@@ -122,12 +122,6 @@ export interface CompressionConfig {
   imageMaxPixelsMulti: number
   imageMultiThreshold: number
   maxRequestBodyBytes: number
-  staleToolResultClearTurns: number
-  shellPatternFilter: boolean
-  dedupEnabled: boolean
-  dedupMinChars: number
-  toolCompressionLevel: string
-  truncationSummaryHeader: boolean
 }
 
 // 获取压缩配置

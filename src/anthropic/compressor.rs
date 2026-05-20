@@ -5,15 +5,10 @@
 //!
 //! 压缩顺序（低风险 → 高风险）：
 //! 1. 空白压缩
-//! 2. Shell 输出模式过滤
-//! 3. thinking 块丢弃/截断
-//! 4. 多轮内容去重
-//! 5. tool_result 智能截断（含摘要头）
-//! 6. tool_use input 截断
-//! 7. 旧轮 tool_result 清空
-//! 8. 历史截断
-
-use std::collections::HashMap;
+//! 2. thinking 块丢弃/截断
+//! 3. tool_result 智能截断
+//! 4. tool_use input 截断
+//! 5. 历史截断
 
 use crate::kiro::model::requests::conversation::{ConversationState, Message};
 use crate::model::config::CompressionConfig;
@@ -22,12 +17,9 @@ use crate::model::config::CompressionConfig;
 #[derive(Debug, Default)]
 pub struct CompressionStats {
     pub whitespace_saved: usize,
-    pub shell_pattern_saved: usize,
     pub thinking_saved: usize,
-    pub dedup_saved: usize,
     pub tool_result_saved: usize,
     pub tool_use_input_saved: usize,
-    pub stale_cleared_saved: usize,
     pub history_turns_removed: usize,
     pub history_bytes_saved: usize,
 }
@@ -36,12 +28,9 @@ impl CompressionStats {
     /// 总节省字节数
     pub fn total_saved(&self) -> usize {
         self.whitespace_saved
-            + self.shell_pattern_saved
             + self.thinking_saved
-            + self.dedup_saved
             + self.tool_result_saved
             + self.tool_use_input_saved
-            + self.stale_cleared_saved
             + self.history_bytes_saved
     }
 }
@@ -59,45 +48,28 @@ pub fn compress(state: &mut ConversationState, config: &CompressionConfig) -> Co
         stats.whitespace_saved = compress_whitespace_pass(state);
     }
 
-    // 2. Shell 输出模式过滤
-    if config.shell_pattern_filter {
-        stats.shell_pattern_saved = compress_shell_patterns_pass(state);
-    }
-
-    // 3. thinking 丢弃/截断
+    // 2. thinking 丢弃/截断
     if config.thinking_strategy != "keep" {
         stats.thinking_saved = compress_thinking_pass(state, &config.thinking_strategy);
     }
 
-    // 4. 多轮内容去重
-    if config.dedup_enabled {
-        stats.dedup_saved = compress_dedup_pass(state, config.dedup_min_chars);
-    }
-
-    // 5. tool_result 智能截断
+    // 3. tool_result 智能截断
     if config.tool_result_max_chars > 0 {
         stats.tool_result_saved = compress_tool_results_pass(
             state,
             config.tool_result_max_chars,
             config.tool_result_head_lines,
             config.tool_result_tail_lines,
-            config.truncation_summary_header,
         );
     }
 
-    // 6. tool_use input 截断
+    // 4. tool_use input 截断
     if config.tool_use_input_max_chars > 0 {
         stats.tool_use_input_saved =
             compress_tool_use_inputs_pass(state, config.tool_use_input_max_chars);
     }
 
-    // 7. 旧轮 tool_result 清空
-    if config.stale_tool_result_clear_turns > 0 {
-        stats.stale_cleared_saved =
-            clear_stale_tool_results_pass(state, config.stale_tool_result_clear_turns);
-    }
-
-    // 8. 历史截断（最后手段）
+    // 5. 历史截断（最后手段）
     if config.max_history_turns > 0 || config.max_history_chars > 0 {
         let (turns, bytes) =
             compress_history_pass(state, config.max_history_turns, config.max_history_chars);
@@ -121,305 +93,6 @@ pub fn compress(state: &mut ConversationState, config: &CompressionConfig) -> Co
     }
 
     stats
-}
-
-// ============ Shell 输出模式过滤 ============
-
-/// Shell 输出模式过滤：移除常见无用输出
-fn compress_shell_patterns_pass(state: &mut ConversationState) -> usize {
-    let mut saved = 0usize;
-
-    for msg in &mut state.history {
-        if let Message::User(user_msg) = msg {
-            for result in &mut user_msg
-                .user_input_message
-                .user_input_message_context
-                .tool_results
-            {
-                for map in result.content.iter_mut() {
-                    if let Some(serde_json::Value::String(text)) = map.get_mut("text") {
-                        let original_len = text.len();
-                        *text = filter_shell_patterns(text);
-                        saved += original_len.saturating_sub(text.len());
-                    }
-                }
-            }
-        }
-    }
-
-    for result in &mut state
-        .current_message
-        .user_input_message
-        .user_input_message_context
-        .tool_results
-    {
-        for map in result.content.iter_mut() {
-            if let Some(serde_json::Value::String(text)) = map.get_mut("text") {
-                let original_len = text.len();
-                *text = filter_shell_patterns(text);
-                saved += original_len.saturating_sub(text.len());
-            }
-        }
-    }
-
-    saved
-}
-
-/// 过滤 shell 输出中的无用模式
-fn filter_shell_patterns(text: &str) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    let mut result: Vec<String> = Vec::with_capacity(lines.len());
-    let mut pass_count = 0u32;
-    let mut last_repeated: Option<String> = None;
-    let mut repeat_count = 0u32;
-
-    for line in &lines {
-        // ANSI 转义序列移除
-        let cleaned = strip_ansi(line);
-        let cleaned_ref = cleaned.as_str();
-
-        // 进度条行（含 \r 或 %, 或 spinner 字符）
-        if is_progress_line(cleaned_ref) {
-            continue;
-        }
-
-        // npm/cargo/pip 安装进度
-        if is_install_progress(cleaned_ref) {
-            continue;
-        }
-
-        // 连续 passing test 行合并
-        if is_test_pass_line(cleaned_ref) {
-            pass_count += 1;
-            continue;
-        } else if pass_count > 0 {
-            result.push(format!("[{} passing tests omitted]", pass_count));
-            pass_count = 0;
-        }
-
-        // 重复行合并（连续相同前缀 >3 行）
-        let prefix = line_prefix(cleaned_ref);
-        if let Some(ref last) = last_repeated {
-            if *last == prefix && !prefix.is_empty() {
-                repeat_count += 1;
-                if repeat_count > 3 {
-                    continue;
-                }
-            } else {
-                if repeat_count > 3 {
-                    result.push(format!(
-                        "[{} similar lines omitted]",
-                        repeat_count - 3
-                    ));
-                }
-                repeat_count = 1;
-                last_repeated = Some(prefix);
-                result.push(cleaned);
-            }
-        } else {
-            repeat_count = 1;
-            last_repeated = Some(prefix);
-            result.push(cleaned);
-        }
-    }
-
-    // 收尾
-    if pass_count > 0 {
-        result.push(format!("[{} passing tests omitted]", pass_count));
-    }
-    if repeat_count > 3 {
-        result.push(format!("[{} similar lines omitted]", repeat_count - 3));
-    }
-
-    result.join("\n")
-}
-
-/// 移除 ANSI 转义序列
-fn strip_ansi(text: &str) -> String {
-    let mut result = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\x1b' {
-            // 跳过 ESC[...m 序列
-            if chars.peek() == Some(&'[') {
-                chars.next();
-                while let Some(&c) = chars.peek() {
-                    chars.next();
-                    if c.is_ascii_alphabetic() {
-                        break;
-                    }
-                }
-            }
-        } else {
-            result.push(ch);
-        }
-    }
-    result
-}
-
-fn is_progress_line(line: &str) -> bool {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    // 含百分比进度
-    if trimmed.contains('%') && (trimmed.contains("━") || trimmed.contains("█") || trimmed.contains('#') || trimmed.contains("...")) {
-        return true;
-    }
-    // spinner 字符
-    if trimmed.starts_with('⠋') || trimmed.starts_with('⠙') || trimmed.starts_with('⠹')
-        || trimmed.starts_with('⠸') || trimmed.starts_with('⠼') || trimmed.starts_with('⠴')
-        || trimmed.starts_with('⠦') || trimmed.starts_with('⠧') || trimmed.starts_with('⠇')
-        || trimmed.starts_with('⠏')
-    {
-        return true;
-    }
-    // 纯进度条
-    if (trimmed.contains("━") || trimmed.contains("─")) && trimmed.len() > 20 {
-        let bar_chars: usize = trimmed.chars().filter(|c| *c == '━' || *c == '─' || *c == '█' || *c == '░').count();
-        if bar_chars > trimmed.chars().count() / 2 {
-            return true;
-        }
-    }
-    false
-}
-
-fn is_install_progress(line: &str) -> bool {
-    let trimmed = line.trim();
-    // npm: "added X packages in Ys" 保留，但 "npm WARN" 和 progress 行过滤
-    if trimmed.starts_with("npm http") || trimmed.starts_with("npm timing") {
-        return true;
-    }
-    // cargo: "Downloading" 和 "Downloaded" 行
-    if trimmed.starts_with("Downloading") || trimmed.starts_with("Downloaded") {
-        return true;
-    }
-    // pip: "Downloading" 和 "Using cached"
-    if trimmed.starts_with("Collecting") && trimmed.contains("Downloading") {
-        return true;
-    }
-    false
-}
-
-fn is_test_pass_line(line: &str) -> bool {
-    let trimmed = line.trim();
-    // rust: "test xxx ... ok"
-    if trimmed.starts_with("test ") && trimmed.ends_with(" ... ok") {
-        return true;
-    }
-    // jest/vitest: "✓" or "✔" or "PASS"
-    if trimmed.starts_with('✓') || trimmed.starts_with('✔') {
-        return true;
-    }
-    // pytest: "PASSED"
-    if trimmed.ends_with("PASSED") && trimmed.contains("::") {
-        return true;
-    }
-    // go: "--- PASS:"
-    if trimmed.starts_with("--- PASS:") {
-        return true;
-    }
-    false
-}
-
-/// 取行的"前缀"用于重复检测（取前 40 字符或到第一个数字/时间戳）
-fn line_prefix(line: &str) -> String {
-    let trimmed = line.trim();
-    if trimmed.chars().count() <= 40 {
-        return trimmed.to_string();
-    }
-    safe_char_truncate(trimmed, 40).to_string()
-}
-
-// ============ 多轮内容去重 ============
-
-/// 检测 tool_result 中重复出现的大文本块，后续出现替换为引用
-fn compress_dedup_pass(state: &mut ConversationState, min_chars: usize) -> usize {
-    let mut saved = 0usize;
-    // hash → (first_turn_index, content_preview)
-    let mut seen: HashMap<u64, usize> = HashMap::new();
-
-    for (turn_idx, msg) in state.history.iter_mut().enumerate() {
-        if let Message::User(user_msg) = msg {
-            for result in &mut user_msg
-                .user_input_message
-                .user_input_message_context
-                .tool_results
-            {
-                for map in result.content.iter_mut() {
-                    if let Some(serde_json::Value::String(text)) = map.get_mut("text") {
-                        if text.len() < min_chars {
-                            continue;
-                        }
-                        let hash = simple_hash(text);
-                        if let Some(&first_turn) = seen.get(&hash) {
-                            let original_len = text.len();
-                            *text = format!("[same content as turn {}]", first_turn / 2 + 1);
-                            saved += original_len.saturating_sub(text.len());
-                        } else {
-                            seen.insert(hash, turn_idx);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    saved
-}
-
-/// 简单非加密 hash（FNV-1a 64bit）
-fn simple_hash(text: &str) -> u64 {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in text.bytes() {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
-}
-
-// ============ 旧轮 tool_result 清空 ============
-
-/// 将超出保留轮数的旧 tool_result 内容替换为 [cleared]
-fn clear_stale_tool_results_pass(state: &mut ConversationState, keep_turns: usize) -> usize {
-    let mut saved = 0usize;
-
-    // 计算 user 消息数量（每个 user 消息算一轮）
-    let user_msg_indices: Vec<usize> = state
-        .history
-        .iter()
-        .enumerate()
-        .filter_map(|(i, msg)| matches!(msg, Message::User(_)).then_some(i))
-        .collect();
-
-    let total_user_msgs = user_msg_indices.len();
-    if total_user_msgs <= keep_turns {
-        return 0;
-    }
-
-    // 只清空前 (total - keep_turns) 个 user 消息的 tool_results
-    let clear_count = total_user_msgs - keep_turns;
-    for &idx in user_msg_indices.iter().take(clear_count) {
-        if let Message::User(user_msg) = &mut state.history[idx] {
-            for result in &mut user_msg
-                .user_input_message
-                .user_input_message_context
-                .tool_results
-            {
-                for map in result.content.iter_mut() {
-                    if let Some(serde_json::Value::String(text)) = map.get_mut("text") {
-                        if text.len() > 10 {
-                            let original_len = text.len();
-                            *text = "[cleared]".to_string();
-                            saved += original_len.saturating_sub(text.len());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    saved
 }
 
 // ============ 空白压缩 ============
@@ -564,13 +237,12 @@ fn truncate_thinking_blocks(text: &str, max_chars: usize) -> String {
 
 // ============ tool_result 智能截断 ============
 
-/// 按行智能截断，保留头尾行，可选摘要头
+/// 按行智能截断，保留头尾行
 fn smart_truncate_by_lines(
     text: &str,
     max_chars: usize,
     head_lines: usize,
     tail_lines: usize,
-    summary_header: bool,
 ) -> (String, usize) {
     let char_count = text.chars().count();
     if char_count <= max_chars {
@@ -579,22 +251,6 @@ fn smart_truncate_by_lines(
 
     let lines: Vec<&str> = text.lines().collect();
     let total_lines = lines.len();
-
-    // 生成摘要头
-    let header = if summary_header {
-        let content_type = detect_content_type(text);
-        let has_error = detect_has_error(text);
-        let byte_size = text.len();
-        format!(
-            "[truncated: {} lines, {}KB | type: {} | has_error: {}]\n",
-            total_lines,
-            byte_size / 1024,
-            content_type,
-            has_error
-        )
-    } else {
-        String::new()
-    };
 
     if total_lines <= head_lines + tail_lines {
         let half = max_chars / 2;
@@ -608,7 +264,7 @@ fn smart_truncate_by_lines(
             .unwrap_or(0);
         let tail = &text[tail_start..];
         let omitted = char_count.saturating_sub(head.chars().count() + tail.chars().count());
-        let result = format!("{}{}\n... [{} chars omitted] ...\n{}", header, head, omitted, tail);
+        let result = format!("{}\n... [{} chars omitted] ...\n{}", head, omitted, tail);
         let saved = text.len().saturating_sub(result.len());
         return (result, saved);
     }
@@ -620,8 +276,8 @@ fn smart_truncate_by_lines(
         char_count.saturating_sub(head_part.chars().count() + tail_part.chars().count());
 
     let mut result = format!(
-        "{}{}\n... [{} lines omitted ({} chars)] ...\n{}",
-        header, head_part, omitted_lines, omitted_chars, tail_part
+        "{}\n... [{} lines omitted ({} chars)] ...\n{}",
+        head_part, omitted_lines, omitted_chars, tail_part
     );
 
     // 硬截断兜底
@@ -634,41 +290,12 @@ fn smart_truncate_by_lines(
     (result, saved)
 }
 
-/// 检测内容类型
-fn detect_content_type(text: &str) -> &'static str {
-    let first_lines: String = text.lines().take(10).collect::<Vec<_>>().join("\n");
-    if first_lines.contains("fn ") || first_lines.contains("pub ") || first_lines.contains("use ") {
-        return "rust";
-    }
-    if first_lines.contains("function ") || first_lines.contains("const ") || first_lines.contains("import ") {
-        return "javascript";
-    }
-    if first_lines.contains("def ") || first_lines.contains("class ") || first_lines.contains("import ") {
-        return "python";
-    }
-    if first_lines.starts_with('{') || first_lines.starts_with('[') {
-        return "json";
-    }
-    if first_lines.contains(" INFO ") || first_lines.contains(" WARN ") || first_lines.contains(" ERROR ") {
-        return "log";
-    }
-    "text"
-}
-
-/// 检测是否包含错误关键词
-fn detect_has_error(text: &str) -> bool {
-    let lower = text.to_lowercase();
-    lower.contains("error") || lower.contains("panic") || lower.contains("failed")
-        || lower.contains("exception") || lower.contains("traceback")
-}
-
 /// 遍历所有 tool_result 的 text 字段，执行智能截断
 fn compress_tool_results_pass(
     state: &mut ConversationState,
     max_chars: usize,
     head_lines: usize,
     tail_lines: usize,
-    summary_header: bool,
 ) -> usize {
     let mut saved = 0usize;
 
@@ -684,7 +311,6 @@ fn compress_tool_results_pass(
                     max_chars,
                     head_lines,
                     tail_lines,
-                    summary_header,
                 );
             }
         }
@@ -697,7 +323,7 @@ fn compress_tool_results_pass(
         .tool_results
     {
         saved +=
-            truncate_tool_result_content(&mut result.content, max_chars, head_lines, tail_lines, summary_header);
+            truncate_tool_result_content(&mut result.content, max_chars, head_lines, tail_lines);
     }
 
     saved
@@ -709,7 +335,6 @@ fn truncate_tool_result_content(
     max_chars: usize,
     head_lines: usize,
     tail_lines: usize,
-    summary_header: bool,
 ) -> usize {
     let mut saved = 0usize;
 
@@ -717,7 +342,7 @@ fn truncate_tool_result_content(
         if let Some(serde_json::Value::String(text)) = map.get_mut("text")
             && text.chars().count() > max_chars
         {
-            let (truncated, s) = smart_truncate_by_lines(text, max_chars, head_lines, tail_lines, summary_header);
+            let (truncated, s) = smart_truncate_by_lines(text, max_chars, head_lines, tail_lines);
             saved += s;
             *text = truncated;
         }
@@ -1154,6 +779,70 @@ mod tests {
     }
 
     #[test]
+    fn test_default_compression_preserves_repeated_tool_results() {
+        let repeated = "file content\n".repeat(40);
+        let tool_use_1 = ToolUseEntry::new("read-1", "Read");
+        let tool_use_2 = ToolUseEntry::new("read-2", "Read");
+        let tool_use_3 = ToolUseEntry::new("read-3", "Read");
+        let user_1 = HistoryUserMessage {
+            user_input_message: UserMessage::new("read first", "claude-sonnet-4.5").with_context(
+                UserInputMessageContext::new()
+                    .with_tool_results(vec![ToolResult::success("read-1", repeated.as_str())]),
+            ),
+        };
+        let user_2 = HistoryUserMessage {
+            user_input_message: UserMessage::new("read second", "claude-sonnet-4.5").with_context(
+                UserInputMessageContext::new()
+                    .with_tool_results(vec![ToolResult::success("read-2", repeated.as_str())]),
+            ),
+        };
+        let user_3 = HistoryUserMessage {
+            user_input_message: UserMessage::new("read third", "claude-sonnet-4.5").with_context(
+                UserInputMessageContext::new()
+                    .with_tool_results(vec![ToolResult::success("read-3", "different content")]),
+            ),
+        };
+        let mut state = ConversationState::new("test-conv")
+            .with_current_message(CurrentMessage::new(UserInputMessage::new(
+                "next",
+                "claude-sonnet-4.5",
+            )))
+            .with_history(vec![
+                Message::Assistant(HistoryAssistantMessage {
+                    assistant_response_message: AssistantMessage::new("read first")
+                        .with_tool_uses(vec![tool_use_1]),
+                }),
+                Message::User(user_1),
+                Message::Assistant(HistoryAssistantMessage {
+                    assistant_response_message: AssistantMessage::new("read second")
+                        .with_tool_uses(vec![tool_use_2]),
+                }),
+                Message::User(user_2),
+                Message::Assistant(HistoryAssistantMessage {
+                    assistant_response_message: AssistantMessage::new("read third")
+                        .with_tool_uses(vec![tool_use_3]),
+                }),
+                Message::User(user_3),
+            ]);
+
+        let stats = compress(&mut state, &CompressionConfig::default());
+
+        assert_eq!(stats.tool_result_saved, 0);
+        if let Message::User(user_msg) = &state.history[3] {
+            let text = user_msg
+                .user_input_message
+                .user_input_message_context
+                .tool_results[0]
+                .content[0]["text"]
+                .as_str()
+                .unwrap();
+            assert_eq!(text, repeated);
+        } else {
+            panic!("history[3] should be a user message");
+        }
+    }
+
+    #[test]
     fn test_compress_whitespace_preserves_indentation() {
         let input = "    indented\n        more indented";
         let result = compress_whitespace(input);
@@ -1163,7 +852,7 @@ mod tests {
     #[test]
     fn test_smart_truncate_short_content_unchanged() {
         let input = "short text";
-        let (result, saved) = smart_truncate_by_lines(input, 100, 5, 3, false);
+        let (result, saved) = smart_truncate_by_lines(input, 100, 5, 3);
         assert_eq!(result, input);
         assert_eq!(saved, 0);
     }
@@ -1172,7 +861,7 @@ mod tests {
     fn test_smart_truncate_preserves_head_tail() {
         let lines: Vec<String> = (0..200).map(|i| format!("line {}", i)).collect();
         let input = lines.join("\n");
-        let (result, _saved) = smart_truncate_by_lines(&input, 100, 3, 2, false);
+        let (result, _saved) = smart_truncate_by_lines(&input, 100, 3, 2);
         assert!(result.starts_with("line 0\nline 1\nline 2\n"));
         assert!(result.ends_with("line 198\nline 199"));
         assert!(result.contains("lines omitted"));
@@ -1432,8 +1121,6 @@ mod tests {
             tool_result_max_chars: 100,
             tool_result_head_lines: 3,
             tool_result_tail_lines: 2,
-            shell_pattern_filter: false,
-            dedup_enabled: false,
             ..Default::default()
         };
         let stats = compress(&mut state, &config);

@@ -34,12 +34,6 @@ const DEFAULT_CONFIG: CompressionConfig = {
   imageMaxPixelsMulti: 4000000,
   imageMultiThreshold: 20,
   maxRequestBodyBytes: 4718592,
-  staleToolResultClearTurns: 6,
-  shellPatternFilter: true,
-  dedupEnabled: true,
-  dedupMinChars: 200,
-  toolCompressionLevel: 'auto',
-  truncationSummaryHeader: true,
 }
 
 type TabId = 'general' | 'tool' | 'history' | 'image' | 'request'
@@ -134,9 +128,6 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                     <>
                       <ToggleRow label="启用压缩" desc="关闭后所有压缩逻辑跳过" checked={config.enabled} onChange={v => update('enabled', v)} />
                       <ToggleRow label="空白字符压缩" desc="合并连续空行和多余空格" checked={config.whitespaceCompression} onChange={v => update('whitespaceCompression', v)} />
-                      <ToggleRow label="Shell 模式过滤" desc="移除进度条、ANSI码、重复行等无用输出" checked={config.shellPatternFilter} onChange={v => update('shellPatternFilter', v)} />
-                      <ToggleRow label="多轮去重" desc="重复出现的大文本块替换为引用" checked={config.dedupEnabled} onChange={v => update('dedupEnabled', v)} />
-                      <ToggleRow label="截断摘要头" desc="截断时附加内容类型和错误检测信息" checked={config.truncationSummaryHeader} onChange={v => update('truncationSummaryHeader', v)} />
                       <SelectRow
                         label="Thinking 处理"
                         desc="模型思考内容的处理方式"
@@ -148,31 +139,16 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                         ]}
                         onChange={v => update('thinkingStrategy', v)}
                       />
-                      <NumberRow label="去重最小字符" desc="低于此长度的文本不参与去重" value={config.dedupMinChars} onChange={v => update('dedupMinChars', v)} />
                     </>
                   )}
 
                   {activeTab === 'tool' && (
                     <>
-                      <SelectRow
-                        label="Schema 压缩级别"
-                        desc="工具定义的压缩策略"
-                        value={config.toolCompressionLevel}
-                        options={[
-                          { value: 'auto', label: '自动 (按大小分级)' },
-                          { value: 'off', label: '关闭' },
-                          { value: 'level1', label: 'L1: 移除属性描述' },
-                          { value: 'level2', label: 'L2: 移除所有描述' },
-                          { value: 'level3', label: 'L3: L2 + 折叠 enum' },
-                        ]}
-                        onChange={v => update('toolCompressionLevel', v)}
-                      />
                       <NumberRow label="Result 最大字符" desc="超出后保留头尾截断中间" value={config.toolResultMaxChars} onChange={v => update('toolResultMaxChars', v)} />
                       <NumberRow label="保留头部行数" desc="截断时保留开头的行数" value={config.toolResultHeadLines} onChange={v => update('toolResultHeadLines', v)} />
                       <NumberRow label="保留尾部行数" desc="截断时保留末尾的行数" value={config.toolResultTailLines} onChange={v => update('toolResultTailLines', v)} />
                       <NumberRow label="Input 最大字符" desc="工具调用参数截断阈值" value={config.toolUseInputMaxChars} onChange={v => update('toolUseInputMaxChars', v)} />
                       <NumberRow label="Description 最大字符" desc="工具描述截断阈值" value={config.toolDescriptionMaxChars} onChange={v => update('toolDescriptionMaxChars', v)} />
-                      <NumberRow label="旧轮清空保留数" desc="只保留最近 N 轮完整 tool_result" value={config.staleToolResultClearTurns} onChange={v => update('staleToolResultClearTurns', v)} />
                     </>
                   )}
 

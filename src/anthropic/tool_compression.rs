@@ -1,144 +1,82 @@
-//! 工具定义分级压缩模块
+//! 工具定义压缩模块
 //!
-//! 根据工具定义总大小自动选择压缩级别：
-//! - Level 0 (< 20KB): 不压缩
-//! - Level 1 (20-40KB): 移除 property descriptions，保留 tool description
-//! - Level 2 (40-80KB): 移除所有 descriptions，只留 name + param names + types
-//! - Level 3 (> 80KB): Level 2 + 折叠 enum 为摘要
-//!
-//! 也支持手动指定级别: "off"/"level1"/"level2"/"level3"/"auto"
+//! 当工具定义的总序列化大小超过阈值时，通过两步压缩减小体积：
+//! 1. 简化 `input_schema`：移除非必要字段（description 等），仅保留结构骨架
+//! 2. 按比例截断 `description`：根据超出比例缩短描述，最短保留 50 字符
 
 use crate::kiro::model::requests::tool::{InputSchema, Tool as KiroTool, ToolSpecification};
 
-const THRESHOLD_L1: usize = 20 * 1024;
-const THRESHOLD_L2: usize = 40 * 1024;
-const THRESHOLD_L3: usize = 80 * 1024;
+/// 工具定义总大小阈值（20KB）
+const TOOL_SIZE_THRESHOLD: usize = 20 * 1024;
 
+/// description 最短保留字符数
 const MIN_DESCRIPTION_CHARS: usize = 50;
 
-/// 根据配置级别压缩工具定义
-pub fn compress_tools_if_needed(tools: &[KiroTool], level: &str) -> Vec<KiroTool> {
-    if level == "off" {
+/// 如果工具定义总大小超过阈值，执行压缩
+///
+/// 返回压缩后的工具列表（如果未超阈值则原样返回）
+pub fn compress_tools_if_needed(tools: &[KiroTool]) -> Vec<KiroTool> {
+    let total_size = estimate_tools_size(tools);
+    if total_size <= TOOL_SIZE_THRESHOLD {
         return tools.to_vec();
     }
 
-    let total_size = estimate_tools_size(tools);
-
-    let effective_level = match level {
-        "level1" => 1,
-        "level2" => 2,
-        "level3" => 3,
-        _ => {
-            // auto
-            if total_size <= THRESHOLD_L1 {
-                return tools.to_vec();
-            } else if total_size <= THRESHOLD_L2 {
-                1
-            } else if total_size <= THRESHOLD_L3 {
-                2
-            } else {
-                3
-            }
-        }
-    };
-
     tracing::info!(
         total_size,
-        effective_level,
+        threshold = TOOL_SIZE_THRESHOLD,
         tool_count = tools.len(),
-        "工具定义压缩: level {}",
-        effective_level
+        "工具定义超过阈值，开始压缩"
     );
 
-    match effective_level {
-        1 => compress_level1(tools, total_size),
-        2 => compress_level2(tools),
-        3 => compress_level3(tools),
-        _ => tools.to_vec(),
-    }
-}
+    // 第一步：简化 input_schema
+    let mut compressed: Vec<KiroTool> = tools.iter().map(simplify_schema).collect();
 
-/// Level 1: 移除 property descriptions，保留 tool description
-/// 如果仍超阈值，按比例截断 tool description
-fn compress_level1(tools: &[KiroTool], original_size: usize) -> Vec<KiroTool> {
-    let mut compressed: Vec<KiroTool> = tools.iter().map(|t| simplify_schema(t, false)).collect();
-
-    let size_after = estimate_tools_size(&compressed);
-    if size_after <= THRESHOLD_L1 {
+    let size_after_schema = estimate_tools_size(&compressed);
+    if size_after_schema <= TOOL_SIZE_THRESHOLD {
+        tracing::info!(
+            original_size = total_size,
+            compressed_size = size_after_schema,
+            "schema 简化后已低于阈值"
+        );
         return compressed;
     }
 
-    // 按比例截断 description
-    let ratio = THRESHOLD_L1 as f64 / size_after as f64;
-    truncate_descriptions(&mut compressed, ratio);
-
-    tracing::info!(
-        original_size,
-        final_size = estimate_tools_size(&compressed),
-        "Level 1 压缩完成"
-    );
-    compressed
-}
-
-/// Level 2: 移除所有 descriptions（tool + property），只留 name + params + types
-fn compress_level2(tools: &[KiroTool]) -> Vec<KiroTool> {
-    tools
-        .iter()
-        .map(|t| {
-            let simplified = simplify_schema(t, false);
-            KiroTool {
-                tool_specification: ToolSpecification {
-                    name: simplified.tool_specification.name.clone(),
-                    description: simplified.tool_specification.name.clone(),
-                    input_schema: simplified.tool_specification.input_schema,
-                },
-            }
-        })
-        .collect()
-}
-
-/// Level 3: Level 2 + 折叠 enum 为摘要
-fn compress_level3(tools: &[KiroTool]) -> Vec<KiroTool> {
-    tools
-        .iter()
-        .map(|t| {
-            let simplified = simplify_schema(t, true);
-            KiroTool {
-                tool_specification: ToolSpecification {
-                    name: simplified.tool_specification.name.clone(),
-                    description: simplified.tool_specification.name.clone(),
-                    input_schema: simplified.tool_specification.input_schema,
-                },
-            }
-        })
-        .collect()
-}
-
-/// 按比例截断所有 tool descriptions
-fn truncate_descriptions(tools: &mut [KiroTool], ratio: f64) {
-    use unicode_segmentation::UnicodeSegmentation;
-    for tool in tools.iter_mut() {
+    // 第二步：按比例截断 description（基于字节大小）
+    let ratio = TOOL_SIZE_THRESHOLD as f64 / size_after_schema as f64;
+    for tool in &mut compressed {
         let desc = &tool.tool_specification.description;
         let target_bytes = (desc.len() as f64 * ratio) as usize;
+        // 最短保留 MIN_DESCRIPTION_CHARS 个字符对应的字节数（至少 50 字符）
         let min_bytes = desc
-            .grapheme_indices(true)
+            .char_indices()
             .nth(MIN_DESCRIPTION_CHARS)
             .map(|(idx, _)| idx)
             .unwrap_or(desc.len());
         let target_bytes = target_bytes.max(min_bytes);
         if desc.len() > target_bytes {
+            // UTF-8 安全截断：找到不超过 target_bytes 的最大字符边界
             let truncate_at = desc
-                .grapheme_indices(true)
+                .char_indices()
                 .take_while(|(idx, _)| *idx <= target_bytes)
                 .last()
-                .map(|(idx, g)| idx + g.len())
+                .map(|(idx, ch)| idx + ch.len_utf8())
                 .unwrap_or(0);
             tool.tool_specification.description = desc[..truncate_at].to_string();
         }
     }
+
+    let final_size = estimate_tools_size(&compressed);
+    tracing::info!(
+        original_size = total_size,
+        after_schema = size_after_schema,
+        final_size,
+        "工具压缩完成"
+    );
+
+    compressed
 }
 
-/// 估算工具列表的总序列化大小
+/// 估算工具列表的总序列化大小（字节）
 fn estimate_tools_size(tools: &[KiroTool]) -> usize {
     tools
         .iter()
@@ -154,10 +92,12 @@ fn estimate_tools_size(tools: &[KiroTool]) -> usize {
 }
 
 /// 简化工具的 input_schema
-/// collapse_enums: 是否将 enum 折叠为摘要
-fn simplify_schema(tool: &KiroTool, collapse_enums: bool) -> KiroTool {
+///
+/// 保留结构骨架（type, properties 的 key 和 type, required），
+/// 移除 properties 内部的 description、examples 等非必要字段
+fn simplify_schema(tool: &KiroTool) -> KiroTool {
     let schema = &tool.tool_specification.input_schema.json;
-    let simplified = simplify_json_schema(schema, collapse_enums);
+    let simplified = simplify_json_schema(schema);
 
     KiroTool {
         tool_specification: ToolSpecification {
@@ -169,29 +109,33 @@ fn simplify_schema(tool: &KiroTool, collapse_enums: bool) -> KiroTool {
 }
 
 /// 递归简化 JSON Schema
-fn simplify_json_schema(schema: &serde_json::Value, collapse_enums: bool) -> serde_json::Value {
+fn simplify_json_schema(schema: &serde_json::Value) -> serde_json::Value {
     let Some(obj) = schema.as_object() else {
         return schema.clone();
     };
 
     let mut result = serde_json::Map::new();
 
+    // 保留顶层结构字段
     for key in &["$schema", "type", "required", "additionalProperties"] {
         if let Some(v) = obj.get(*key) {
             result.insert(key.to_string(), v.clone());
         }
     }
 
+    // 简化 properties：仅保留每个属性的 type
     if let Some(serde_json::Value::Object(props)) = obj.get("properties") {
         let mut simplified_props = serde_json::Map::new();
         for (name, prop_schema) in props {
             if let Some(prop_obj) = prop_schema.as_object() {
                 let mut simplified_prop = serde_json::Map::new();
+                // 保留 type
                 if let Some(ty) = prop_obj.get("type") {
                     simplified_prop.insert("type".to_string(), ty.clone());
                 }
-                // 递归嵌套 properties
+                // 递归简化嵌套 properties（如 object 类型）
                 if let Some(nested_props) = prop_obj.get("properties") {
+                    // 构造完整的子 schema，保留 required 和 additionalProperties
                     let mut nested_schema = serde_json::Map::new();
                     nested_schema.insert(
                         "type".to_string(),
@@ -204,8 +148,7 @@ fn simplify_json_schema(schema: &serde_json::Value, collapse_enums: bool) -> ser
                     if let Some(ap) = prop_obj.get("additionalProperties") {
                         nested_schema.insert("additionalProperties".to_string(), ap.clone());
                     }
-                    let nested =
-                        simplify_json_schema(&serde_json::Value::Object(nested_schema), collapse_enums);
+                    let nested = simplify_json_schema(&serde_json::Value::Object(nested_schema));
                     if let Some(np) = nested.get("properties") {
                         simplified_prop.insert("properties".to_string(), np.clone());
                     }
@@ -216,24 +159,13 @@ fn simplify_json_schema(schema: &serde_json::Value, collapse_enums: bool) -> ser
                         simplified_prop.insert("additionalProperties".to_string(), ap.clone());
                     }
                 }
-                // items
+                // 保留 items（数组类型）
                 if let Some(items) = prop_obj.get("items") {
-                    simplified_prop
-                        .insert("items".to_string(), simplify_json_schema(items, collapse_enums));
+                    simplified_prop.insert("items".to_string(), simplify_json_schema(items));
                 }
-                // enum 处理
+                // 保留 enum
                 if let Some(e) = prop_obj.get("enum") {
-                    if collapse_enums {
-                        if let Some(arr) = e.as_array() {
-                            let summary = format!("...{} options", arr.len());
-                            simplified_prop.insert(
-                                "enum".to_string(),
-                                serde_json::Value::Array(vec![serde_json::Value::String(summary)]),
-                            );
-                        }
-                    } else {
-                        simplified_prop.insert("enum".to_string(), e.clone());
-                    }
+                    simplified_prop.insert("enum".to_string(), e.clone());
                 }
                 simplified_props.insert(name.clone(), serde_json::Value::Object(simplified_prop));
             } else {
@@ -270,7 +202,7 @@ mod tests {
             "A short description",
             serde_json::json!({"type": "object", "properties": {}}),
         )];
-        let result = compress_tools_if_needed(&tools, "auto");
+        let result = compress_tools_if_needed(&tools);
         assert_eq!(result.len(), 1);
         assert_eq!(
             result[0].tool_specification.description,
@@ -280,6 +212,7 @@ mod tests {
 
     #[test]
     fn test_compression_triggers_over_threshold() {
+        // 创建大量工具使总大小超过 20KB
         let long_desc = "x".repeat(2000);
         let tools: Vec<KiroTool> = (0..15)
             .map(|i| {
@@ -289,8 +222,8 @@ mod tests {
                     serde_json::json!({
                         "type": "object",
                         "properties": {
-                            "param1": {"type": "string", "description": "A very long parameter description"},
-                            "param2": {"type": "number", "description": "Another long description"}
+                            "param1": {"type": "string", "description": "A very long parameter description that adds to the size"},
+                            "param2": {"type": "number", "description": "Another long description for testing purposes"}
                         }
                     }),
                 )
@@ -298,54 +231,44 @@ mod tests {
             .collect();
 
         let original_size = estimate_tools_size(&tools);
-        assert!(original_size > THRESHOLD_L1);
+        assert!(original_size > TOOL_SIZE_THRESHOLD, "测试数据应超过阈值");
 
-        let result = compress_tools_if_needed(&tools, "auto");
+        let result = compress_tools_if_needed(&tools);
         let compressed_size = estimate_tools_size(&result);
-        assert!(compressed_size < original_size);
+        assert!(
+            compressed_size < original_size,
+            "压缩后应更小: {} < {}",
+            compressed_size,
+            original_size
+        );
     }
 
     #[test]
-    fn test_level2_removes_all_descriptions() {
+    fn test_preserves_enum_values() {
         let tools = vec![make_tool(
             "test",
-            "This description should be removed",
-            serde_json::json!({"type": "object", "properties": {"x": {"type": "string"}}}),
-        )];
-        let result = compress_tools_if_needed(&tools, "level2");
-        assert_eq!(result[0].tool_specification.description, "test");
-    }
-
-    #[test]
-    fn test_level3_collapses_enums() {
-        let tools = vec![make_tool(
-            "test",
-            "desc",
+            &"x".repeat(20_000),
             serde_json::json!({
                 "type": "object",
                 "properties": {
                     "mode": {
                         "type": "string",
-                        "enum": ["read", "write", "append", "truncate", "exclusive"]
+                        "enum": ["read", "write", "append"]
                     }
                 }
             }),
         )];
-        let result = compress_tools_if_needed(&tools, "level3");
-        let props = result[0].tool_specification.input_schema.json.get("properties").unwrap();
-        let mode_enum = props.get("mode").unwrap().get("enum").unwrap();
-        let first = mode_enum.as_array().unwrap()[0].as_str().unwrap();
-        assert!(first.contains("5 options"));
-    }
 
-    #[test]
-    fn test_off_returns_unchanged() {
-        let tools = vec![make_tool(
-            "test",
-            "x".repeat(50000).as_str(),
-            serde_json::json!({"type": "object", "properties": {}}),
-        )];
-        let result = compress_tools_if_needed(&tools, "off");
-        assert_eq!(result[0].tool_specification.description.len(), 50000);
+        let result = compress_tools_if_needed(&tools);
+        let props = result[0]
+            .tool_specification
+            .input_schema
+            .json
+            .get("properties")
+            .unwrap();
+        assert_eq!(
+            props.get("mode").unwrap().get("enum").unwrap(),
+            &serde_json::json!(["read", "write", "append"])
+        );
     }
 }

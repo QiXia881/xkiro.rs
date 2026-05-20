@@ -189,27 +189,21 @@ pub(crate) fn extract_thinking_from_complete_text(text: &str) -> (Option<String>
     let after_open = &text[start_pos + "<thinking>".len()..];
 
     // 查找结束标签：优先匹配带 \n\n 后缀的，退而使用末尾匹配
-    let (thinking_raw, text_after) =
-        if let Some(end_pos) = find_real_thinking_end_tag(after_open) {
-            (
-                &after_open[..end_pos],
-                &after_open[end_pos + "</thinking>\n\n".len()..],
-            )
-        } else if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(after_open) {
-            let after_tag = end_pos + "</thinking>".len();
-            (
-                &after_open[..end_pos],
-                after_open[after_tag..].trim_start(),
-            )
-        } else {
-            // 找不到有效的结束标签，不做提取
-            return (None, text.to_string());
-        };
+    let (thinking_raw, text_after) = if let Some(end_pos) = find_real_thinking_end_tag(after_open) {
+        (
+            &after_open[..end_pos],
+            &after_open[end_pos + "</thinking>\n\n".len()..],
+        )
+    } else if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(after_open) {
+        let after_tag = end_pos + "</thinking>".len();
+        (&after_open[..end_pos], after_open[after_tag..].trim_start())
+    } else {
+        // 找不到有效的结束标签，不做提取
+        return (None, text.to_string());
+    };
 
     // 剥离开头的换行符（与流式处理一致：模型输出 <thinking>\n）
-    let thinking_content = thinking_raw
-        .strip_prefix('\n')
-        .unwrap_or(thinking_raw);
+    let thinking_content = thinking_raw.strip_prefix('\n').unwrap_or(thinking_raw);
 
     // 组装剩余文本：跳过纯空白的 before 部分
     let mut remaining = String::new();
@@ -591,10 +585,11 @@ impl StreamContext {
         })
     }
 
-    /// 生成初始事件序列 (message_start + 文本块 start)
+    /// 生成初始事件序列。
     ///
-    /// 当 thinking 启用时，不在初始化时创建文本块，而是等到实际收到内容时再创建。
-    /// 这样可以确保 thinking 块（索引 0）在文本块（索引 1）之前。
+    /// 不在初始化阶段创建空 text block。tool_use-only 响应如果先发出
+    /// `text: ""`，Claude Code 会把空文本写回 history，后续请求容易触发
+    /// 上游的 tool_use/tool_result 或空内容校验问题。
     pub fn generate_initial_events(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
@@ -603,29 +598,6 @@ impl StreamContext {
         if let Some(event) = self.state_manager.handle_message_start(msg_start) {
             events.push(event);
         }
-
-        // 如果启用了 thinking，不在这里创建文本块
-        // thinking 块和文本块会在 process_content_with_thinking 中按正确顺序创建
-        if self.thinking_enabled {
-            return events;
-        }
-
-        // 创建初始文本块（仅在未启用 thinking 时）
-        let text_block_index = self.state_manager.next_block_index();
-        self.text_block_index = Some(text_block_index);
-        let text_block_events = self.state_manager.handle_content_block_start(
-            text_block_index,
-            "text",
-            json!({
-                "type": "content_block_start",
-                "index": text_block_index,
-                "content_block": {
-                    "type": "text",
-                    "text": ""
-                }
-            }),
-        );
-        events.extend(text_block_events);
 
         events
     }
@@ -638,9 +610,8 @@ impl StreamContext {
             Event::ContextUsage(context_usage) => {
                 // 从上下文使用百分比计算实际的 input_tokens
                 let window_size = get_context_window_size(&self.model);
-                let actual_input_tokens = (context_usage.context_usage_percentage
-                    * (window_size as f64)
-                    / 100.0) as i32;
+                let actual_input_tokens =
+                    (context_usage.context_usage_percentage * (window_size as f64) / 100.0) as i32;
                 self.context_input_tokens = Some(actual_input_tokens);
                 // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
                 if context_usage.context_usage_percentage >= 100.0 {
@@ -1158,8 +1129,12 @@ impl BufferedStreamContext {
         thinking_enabled: bool,
         tool_name_map: HashMap<String, String>,
     ) -> Self {
-        let inner =
-            StreamContext::new_with_thinking(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+        let inner = StreamContext::new_with_thinking(
+            model,
+            estimated_input_tokens,
+            thinking_enabled,
+            tool_name_map,
+        );
         Self {
             inner,
             event_buffer: Vec::new(),
@@ -1297,7 +1272,10 @@ mod tests {
         use crate::kiro::model::events::ToolUseEvent;
 
         let mut map = HashMap::new();
-        map.insert("short_abc12345".to_string(), "mcp__very_long_original_tool_name".to_string());
+        map.insert(
+            "short_abc12345".to_string(),
+            "mcp__very_long_original_tool_name".to_string(),
+        );
 
         let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, map);
         let _ = ctx.generate_initial_events();
@@ -1313,10 +1291,12 @@ mod tests {
         let events = ctx.process_kiro_event(&tool_event);
 
         // content_block_start 中的 name 应该是原始长名称
-        let start_event = events.iter().find(|e| e.event == "content_block_start").unwrap();
+        let start_event = events
+            .iter()
+            .find(|e| e.event == "content_block_start")
+            .unwrap();
         assert_eq!(
-            start_event.data["content_block"]["name"],
-            "mcp__very_long_original_tool_name",
+            start_event.data["content_block"]["name"], "mcp__very_long_original_tool_name",
             "应还原为原始工具名称"
         );
     }
@@ -1329,13 +1309,22 @@ mod tests {
         assert!(
             initial_events
                 .iter()
-                .any(|e| e.event == "content_block_start"
-                    && e.data["content_block"]["type"] == "text")
+                .all(|e| !(e.event == "content_block_start"
+                    && e.data["content_block"]["type"] == "text"))
         );
 
-        let initial_text_index = ctx
-            .text_block_index
-            .expect("initial text block index should exist");
+        let first_text_events = ctx.process_assistant_response("hi");
+        let initial_text_index = first_text_events
+            .iter()
+            .find_map(|e| {
+                if e.event == "content_block_start" && e.data["content_block"]["type"] == "text" {
+                    e.data["index"].as_i64()
+                } else {
+                    None
+                }
+            })
+            .expect("text block should start on first text delta")
+            as i32;
 
         // tool_use 开始会自动关闭现有 text block
         let tool_events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
@@ -1377,6 +1366,36 @@ mod tests {
                     && e.data["delta"]["text"] == "hello"
             }),
             "should emit text_delta after restarting text block"
+        );
+    }
+
+    #[test]
+    fn test_tool_use_only_does_not_emit_empty_text_block() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+
+        let mut all_events = Vec::new();
+        all_events.extend(ctx.generate_initial_events());
+        all_events.extend(
+            ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+                name: "test_tool".to_string(),
+                tool_use_id: "tool_1".to_string(),
+                input: "{}".to_string(),
+                stop: true,
+            }),
+        );
+        all_events.extend(ctx.generate_final_events());
+
+        assert!(
+            all_events.iter().any(|e| {
+                e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use"
+            }),
+            "should emit tool_use content_block_start"
+        );
+        assert!(
+            all_events.iter().all(|e| {
+                !(e.event == "content_block_start" && e.data["content_block"]["type"] == "text")
+            }),
+            "tool_use-only stream should not start a text block"
         );
     }
 
@@ -1738,7 +1757,12 @@ mod tests {
 
         let full_thinking: String = thinking_deltas
             .iter()
-            .filter(|e| !e.data["delta"]["thinking"].as_str().unwrap_or("").is_empty())
+            .filter(|e| {
+                !e.data["delta"]["thinking"]
+                    .as_str()
+                    .unwrap_or("")
+                    .is_empty()
+            })
             .map(|e| e.data["delta"]["thinking"].as_str().unwrap_or(""))
             .collect();
 
@@ -1751,14 +1775,11 @@ mod tests {
         let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
-        let events =
-            ctx.process_assistant_response("<thinking>\nabc</thinking>\n\n你好");
+        let events = ctx.process_assistant_response("<thinking>\nabc</thinking>\n\n你好");
 
         let text_deltas: Vec<_> = events
             .iter()
-            .filter(|e| {
-                e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta"
-            })
+            .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta")
             .collect();
 
         let full_text: String = text_deltas
@@ -1790,9 +1811,7 @@ mod tests {
     fn collect_text_content(events: &[SseEvent]) -> String {
         events
             .iter()
-            .filter(|e| {
-                e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta"
-            })
+            .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta")
             .map(|e| e.data["delta"]["text"].as_str().unwrap_or(""))
             .collect()
     }
@@ -1811,7 +1830,11 @@ mod tests {
         all.extend(ctx.generate_final_events());
 
         let thinking = collect_thinking_content(&all);
-        assert_eq!(thinking, "abc", "thinking should be 'abc', got: {:?}", thinking);
+        assert_eq!(
+            thinking, "abc",
+            "thinking should be 'abc', got: {:?}",
+            thinking
+        );
 
         let text = collect_text_content(&all);
         assert_eq!(text, "你好", "text should be '你好', got: {:?}", text);
@@ -1829,7 +1852,11 @@ mod tests {
         all.extend(ctx.generate_final_events());
 
         let thinking = collect_thinking_content(&all);
-        assert_eq!(thinking, "abc", "thinking should be 'abc', got: {:?}", thinking);
+        assert_eq!(
+            thinking, "abc",
+            "thinking should be 'abc', got: {:?}",
+            thinking
+        );
 
         let text = collect_text_content(&all);
         assert_eq!(text, "你好", "text should be '你好', got: {:?}", text);
@@ -1849,7 +1876,11 @@ mod tests {
         all.extend(ctx.generate_final_events());
 
         let thinking = collect_thinking_content(&all);
-        assert_eq!(thinking, "abc", "thinking should be 'abc', got: {:?}", thinking);
+        assert_eq!(
+            thinking, "abc",
+            "thinking should be 'abc', got: {:?}",
+            thinking
+        );
 
         let text = collect_text_content(&all);
         assert_eq!(text, "text", "text should be 'text', got: {:?}", text);
@@ -1878,7 +1909,11 @@ mod tests {
         all.extend(ctx.generate_final_events());
 
         let thinking = collect_thinking_content(&all);
-        assert_eq!(thinking, "hello", "thinking should be 'hello', got: {:?}", thinking);
+        assert_eq!(
+            thinking, "hello",
+            "thinking should be 'hello', got: {:?}",
+            thinking
+        );
 
         let text = collect_text_content(&all);
         assert_eq!(text, "world", "text should be 'world', got: {:?}", text);
@@ -1968,12 +2003,14 @@ mod tests {
 
         let mut all_events = Vec::new();
         all_events.extend(ctx.process_assistant_response("<thinking>\nabc</thinking>"));
-        all_events.extend(ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
-            name: "test_tool".to_string(),
-            tool_use_id: "tool_1".to_string(),
-            input: "{}".to_string(),
-            stop: true,
-        }));
+        all_events.extend(
+            ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+                name: "test_tool".to_string(),
+                tool_use_id: "tool_1".to_string(),
+                input: "{}".to_string(),
+                stop: true,
+            }),
+        );
         all_events.extend(ctx.generate_final_events());
 
         let message_delta = all_events
