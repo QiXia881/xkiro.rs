@@ -150,6 +150,13 @@ async fn main() {
         token_manager.start_background_refresh(BackgroundRefreshConfig::default());
     tracing::info!("后台 Token 刷新任务已启动");
 
+    // 初始化所有凭据的余额缓存（顺序查询，间隔 0.5s 避免限流）
+    // 余额 < 1.0 的凭据会自动禁用并标记 InsufficientBalance
+    let init_count = token_manager.initialize_balances().await;
+    if init_count == 0 && token_manager.total_count() > 0 {
+        tracing::warn!("所有凭据余额初始化失败，将按优先级选择凭据");
+    }
+
     let kiro_provider = KiroProvider::with_proxy(
         token_manager.clone(),
         proxy_config.clone(),

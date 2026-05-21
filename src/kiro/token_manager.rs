@@ -2219,6 +2219,79 @@ impl MultiTokenManager {
         Ok(usage_limits)
     }
 
+    /// 初始化所有凭据的余额缓存
+    ///
+    /// 启动时顺序查询所有非禁用凭据的余额，每次间隔 0.5 秒避免触发限流。
+    /// 查询失败的凭据会被跳过（保持 initialized: false）。
+    /// 余额 < 1.0 的凭据会自动禁用并标记 InsufficientBalance。
+    ///
+    /// 贴合 BK token_manager.rs L2303-2364。
+    ///
+    /// # 返回
+    /// - 成功初始化的凭据数量
+    pub async fn initialize_balances(&self) -> usize {
+        let credential_ids: Vec<u64> = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .filter(|e| !e.disabled)
+                .map(|e| e.id)
+                .collect()
+        };
+
+        if credential_ids.is_empty() {
+            tracing::info!("无可用凭据，跳过余额初始化");
+            return 0;
+        }
+
+        tracing::info!("正在初始化 {} 个凭据的余额...", credential_ids.len());
+
+        let mut success_count = 0;
+
+        // 顺序查询每个凭据的余额，间隔 0.5 秒避免触发限流
+        for (index, &id) in credential_ids.iter().enumerate() {
+            match self.get_usage_limits_for(id).await {
+                Ok(limits) => {
+                    // 计算剩余额度
+                    let used = limits.current_usage();
+                    let limit = limits.usage_limit();
+                    let remaining = (limit - used).max(0.0);
+
+                    self.update_balance_cache(id, remaining);
+
+                    // 余额 < LOW_BALANCE_THRESHOLD (1.0) 时自动禁用凭据
+                    if remaining < LOW_BALANCE_THRESHOLD {
+                        self.mark_insufficient_balance(id);
+                        tracing::warn!(
+                            "凭据 #{} 余额不足 ({:.2})，已自动禁用",
+                            id,
+                            remaining
+                        );
+                    } else {
+                        tracing::info!("凭据 #{} 余额初始化成功: {:.2}", id, remaining);
+                    }
+                    success_count += 1;
+                }
+                Err(e) => {
+                    tracing::warn!("凭据 #{} 余额查询失败: {}", id, e);
+                }
+            }
+
+            // 非最后一个凭据时，间隔 0.5 秒
+            if index < credential_ids.len() - 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
+
+        tracing::info!(
+            "余额初始化完成: {}/{} 成功",
+            success_count,
+            credential_ids.len()
+        );
+
+        success_count
+    }
+
     /// 添加新凭据（Admin API）
     ///
     /// # 流程
