@@ -191,7 +191,7 @@ impl KiroProvider {
             };
 
             let url = endpoint.mcp_url(&rctx);
-            let body = endpoint.transform_mcp_body(request_body, &rctx);
+            let body = endpoint.transform_mcp_body(request_body, &rctx)?;
 
             let base = self
                 .client_for(&ctx.credentials)?
@@ -356,7 +356,7 @@ impl KiroProvider {
             };
 
             let url = endpoint.api_url(&rctx);
-            let body = endpoint.transform_api_body(request_body, &rctx);
+            let body = endpoint.transform_api_body(request_body, &rctx)?;
 
             let base = self
                 .client_for(&ctx.credentials)?

@@ -3,7 +3,7 @@
 use reqwest::RequestBuilder;
 use uuid::Uuid;
 
-use super::{KiroEndpoint, RequestContext};
+use super::{KiroEndpoint, RequestContext, UsageRequestParts};
 
 pub const CLI_ENDPOINT_NAME: &str = "cli";
 const CLI_ORIGIN: &str = "KIRO_CLI";
@@ -159,11 +159,36 @@ impl KiroEndpoint for CliEndpoint {
         req
     }
 
-    fn transform_api_body(&self, body: &str, _ctx: &RequestContext<'_>) -> String {
-        self.transform_body(body)
+    fn transform_api_body(&self, body: &str, _ctx: &RequestContext<'_>) -> anyhow::Result<String> {
+        Ok(self.transform_body(body))
     }
 
-    fn transform_mcp_body(&self, body: &str, _ctx: &RequestContext<'_>) -> String {
-        self.transform_body(body)
+    fn transform_mcp_body(&self, body: &str, _ctx: &RequestContext<'_>) -> anyhow::Result<String> {
+        Ok(self.transform_body(body))
+    }
+
+    fn usage_request_parts(&self, ctx: &RequestContext<'_>) -> anyhow::Result<UsageRequestParts> {
+        let host = self.host(ctx);
+        let url = format!(
+            "https://{}/getUsageLimits?origin={}&resourceType=AGENTIC_REQUEST",
+            host,
+            self.api_origin()
+        );
+
+        let mut headers = vec![
+            ("Accept", "application/json".to_string()),
+            ("x-amz-user-agent", self.runtime_x_amz_user_agent()),
+            ("user-agent", self.runtime_user_agent()),
+            ("host", host),
+            ("amz-sdk-invocation-id", Uuid::new_v4().to_string()),
+            ("amz-sdk-request", "attempt=1; max=1".to_string()),
+            ("Authorization", format!("Bearer {}", ctx.token)),
+        ];
+
+        if ctx.credentials.is_api_key_credential() {
+            headers.push(("tokentype", "API_KEY".to_string()));
+        }
+
+        Ok(UsageRequestParts { url, headers })
     }
 }

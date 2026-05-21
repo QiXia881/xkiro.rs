@@ -562,6 +562,19 @@ const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 
+/// 余额缓存：高频渠道 TTL（10 分钟）
+const BALANCE_TTL_HIGH_FREQ_SECS: u64 = 600;
+/// 余额缓存：低频渠道 TTL（30 分钟）
+const BALANCE_TTL_LOW_FREQ_SECS: u64 = 1800;
+/// 余额缓存：低余额渠道 TTL（24 小时，避免无意义反复刷低值）
+const BALANCE_TTL_LOW_BALANCE_SECS: u64 = 86400;
+/// 余额缓存：高频判定阈值（USAGE_COUNT_RESET_SECS 内使用超过此次数视为高频）
+const HIGH_FREQ_THRESHOLD: u32 = 20;
+/// 余额缓存：使用计数重置周期（10 分钟）
+const USAGE_COUNT_RESET_SECS: u64 = 600;
+/// 余额缓存：低余额阈值（小于此值切到长 TTL）
+const LOW_BALANCE_THRESHOLD: f64 = 1.0;
+
 /// API 调用上下文
 ///
 /// 绑定特定凭据的调用上下文，确保 token、credentials 和 id 的一致性
