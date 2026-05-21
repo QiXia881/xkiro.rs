@@ -16,6 +16,7 @@ use crate::kiro::model::requests::tool::{
 };
 use crate::model::config::CompressionConfig;
 
+use super::compressor::CompressionStats;
 use super::tool_compression;
 use super::types::{ContentBlock, MessagesRequest};
 
@@ -113,6 +114,17 @@ You are an autonomous coding agent. Follow these principles:\n\
 /// 超过此数量的图片会被丢弃，避免 base64 体积过大导致上游 400
 const MAX_TOTAL_IMAGES: usize = 20;
 
+/// 在不主动改变内容语义的前提下，对空文本兜底返回 ""。
+///
+/// - 含非文本载荷（图片 / tool_result）时保留原文，最终是否需要补占位符由调用方决定
+/// - 不含非文本载荷时同样保留原文，由调用方在最末做兜底
+fn non_empty_content_or_space(content: String, has_non_text_payload: bool) -> String {
+    if has_non_text_payload {
+        return content;
+    }
+    content
+}
+
 /// 统计单个消息内容中的图片数量
 fn count_images_in_content(content: &serde_json::Value) -> usize {
     match content {
@@ -202,6 +214,8 @@ pub fn get_context_window_size(model: &str) -> i32 {
 pub struct ConversionResult {
     /// 转换后的 Kiro 请求
     pub conversation_state: ConversationState,
+    /// 压缩统计信息（仅在启用压缩时有值）
+    pub compression_stats: Option<CompressionStats>,
     /// 工具名称映射（短名称 → 原始名称），仅当存在超长工具名时非空
     pub tool_name_map: HashMap<String, String>,
 }
@@ -211,6 +225,7 @@ pub struct ConversionResult {
 pub enum ConversionError {
     UnsupportedModel(String),
     EmptyMessages,
+    EmptyMessageContent,
 }
 
 impl std::fmt::Display for ConversionError {
@@ -218,6 +233,7 @@ impl std::fmt::Display for ConversionError {
         match self {
             ConversionError::UnsupportedModel(model) => write!(f, "模型不支持: {}", model),
             ConversionError::EmptyMessages => write!(f, "消息列表为空"),
+            ConversionError::EmptyMessageContent => write!(f, "消息内容为空"),
         }
     }
 }
@@ -324,6 +340,29 @@ pub fn convert_request(
         &req.messages
     };
 
+    // 2.6. 验证最后一条消息内容不为空
+    // 检查最后一条消息（经过 prefill 处理后）是否有有效内容
+    let last_message = messages.last().unwrap();
+    let has_valid_content = match &last_message.content {
+        serde_json::Value::String(s) => !s.trim().is_empty(),
+        serde_json::Value::Array(arr) => arr.iter().any(|item| {
+            if let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) {
+                match block.block_type.as_str() {
+                    "text" => block.text.as_ref().is_some_and(|t| !t.trim().is_empty()),
+                    "image" | "tool_use" | "tool_result" => true,
+                    _ => false,
+                }
+            } else {
+                false
+            }
+        }),
+        _ => false,
+    };
+    if !has_valid_content {
+        tracing::warn!("最后一条消息内容为空（仅包含空白文本或无内容）");
+        return Err(ConversionError::EmptyMessageContent);
+    }
+
     // 3. 生成会话 ID 和代理 ID
     // 优先从 metadata.user_id 中提取 session UUID 作为 conversationId
     let conversation_id = req
@@ -357,7 +396,11 @@ pub fn convert_request(
 
     // 6. 转换工具定义（超长名称自动缩短并记录映射）
     let mut tool_name_map = HashMap::new();
-    let mut tools = convert_tools(&req.tools, &mut tool_name_map);
+    let mut tools = convert_tools(
+        &req.tools,
+        compression_config.tool_description_max_chars,
+        &mut tool_name_map,
+    );
 
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
     let mut history = build_history(
@@ -386,26 +429,62 @@ pub fn convert_request(
     // Kiro API 要求：历史消息中引用的工具必须在 tools 列表中有定义
     // 注意：Kiro 匹配工具名称时忽略大小写，所以这里也需要忽略大小写比较
     let history_tool_names = collect_history_tool_names(&history);
-    let existing_tool_names: std::collections::HashSet<_> = tools
+    let mut existing_tool_names: std::collections::HashSet<_> = tools
         .iter()
         .map(|t| t.tool_specification.name.to_lowercase())
         .collect();
 
     for tool_name in history_tool_names {
-        if !existing_tool_names.contains(&tool_name.to_lowercase()) {
+        let lower = tool_name.to_lowercase();
+        if !existing_tool_names.contains(&lower) {
             tools.push(create_placeholder_tool(&tool_name));
+            existing_tool_names.insert(lower);
         }
     }
 
-    // 11.5. 工具定义压缩
-    let tools = tool_compression::compress_tools_if_needed(&tools);
+    // 10.5. 工具压缩：在所有工具（含 placeholder）就绪后执行
+    let mut tools = tool_compression::compress_tools_if_needed(&tools);
+
+    // 10.6. 工具统计诊断日志
+    {
+        let original_tool_count = req.tools.as_ref().map(|t| t.len()).unwrap_or(0);
+        let placeholder_count = tools.len().saturating_sub(original_tool_count);
+
+        // 大小写不敏感的重复检测
+        let mut name_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for t in &tools {
+            *name_counts
+                .entry(t.tool_specification.name.to_lowercase())
+                .or_insert(0) += 1;
+        }
+        let duplicates: Vec<_> = name_counts
+            .iter()
+            .filter(|(_, count)| **count > 1)
+            .map(|(name, count)| format!("{}(x{})", name, count))
+            .collect();
+
+        if !duplicates.is_empty() {
+            tracing::warn!(
+                tool_count = tools.len(),
+                duplicates = ?duplicates,
+                "检测到重复工具名称（大小写不敏感）"
+            );
+        }
+        tracing::info!(
+            tool_count = tools.len(),
+            placeholder_count = placeholder_count,
+            "工具定义统计"
+        );
+    }
 
     // 11. 构建 UserInputMessageContext
     let mut context = UserInputMessageContext::new();
     if !tools.is_empty() {
-        context = context.with_tools(tools);
+        context = context.with_tools(std::mem::take(&mut tools));
     }
-    if !validated_tool_results.is_empty() {
+    let has_tool_results = !validated_tool_results.is_empty();
+    if has_tool_results {
         context = context.with_tool_results(validated_tool_results);
     }
 
@@ -423,7 +502,14 @@ pub fn convert_request(
 
     // 12. 构建当前消息
     // 保留文本内容，即使有工具结果也不丢弃用户文本
-    let content = text_content;
+    let content = non_empty_content_or_space(text_content, !images.is_empty() || has_tool_results);
+    // current_message 是请求主体，必须保留；若文本为空且无非文本载荷，最终兜底
+    let content = if content.trim().is_empty() && images.is_empty() && !has_tool_results {
+        tracing::warn!("currentMessage content 为空，已使用占位符修复");
+        ".".to_string()
+    } else {
+        content
+    };
 
     let mut user_input = UserInputMessage::new(content, &model_id)
         .with_context(context)
@@ -436,12 +522,24 @@ pub fn convert_request(
     let current_message = CurrentMessage::new(user_input);
 
     // 13. 构建 ConversationState
-    let conversation_state = ConversationState::new(conversation_id)
+    let mut conversation_state = ConversationState::new(conversation_id)
         .with_agent_continuation_id(agent_continuation_id)
         .with_agent_task_type("vibe")
         .with_chat_trigger_type(chat_trigger_type)
         .with_current_message(current_message)
         .with_history(history);
+
+    // 14. 执行输入压缩
+    let compression_stats = if compression_config.enabled {
+        let stats = super::compressor::compress(&mut conversation_state, compression_config);
+        if stats.total_saved() > 0 || stats.history_turns_removed > 0 {
+            Some(stats)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     if !tool_name_map.is_empty() {
         tracing::info!("工具名称映射: {} 个超长名称已缩短", tool_name_map.len());
@@ -449,6 +547,7 @@ pub fn convert_request(
 
     Ok(ConversionResult {
         conversation_state,
+        compression_stats,
         tool_name_map,
     })
 }
@@ -825,6 +924,7 @@ fn map_tool_name(name: &str, tool_name_map: &mut HashMap<String, String>) -> Str
 /// 转换工具定义
 fn convert_tools(
     tools: &Option<Vec<super::types::Tool>>,
+    max_description_chars: usize,
     tool_name_map: &mut HashMap<String, String>,
 ) -> Vec<Tool> {
     let Some(tools) = tools else {
@@ -833,8 +933,24 @@ fn convert_tools(
 
     tools
         .iter()
+        .filter(|t| {
+            // 过滤掉 web_search 类型的工具（Kiro API 当前不支持）
+            // 工具类型格式: "web_search_20250305"
+            let dropped = t
+                .tool_type
+                .as_ref()
+                .is_some_and(|ty| ty.starts_with("web_search"));
+            if dropped {
+                tracing::debug!("过滤不支持的工具: name={}, type={:?}", t.name, t.tool_type);
+            }
+            !dropped
+        })
         .map(|t| {
-            let mut description = t.description.clone();
+            let mut description = if t.description.trim().is_empty() {
+                format!("Tool: {}", t.name)
+            } else {
+                t.description.clone()
+            };
 
             // 对 Write/Edit 工具追加自定义描述后缀
             let suffix = match t.name.as_str() {
@@ -847,10 +963,14 @@ fn convert_tools(
                 description.push_str(suffix);
             }
 
-            // 限制描述长度为 10000 字符（安全截断 UTF-8，单次遍历）
-            let description = match description.char_indices().nth(10000) {
-                Some((idx, _)) => description[..idx].to_string(),
-                None => description,
+            // 限制描述长度（0=不截断；安全截断 UTF-8，单次遍历）
+            let description = if max_description_chars > 0 {
+                match description.char_indices().nth(max_description_chars) {
+                    Some((idx, _)) => description[..idx].to_string(),
+                    None => description,
+                }
+            } else {
+                description
             };
 
             Tool {
