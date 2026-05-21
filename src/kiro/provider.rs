@@ -409,6 +409,8 @@ impl KiroProvider {
             // 成功响应
             if status.is_success() {
                 self.token_manager.report_success(ctx.id);
+                // 后台异步刷新余额缓存（贴合 BK provider.rs:633）
+                self.spawn_balance_refresh(ctx.id);
                 return Ok(ApiCallResult {
                     response,
                     credential_id: ctx.id,
@@ -630,6 +632,41 @@ impl KiroProvider {
         let jitter_max = (backoff / 4).max(1);
         let jitter = fastrand::u64(0..=jitter_max);
         Duration::from_millis(backoff.saturating_add(jitter))
+    }
+
+    /// 后台异步刷新余额缓存（如果需要）
+    ///
+    /// 贴合 BK provider.rs:190-212：成功调用 API 后触发，仅在 TTL 到期时才发起
+    /// `getUsageLimits` 请求，避免每次 API 调用都阻塞在余额查询上。
+    ///
+    /// 余额低于 1.0 时主动调用 `mark_insufficient_balance` 禁用凭据，确保
+    /// admin UI 余额显示与故障转移逻辑同步。
+    fn spawn_balance_refresh(&self, id: u64) {
+        // 检查缓存是否需要刷新（TTL 5 分钟，xkiro 独有保留）
+        if !self.token_manager.should_refresh_balance(id) {
+            return;
+        }
+        let tm = Arc::clone(&self.token_manager);
+        tokio::spawn(async move {
+            match tm.get_usage_limits_for(id).await {
+                Ok(resp) => {
+                    let remaining = resp.usage_limit() - resp.current_usage();
+                    tm.update_balance_cache(id, remaining);
+                    tracing::debug!("凭据 #{} 余额缓存已刷新: {:.2}", id, remaining);
+                    if remaining < 1.0 {
+                        tm.mark_insufficient_balance(id);
+                        tracing::warn!(
+                            "凭据 #{} 余额不足 ({:.2})，已主动禁用",
+                            id,
+                            remaining
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("凭据 #{} 余额刷新失败: {}", id, e);
+                }
+            }
+        });
     }
 }
 
