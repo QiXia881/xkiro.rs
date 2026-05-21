@@ -44,8 +44,7 @@ struct CachedBalance {
 /// 封装所有 Admin API 的业务逻辑
 pub struct AdminService {
     token_manager: Arc<MultiTokenManager>,
-    /// Kiro Provider 引用，用于 region/endpoint 热更新
-    #[allow(dead_code)]
+    /// Kiro Provider 引用，用于 region/endpoint/global_proxy 热更新双层同步
     kiro_provider: Option<Arc<KiroProvider>>,
     /// 共享压缩配置，与 AppState 同源（运行时热更新）
     compression_config: Arc<RwLock<CompressionConfig>>,
@@ -625,9 +624,13 @@ impl AdminService {
         })?;
 
         // 3. 持久化成功后再应用运行时变更
-        // 注：xkiro 没有 provider.update_global_proxy 与 crate::token::update_proxy 同步点，
-        //     全局代理只通过 MultiTokenManager.update_proxy 生效。
-        self.token_manager.update_proxy(new_proxy);
+        // 贴合 BK admin/service.rs:785-808：先 token_manager 后 provider 双层同步
+        self.token_manager.update_proxy(new_proxy.clone());
+        if let Some(provider) = &self.kiro_provider {
+            if let Err(e) = provider.update_global_proxy(new_proxy) {
+                tracing::warn!("provider.update_global_proxy 失败（已持久化）: {}", e);
+            }
+        }
 
         Ok(())
     }
@@ -731,10 +734,21 @@ impl AdminService {
             self.token_manager.update_region(config.region.clone());
         }
 
-        // 热更新 default_endpoint（xkiro 无 provider.update_default_endpoint 同步）
+        // 热更新 default_endpoint
+        // 贴合 BK admin/service.rs:910-925：token_manager 先 + provider 后双层同步
         if req.default_endpoint.is_some() {
             self.token_manager
                 .update_default_endpoint(config.default_endpoint.clone());
+            if let Some(provider) = &self.kiro_provider {
+                if let Err(e) =
+                    provider.update_default_endpoint(config.default_endpoint.clone())
+                {
+                    tracing::warn!(
+                        "provider.update_default_endpoint 失败（已持久化）: {}",
+                        e
+                    );
+                }
+            }
         }
 
         // 热更新 Prompt Cache 运行时配置

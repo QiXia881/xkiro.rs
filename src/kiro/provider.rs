@@ -17,7 +17,7 @@ use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::TlsBackend;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 
 /// API 调用结果
 pub struct ApiCallResult {
@@ -45,7 +45,9 @@ const MAX_TOTAL_RETRIES: usize = 9;
 pub struct KiroProvider {
     token_manager: Arc<MultiTokenManager>,
     /// 全局代理配置（用于凭据无自定义代理时的回退）
-    global_proxy: Option<ProxyConfig>,
+    ///
+    /// 使用 RwLock 包裹以支持运行时热更新（贴合 BK provider.rs:108）
+    global_proxy: RwLock<Option<ProxyConfig>>,
     /// Client 缓存：key = effective proxy config, value = reqwest::Client
     /// 不同代理配置的凭据使用不同的 Client，共享相同代理的凭据复用 Client
     client_cache: Mutex<HashMap<Option<ProxyConfig>, Client>>,
@@ -54,7 +56,9 @@ pub struct KiroProvider {
     /// 端点实现注册表（key: endpoint 名称）
     endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
     /// 默认端点名称（凭据未指定 endpoint 时使用）
-    default_endpoint: String,
+    ///
+    /// 使用 RwLock 包裹以支持运行时热更新（贴合 BK provider.rs:111）
+    default_endpoint: RwLock<String>,
 }
 
 impl KiroProvider {
@@ -85,17 +89,17 @@ impl KiroProvider {
 
         Self {
             token_manager,
-            global_proxy: proxy,
+            global_proxy: RwLock::new(proxy),
             client_cache: Mutex::new(cache),
             tls_backend,
             endpoints,
-            default_endpoint,
+            default_endpoint: RwLock::new(default_endpoint),
         }
     }
 
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
     fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
-        let effective = credentials.effective_proxy(self.global_proxy.as_ref());
+        let effective = credentials.effective_proxy(self.global_proxy.read().as_ref());
         let mut cache = self.client_cache.lock();
         if let Some(client) = cache.get(&effective) {
             return Ok(client.clone());
@@ -110,14 +114,45 @@ impl KiroProvider {
         &self,
         credentials: &KiroCredentials,
     ) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
+        let default = self.default_endpoint.read();
         let name = credentials
             .endpoint
             .as_deref()
-            .unwrap_or(&self.default_endpoint);
+            .unwrap_or(default.as_str());
         self.endpoints
             .get(name)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("未知端点: {}", name))
+    }
+
+    /// 热更新全局代理配置
+    ///
+    /// 贴合 BK provider.rs:118-128：替换 global_proxy 后清空 client_cache，
+    /// 让下次 [`Self::client_for`] 调用按需重建凭据级 Client。
+    pub fn update_global_proxy(&self, proxy: Option<ProxyConfig>) -> anyhow::Result<()> {
+        // 提前验证新代理配置是否能成功构建 Client，避免清空缓存后下次请求失败
+        let new_client = build_client(proxy.as_ref(), 720, self.tls_backend)?;
+
+        *self.global_proxy.write() = proxy.clone();
+        // 清空缓存并预热全局代理对应的 Client（保留 xkiro 原 with_proxy 的预热语义）
+        let mut cache = self.client_cache.lock();
+        cache.clear();
+        cache.insert(proxy, new_client);
+
+        tracing::info!("全局代理配置已热更新，client_cache 已重建");
+        Ok(())
+    }
+
+    /// 热更新默认 endpoint 名称
+    ///
+    /// 贴合 BK provider.rs:131-138：仅当目标端点已在注册表中时才生效。
+    pub fn update_default_endpoint(&self, default_endpoint: String) -> anyhow::Result<()> {
+        if !self.endpoints.contains_key(&default_endpoint) {
+            return Err(anyhow::anyhow!("未知端点: {}", default_endpoint));
+        }
+        *self.default_endpoint.write() = default_endpoint;
+        tracing::info!("默认 endpoint 已热更新");
+        Ok(())
     }
 
     /// 发送非流式 API 请求
