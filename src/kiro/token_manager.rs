@@ -911,18 +911,19 @@ impl MultiTokenManager {
 
     /// 给 acquire_context 用的候选排序：返回排好序的凭据 id 列表。
     ///
-    /// 算法：(priority, has_primary, in_flight, primary_bucket, overage_bucket) 字典序
-    ///
-    /// - `priority` asc：用户配置的优先级（0 最高）。同 priority 才参与下层比较。
-    /// - `has_primary` desc：还有正式额度（>=1.0）的优先于只剩超额的；
-    ///   即使后者总额更高，也排在 has_primary=true 后面。
-    /// - `in_flight = max_permits - sema.available_permits()` asc：LEAST_REQUEST，
-    ///   均衡负载，最少在飞的优先（A=1, B=0, C=1 → 选 B）。
-    /// - `primary_bucket = log2(primary).floor()` desc：同上述键时余额多的优先；同档 tie。
-    /// - `overage_bucket = log2(overage).floor()` desc：primary 全 0 时按超额量级。
-    /// - 同 (priority, has_primary, in_flight, primary_bucket, overage_bucket) 段：rr 轮转。
-    ///
-    /// 单并发场景：in_flight 全 0，余额量级相近 → tie 走 rr，不会盯单凭据。
+    /// 排序字典序（每一项为前一项的 tie-breaker）：
+    /// 1. `priority` asc：用户优先级（0 最高），分层匹配，同 priority 才参与下层比较。
+    /// 2. `has_primary` desc：还有正式剩余（>=1.0）的永远压制只剩超额的，
+    ///    即使后者总额更大。
+    /// 3. `primary_bucket = log2(primary).floor()` desc：正式剩余多的优先（量级粒度，
+    ///    避免 ±几次调用的浮点抖动反复重排）。
+    /// 4. `has_overage` desc：primary 全为 0 时，**超额已开启且有剩余**的优先；
+    ///    上游未开 overage 时缓存内 overage_remaining=0 → has_overage=false → 排末尾。
+    /// 5. `overage_bucket = log2(overage).floor()` desc：超额剩余多的优先。
+    /// 6. `in_flight = max_permits - available_permits` asc：仅作最末位 tie-breaker，
+    ///    LEAST_REQUEST 兜底打散并发；不能盖过余额，否则会出现"剩余少但暂时空闲"
+    ///    压过"剩余多但 1 个在飞"的反直觉行为。
+    /// 7. 完整 6 元组相同的段：rr 轮转，公平分摊。
     ///
     /// acquire_context 拿到列表后挨个 `try_acquire_owned`，第一个抢到 permit 的就用。
     fn rank_candidates(&self, model: Option<&str>) -> Vec<u64> {
@@ -1007,12 +1008,15 @@ impl MultiTokenManager {
             }
         };
 
-        // 5. 排序键：(priority asc, has_primary desc, in_flight asc, primary_bucket desc, overage_bucket desc)
-        //    - priority asc：用户优先级（0 最高）
-        //    - has_primary desc：还有正式额度的优先于只剩超额的（即使后者总额更大）
-        //    - in_flight asc：均衡负载，最少在飞的优先（Envoy LEAST_REQUEST）
-        //    - primary_bucket desc：同上述键时余额多的优先；同档 tie 走 rr 打散
-        //    - overage_bucket desc：primary 全为 0 时按超额额度量级
+        // 5. 排序键：(priority asc, has_primary desc, primary_bucket desc,
+        //              has_overage desc, overage_bucket desc, in_flight asc)
+        //    - priority asc：用户优先级（0 最高），分层匹配的最外层
+        //    - has_primary desc：还有正式剩余的永远压制只剩超额的（即使后者总额更大）
+        //    - primary_bucket desc：在 has_primary 同档内，正式剩余多的优先
+        //    - has_overage desc：primary 全 0 时，开了超额且有剩余的优先
+        //    - overage_bucket desc：超额剩余多的优先
+        //    - in_flight asc：以上全 tie 时，把当前最少在飞的放前面（仅作 tie-breaker，
+        //      不能盖过余额；否则会出现"剩余少但空闲"压过"剩余多但 1 个在飞"的反直觉行为）
         const REMAINING_EPS: f64 = 1e-3;
         let bucket = |r: f64| -> i32 {
             if r <= REMAINING_EPS {
@@ -1021,7 +1025,7 @@ impl MultiTokenManager {
                 r.log2().floor() as i32
             }
         };
-        let mut scored: Vec<(u64, u32, bool, usize, i32, i32)> = candidate_ids
+        let mut scored: Vec<(u64, u32, bool, i32, bool, i32, usize)> = candidate_ids
             .iter()
             .map(|&id| {
                 let max = *max_permits_map.get(&id).unwrap_or(&global_per_cred);
@@ -1032,25 +1036,34 @@ impl MultiTokenManager {
                 let in_flight = max.saturating_sub(avail);
                 let cached = balances.get(&id).copied().flatten();
                 let (primary, overage) = match cached {
-                    Some((p, o)) => (p.max(REMAINING_EPS), o.max(0.0)),
+                    Some((p, o)) => (p.max(0.0), o.max(0.0)),
                     None => (unknown_fallback.max(REMAINING_EPS), 0.0),
                 };
                 let has_primary = primary >= 1.0;
+                let has_overage = overage >= 1.0;
                 let pri = priority_map.get(&id).copied().unwrap_or(0);
-                (id, pri, has_primary, in_flight, bucket(primary), bucket(overage))
+                (
+                    id,
+                    pri,
+                    has_primary,
+                    bucket(primary.max(REMAINING_EPS)),
+                    has_overage,
+                    bucket(overage.max(REMAINING_EPS)),
+                    in_flight,
+                )
             })
             .collect();
 
-        // priority asc, has_primary desc(true 优先), in_flight asc, primary_bucket desc, overage_bucket desc
         scored.sort_by(|a, b| {
-            a.1.cmp(&b.1)
-                .then(b.2.cmp(&a.2))
-                .then(a.3.cmp(&b.3))
-                .then(b.4.cmp(&a.4))
-                .then(b.5.cmp(&a.5))
+            a.1.cmp(&b.1) // priority asc
+                .then(b.2.cmp(&a.2)) // has_primary desc
+                .then(b.3.cmp(&a.3)) // primary_bucket desc
+                .then(b.4.cmp(&a.4)) // has_overage desc
+                .then(b.5.cmp(&a.5)) // overage_bucket desc
+                .then(a.6.cmp(&b.6)) // in_flight asc (tie-breaker)
         });
 
-        // 6. 同 (priority, has_primary, in_flight, primary_bucket, overage_bucket) 段做 rr 轮转
+        // 6. 完整 6 元组相同的段做 rr 轮转（同优先级同余额量级同负载，公平打散）
         let mut result: Vec<u64> = Vec::with_capacity(scored.len());
         let mut i = 0;
         while i < scored.len() {
@@ -1061,6 +1074,7 @@ impl MultiTokenManager {
                 && scored[j].3 == scored[i].3
                 && scored[j].4 == scored[i].4
                 && scored[j].5 == scored[i].5
+                && scored[j].6 == scored[i].6
             {
                 j += 1;
             }
