@@ -101,6 +101,7 @@ function BalanceBlock({ balance, loading, overageMutating, onToggleOverage }: Ba
   const basePercent = limit > 0 ? Math.min(100, (baseUsed / limit) * 100) : 0
   const overUsed = Math.max(0, used - limit)
   const overCap = balance.overageCap || 0
+  const overRemaining = Math.max(0, overCap - overUsed)
   const overPercent = overCap > 0 ? Math.min(100, (overUsed / overCap) * 100) : 0
 
   const resetStr = formatResetDate(balance.nextResetAt)
@@ -138,7 +139,7 @@ function BalanceBlock({ balance, loading, overageMutating, onToggleOverage }: Ba
           <div className="flex items-baseline justify-between gap-2">
             <span className="text-xs text-muted-foreground">超额额度</span>
             <span className="tabular text-xs font-medium">
-              <span className="text-foreground">{overUsed.toFixed(2)}</span>
+              <span className="text-foreground">{overRemaining.toFixed(2)}</span>
               <span className="text-muted-foreground"> / {overCap > 0 ? overCap.toFixed(2) : '—'}</span>
             </span>
           </div>
