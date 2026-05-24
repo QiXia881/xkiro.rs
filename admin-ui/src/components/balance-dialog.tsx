@@ -69,33 +69,45 @@ export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialo
               </span>
             </div>
 
-            {/* 使用进度 */}
+            {/* 正式额度进度 */}
             <div className="space-y-2">
               <div className="flex justify-between text-sm">
-                <span>已使用: ${formatNumber(balance.currentUsage)}</span>
-                <span>限额: ${formatNumber(balance.usageLimit)}</span>
+                <span>正式额度</span>
+                <span className="text-muted-foreground">
+                  {formatNumber(Math.min(balance.currentUsage, balance.usageLimit))} / {formatNumber(balance.usageLimit)}
+                </span>
               </div>
-              <Progress value={balance.usagePercentage} />
+              <Progress value={Math.min(100, balance.usagePercentage)} />
               <div className="text-center text-sm text-muted-foreground">
-                {balance.usagePercentage.toFixed(1)}% 已使用
+                剩余 ${formatNumber(balance.remaining)} · 下次重置 {formatDate(balance.nextResetAt)}
               </div>
             </div>
 
-            {/* 详细信息 */}
-            <div className="grid grid-cols-2 gap-4 pt-4 border-t text-sm">
-              <div>
-                <span className="text-muted-foreground">剩余额度：</span>
-                <span className="font-medium text-green-600">
-                  ${formatNumber(balance.remaining)}
-                </span>
+            {/* 超额额度进度 */}
+            {(balance.overageCapability === 'OVERAGE_CAPABLE' || balance.overageCap > 0 || balance.currentUsage > balance.usageLimit) && (
+              <div className="space-y-2 pt-2 border-t">
+                <div className="flex justify-between text-sm">
+                  <span>超额额度</span>
+                  <span className="text-muted-foreground">
+                    {formatNumber(Math.max(0, balance.currentUsage - balance.usageLimit))} / {balance.overageCap > 0 ? formatNumber(balance.overageCap) : '—'}
+                  </span>
+                </div>
+                {balance.overageCap > 0 ? (
+                  <Progress value={Math.min(100, ((balance.currentUsage - balance.usageLimit) / balance.overageCap) * 100)} />
+                ) : (
+                  <div className="text-xs text-muted-foreground">订阅未提供超额上限</div>
+                )}
+                <div className="text-center text-xs text-muted-foreground">
+                  {balance.overageStatus === 'ENABLED'
+                    ? '远端开关：已启用'
+                    : balance.overageStatus === 'DISABLED'
+                      ? '远端开关：已禁用'
+                      : balance.overageCapability === 'OVERAGE_INCAPABLE'
+                        ? '订阅不支持超额'
+                        : ''}
+                </div>
               </div>
-              <div>
-                <span className="text-muted-foreground">下次重置：</span>
-                <span className="font-medium">
-                  {formatDate(balance.nextResetAt)}
-                </span>
-              </div>
-            </div>
+            )}
           </div>
         )}
       </DialogContent>

@@ -7,6 +7,7 @@ import {
   resetCredentialFailure,
   forceRefreshToken,
   getCredentialBalance,
+  setOverageStatus,
   addCredential,
   deleteCredential,
 } from '@/api/credentials'
@@ -85,6 +86,19 @@ export function useForceRefreshToken() {
     mutationFn: (id: number) => forceRefreshToken(id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 切换上游 overage 开关
+export function useSetOverage() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, enabled }: { id: number; enabled: boolean }) =>
+      setOverageStatus(id, enabled),
+    onSuccess: (_data, vars) => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      queryClient.invalidateQueries({ queryKey: ['credential-balance', vars.id] })
     },
   })
 }

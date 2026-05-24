@@ -15,7 +15,7 @@ import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-
 import { SettingsDialog } from '@/components/settings-dialog'
 import { useCredentials, useDeleteCredential, useResetFailure } from '@/hooks/use-credentials'
 import { useRuntimeStats } from '@/hooks/use-runtime-stats'
-import { getCredentialBalance, refreshBatch, refreshBalancesBatch } from '@/api/credentials'
+import { getCredentialBalance, refreshBatch, refreshBalancesBatch, getCachedBalances } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse } from '@/types/api'
 
@@ -130,6 +130,42 @@ export function Dashboard({ onLogout }: DashboardProps) {
       document.documentElement.classList.add('dark')
     } else {
       document.documentElement.classList.remove('dark')
+    }
+  }, [])
+
+  // 首次挂载拉取后端缓存余额，预填到 balanceMap
+  // 后端启动时会并行预取所有未禁用凭据的余额并写入磁盘缓存，
+  // 这里直接复用，省掉用户进入页面后再手动点查询的步骤
+  useEffect(() => {
+    let cancelled = false
+    getCachedBalances()
+      .then(resp => {
+        if (cancelled) return
+        setBalanceMap(prev => {
+          const next = new Map(prev)
+          resp.balances.forEach(item => {
+            // 把 CachedBalanceItem 投影到 BalanceResponse 形状（字段一一对应）
+            next.set(item.id, {
+              id: item.id,
+              subscriptionTitle: item.subscriptionTitle,
+              currentUsage: item.currentUsage,
+              usageLimit: item.usageLimit,
+              remaining: item.remaining,
+              usagePercentage: item.usagePercentage,
+              nextResetAt: item.nextResetAt,
+              overageCap: item.overageCap,
+              overageCapability: item.overageCapability,
+              overageStatus: item.overageStatus,
+            })
+          })
+          return next
+        })
+      })
+      .catch(() => {
+        // 缓存接口失败不打扰用户，让 dashboard 走原本的手动查询路径
+      })
+    return () => {
+      cancelled = true
     }
   }, [])
 
@@ -413,65 +449,58 @@ export function Dashboard({ onLogout }: DashboardProps) {
     deselectAll()
   }
 
-  // 查询当前页凭据信息（逐个查询，避免瞬时并发）
+  // 查询所有未禁用凭据信息（一次往返调 batch 端点，不刷 token）
   const handleQueryCurrentPageInfo = async () => {
-    if (currentCredentials.length === 0) {
-      toast.error('当前页没有可查询的凭据')
+    if (!data?.credentials || data.credentials.length === 0) {
+      toast.error('暂无可查询的凭据')
       return
     }
 
-    const ids = currentCredentials
+    const ids = data.credentials
       .filter(credential => !credential.disabled)
       .map(credential => credential.id)
 
     if (ids.length === 0) {
-      toast.error('当前页没有可查询的启用凭据')
+      toast.error('没有可查询的启用凭据')
       return
     }
 
     setQueryingInfo(true)
     setQueryInfoProgress({ current: 0, total: ids.length })
+    setLoadingBalanceIds(prev => {
+      const next = new Set(prev)
+      ids.forEach(id => next.add(id))
+      return next
+    })
 
-    let successCount = 0
-    let failCount = 0
+    try {
+      const resp = await refreshBalancesBatch(ids)
+      setQueryInfoProgress({ current: ids.length, total: ids.length })
 
-    for (let i = 0; i < ids.length; i++) {
-      const id = ids[i]
-
-      setLoadingBalanceIds(prev => {
-        const next = new Set(prev)
-        next.add(id)
+      setBalanceMap(prev => {
+        const next = new Map(prev)
+        resp.results.forEach(item => {
+          if (item.success && item.balance) {
+            next.set(item.id, item.balance)
+          }
+        })
         return next
       })
 
-      try {
-        const balance = await getCredentialBalance(id)
-        successCount++
-
-        setBalanceMap(prev => {
-          const next = new Map(prev)
-          next.set(id, balance)
-          return next
-        })
-      } catch (error) {
-        failCount++
-      } finally {
-        setLoadingBalanceIds(prev => {
-          const next = new Set(prev)
-          next.delete(id)
-          return next
-        })
+      if (resp.failureCount === 0) {
+        toast.success(`查询完成：成功 ${resp.successCount}/${ids.length}`)
+      } else {
+        toast.warning(`查询完成：成功 ${resp.successCount} 个，失败 ${resp.failureCount} 个`)
       }
-
-      setQueryInfoProgress({ current: i + 1, total: ids.length })
-    }
-
-    setQueryingInfo(false)
-
-    if (failCount === 0) {
-      toast.success(`查询完成：成功 ${successCount}/${ids.length}`)
-    } else {
-      toast.warning(`查询完成：成功 ${successCount} 个，失败 ${failCount} 个`)
+    } catch (error) {
+      toast.error(`批量查询失败：${extractErrorMessage(error)}`)
+    } finally {
+      setLoadingBalanceIds(prev => {
+        const next = new Set(prev)
+        ids.forEach(id => next.delete(id))
+        return next
+      })
+      setQueryingInfo(false)
     }
   }
 
@@ -761,6 +790,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
                     onToggleSelect={() => toggleSelect(credential.id)}
                     balance={balanceMap.get(credential.id) || null}
                     loadingBalance={loadingBalanceIds.has(credential.id)}
+                    onBalanceChange={(id, next) => {
+                      setBalanceMap(prev => {
+                        const m = new Map(prev)
+                        if (next) m.set(id, next)
+                        else m.delete(id)
+                        return m
+                      })
+                    }}
                   />
                 ))}
               </div>

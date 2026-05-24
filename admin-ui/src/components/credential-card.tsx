@@ -7,6 +7,7 @@ import { Badge } from '@/components/ui/badge'
 import { Switch } from '@/components/ui/switch'
 import { Input } from '@/components/ui/input'
 import { Checkbox } from '@/components/ui/checkbox'
+import { Progress } from '@/components/ui/progress'
 import {
   Dialog,
   DialogContent,
@@ -23,7 +24,9 @@ import {
   useResetFailure,
   useDeleteCredential,
   useForceRefreshToken,
+  useSetOverage,
 } from '@/hooks/use-credentials'
+import { getCredentialBalance } from '@/api/credentials'
 
 interface CredentialCardProps {
   credential: CredentialStatusItem
@@ -32,6 +35,8 @@ interface CredentialCardProps {
   onToggleSelect: () => void
   balance: BalanceResponse | null
   loadingBalance: boolean
+  /** 父级 balanceMap 派发器，用于乐观更新/失败回滚/真值覆盖 */
+  onBalanceChange: (id: number, next: BalanceResponse | null) => void
 }
 
 function formatLastUsed(lastUsedAt: string | null): string {
@@ -50,6 +55,131 @@ function formatLastUsed(lastUsedAt: string | null): string {
   return `${days} 天前`
 }
 
+function formatResetDate(ts: number | null): string | null {
+  if (!ts) return null
+  const date = new Date(ts * 1000)
+  return date.toLocaleDateString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit' })
+}
+
+function daysUntil(ts: number | null): number | null {
+  if (!ts) return null
+  const diff = ts * 1000 - Date.now()
+  if (diff <= 0) return 0
+  return Math.ceil(diff / (1000 * 60 * 60 * 24))
+}
+
+interface BalanceBlockProps {
+  balance: BalanceResponse | null
+  loading: boolean
+  overageMutating: boolean
+  onToggleOverage: (next: boolean) => void
+}
+
+// 余额展示：正式额度进度条 + 超额进度条
+// 正式额度按 usage_limit 计 100%；超额（current_usage > usage_limit）从超额池计算独立进度条
+function BalanceBlock({ balance, loading, overageMutating, onToggleOverage }: BalanceBlockProps) {
+  if (loading) {
+    return (
+      <div className="flex items-center gap-2 text-sm text-muted-foreground">
+        <Loader2 className="w-3 h-3 animate-spin" /> 加载中...
+      </div>
+    )
+  }
+
+  if (!balance) {
+    return (
+      <div className="flex items-center justify-between">
+        <span className="text-muted-foreground text-sm">剩余用量：</span>
+        <span className="text-sm text-muted-foreground">未知</span>
+      </div>
+    )
+  }
+
+  const limit = balance.usageLimit
+  const used = balance.currentUsage
+  // 正式额度部分：未超额时按实际使用，超额时锁定 100%
+  const baseUsed = Math.min(used, limit)
+  const baseRemaining = Math.max(0, limit - used)
+  const basePercent = limit > 0 ? Math.min(100, (baseUsed / limit) * 100) : 0
+  // 超额部分：current_usage 超过 usage_limit 的差值
+  const overUsed = Math.max(0, used - limit)
+  const overCap = balance.overageCap || 0
+  const overPercent = overCap > 0 ? Math.min(100, (overUsed / overCap) * 100) : 0
+
+  const resetStr = formatResetDate(balance.nextResetAt)
+  const daysLeft = daysUntil(balance.nextResetAt)
+  const showOverage = balance.overageCapability === 'OVERAGE_CAPABLE' || overUsed > 0 || overCap > 0
+
+  return (
+    <div className="space-y-3">
+      {/* 正式额度 */}
+      <div className="space-y-1">
+        <div className="flex items-center justify-between">
+          <span className="text-muted-foreground text-sm">正式额度</span>
+          <span className="font-medium text-sm">
+            {baseRemaining.toFixed(2)} / {limit.toFixed(2)}
+            <span className="text-xs text-muted-foreground ml-1">
+              ({(100 - basePercent).toFixed(1)}% 剩余)
+            </span>
+          </span>
+        </div>
+        <Progress value={basePercent} className="h-2" />
+        {resetStr && (
+          <div className="text-xs text-muted-foreground">
+            下次重置：{resetStr}
+            {daysLeft != null && ` · ${daysLeft === 0 ? '今日' : `${daysLeft} 天后`}`}
+          </div>
+        )}
+      </div>
+
+      {/* 超额额度 */}
+      {showOverage && (
+        <div className="space-y-1">
+          <div className="flex items-center justify-between">
+            <span className="text-muted-foreground text-sm">超额额度</span>
+            <span className="font-medium text-sm">
+              {overUsed.toFixed(2)} / {overCap > 0 ? overCap.toFixed(2) : '—'}
+              {overCap > 0 && (
+                <span className="text-xs text-muted-foreground ml-1">
+                  ({overPercent.toFixed(1)}% 已用)
+                </span>
+              )}
+            </span>
+          </div>
+          {overCap > 0 ? (
+            <Progress value={overPercent} className="h-2" />
+          ) : (
+            <div className="text-xs text-muted-foreground">订阅未提供超额上限</div>
+          )}
+          <div className="flex items-center justify-between text-xs pt-0.5">
+            <span className="text-muted-foreground">
+              {overageMutating
+                ? '切换中...'
+                : balance.overageCapability === 'OVERAGE_CAPABLE'
+                  ? balance.overageStatus === 'ENABLED'
+                    ? '订阅支持超额 · 已开启'
+                    : '订阅支持超额 · 已关闭'
+                  : balance.overageCapability === 'OVERAGE_INCAPABLE'
+                    ? '订阅不支持超额'
+                    : ''}
+            </span>
+            {balance.overageCapability === 'OVERAGE_CAPABLE' && (
+              <div className="flex items-center gap-2">
+                <span className="text-muted-foreground">超额开关</span>
+                <Switch
+                  checked={balance.overageStatus === 'ENABLED'}
+                  disabled={overageMutating}
+                  onCheckedChange={onToggleOverage}
+                />
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 export function CredentialCard({
   credential,
   onViewBalance,
@@ -57,6 +187,7 @@ export function CredentialCard({
   onToggleSelect,
   balance,
   loadingBalance,
+  onBalanceChange,
 }: CredentialCardProps) {
   const [editingPriority, setEditingPriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
@@ -82,6 +213,8 @@ export function CredentialCard({
   const resetFailure = useResetFailure()
   const deleteCredential = useDeleteCredential()
   const forceRefresh = useForceRefreshToken()
+  const setOverage = useSetOverage()
+  const overageMutating = setOverage.isPending
 
   const handleToggleDisabled = () => {
     setDisabled.mutate(
@@ -92,6 +225,38 @@ export function CredentialCard({
         },
         onError: (err) => {
           toast.error('操作失败: ' + (err as Error).message)
+        },
+      }
+    )
+  }
+
+  // KAM 模式：乐观更新 → 调上游切换 → 成功后拉真值覆盖 → 失败回滚
+  // 父级 balanceMap 是单一真源，全部经 onBalanceChange 派发
+  const handleToggleOverage = (next: boolean) => {
+    if (!balance) return
+    const prev = balance
+    const optimistic: BalanceResponse = {
+      ...balance,
+      overageStatus: next ? 'ENABLED' : 'DISABLED',
+    }
+    onBalanceChange(credential.id, optimistic)
+
+    setOverage.mutate(
+      { id: credential.id, enabled: next },
+      {
+        onSuccess: async () => {
+          toast.success(next ? '已开启超额' : '已关闭超额')
+          // 拉真值覆盖：上游可能附带其它字段变化（cap/限额）
+          try {
+            const fresh = await getCredentialBalance(credential.id)
+            onBalanceChange(credential.id, fresh)
+          } catch {
+            // 真值拉取失败保留乐观值，下次刷新会自然纠偏
+          }
+        },
+        onError: (err) => {
+          onBalanceChange(credential.id, prev)
+          toast.error('切换超额开关失败: ' + (err as Error).message)
         },
       }
     )
@@ -195,7 +360,7 @@ export function CredentialCard({
 
   return (
     <>
-      <Card className={credential.isCurrent ? 'ring-2 ring-primary' : ''}>
+      <Card>
         <CardHeader className="pb-2">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
@@ -205,9 +370,6 @@ export function CredentialCard({
               />
               <CardTitle className="text-lg flex items-center gap-2">
                 {credential.email || `凭据 #${credential.id}`}
-                {credential.isCurrent && (
-                  <Badge variant="success">当前</Badge>
-                )}
                 {credential.disabled && (
                   <Badge variant="destructive">已禁用</Badge>
                 )}
@@ -374,22 +536,13 @@ export function CredentialCard({
                 <span className="font-mono font-medium">{credential.maskedApiKey}</span>
               </div>
             )}
-            <div className="col-span-2">
-              <span className="text-muted-foreground">剩余用量：</span>
-              {loadingBalance ? (
-                <span className="text-sm ml-1">
-                  <Loader2 className="inline w-3 h-3 animate-spin" /> 加载中...
-                </span>
-              ) : balance ? (
-                <span className="font-medium ml-1">
-                  {balance.remaining.toFixed(2)} / {balance.usageLimit.toFixed(2)}
-                  <span className="text-xs text-muted-foreground ml-1">
-                    ({(100 - balance.usagePercentage).toFixed(1)}% 剩余)
-                  </span>
-                </span>
-              ) : (
-                <span className="text-sm text-muted-foreground ml-1">未知</span>
-              )}
+            <div className="col-span-2 space-y-2">
+              <BalanceBlock
+                balance={balance}
+                loading={loadingBalance}
+                overageMutating={overageMutating}
+                onToggleOverage={handleToggleOverage}
+              />
             </div>
             {credential.hasProxy && (
               <div className="col-span-2">

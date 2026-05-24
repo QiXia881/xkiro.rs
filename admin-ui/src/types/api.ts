@@ -2,7 +2,6 @@
 export interface CredentialsStatusResponse {
   total: number
   available: number
-  currentId: number
   credentials: CredentialStatusItem[]
 }
 
@@ -12,7 +11,6 @@ export interface CredentialStatusItem {
   priority: number
   disabled: boolean
   failureCount: number
-  isCurrent: boolean
   expiresAt: string | null
   authMethod: string | null
   hasProfileArn: boolean
@@ -92,6 +90,12 @@ export interface BalanceResponse {
   remaining: number
   usagePercentage: number
   nextResetAt: number | null
+  /** 超额上限（订阅可超额时 > 0） */
+  overageCap: number
+  /** 超额资格 OVERAGE_CAPABLE / OVERAGE_INCAPABLE */
+  overageCapability?: string | null
+  /** 远端开关 ENABLED / DISABLED */
+  overageStatus?: string | null
 }
 
 // 成功响应
@@ -201,4 +205,29 @@ export interface BatchRefreshBalanceResponse {
   results: BatchRefreshBalanceResultItem[]
   successCount: number
   failureCount: number
+}
+
+// ============ 缓存余额端点 ============
+
+/** 单个凭据的缓存余额条目 */
+export interface CachedBalanceItem {
+  id: number
+  currentUsage: number
+  usageLimit: number
+  remaining: number
+  usagePercentage: number
+  subscriptionTitle: string | null
+  nextResetAt: number | null
+  overageCap: number
+  overageCapability?: string | null
+  overageStatus?: string | null
+  /** 缓存时间（Unix 毫秒） */
+  cachedAt: number
+  /** TTL 秒，cachedAt + ttlSecs*1000 后过期 */
+  ttlSecs: number
+}
+
+/** GET /credentials/balances/cached 响应 */
+export interface CachedBalancesResponse {
+  balances: CachedBalanceItem[]
 }

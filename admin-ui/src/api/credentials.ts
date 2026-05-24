@@ -92,6 +92,17 @@ export async function getCredentialBalance(id: number): Promise<BalanceResponse>
   return data
 }
 
+// 切换上游 overage 开关
+export async function setOverageStatus(
+  id: number,
+  enabled: boolean
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/overage`, {
+    enabled,
+  })
+  return data
+}
+
 // 添加新凭据
 export async function addCredential(
   req: AddCredentialRequest
@@ -175,6 +186,14 @@ export async function refreshBalancesBatch(
   const { data } = await api.post<import('../types/api').BatchRefreshBalanceResponse>(
     '/credentials/refresh-balances-batch',
     { ids } as import('../types/api').BatchRefreshRequest,
+  )
+  return data
+}
+
+// 获取所有凭据缓存余额（首屏预填，避免手动查询）
+export async function getCachedBalances(): Promise<import('../types/api').CachedBalancesResponse> {
+  const { data } = await api.get<import('../types/api').CachedBalancesResponse>(
+    '/credentials/balances/cached',
   )
   return data
 }
