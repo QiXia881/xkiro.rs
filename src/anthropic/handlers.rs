@@ -18,6 +18,7 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt, stream};
 use serde_json::json;
 use std::time::Duration;
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::interval;
 use uuid::Uuid;
 
@@ -1074,7 +1075,7 @@ async fn handle_stream_request(
     context: StreamRequestContext<'_>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let api_result = match provider
+    let mut api_result = match provider
         .call_api_stream(context.request_body, context.user_id)
         .await
     {
@@ -1116,8 +1117,16 @@ async fn handle_stream_request(
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
 
-    // 创建 SSE 流
-    let stream = create_sse_stream(api_result.response, ctx, initial_events);
+    // 创建 SSE 流（permit 随 stream 一起持有，body 消费完成后再释放）
+    let cred_permit = api_result._credential_permit.take();
+    let glb_permit = api_result._global_permit.take();
+    let stream = create_sse_stream(
+        api_result.response,
+        ctx,
+        initial_events,
+        cred_permit,
+        glb_permit,
+    );
 
     // 返回 SSE 响应
     Response::builder()
@@ -1142,6 +1151,8 @@ fn create_sse_stream(
     response: reqwest::Response,
     ctx: StreamContext,
     initial_events: Vec<SseEvent>,
+    cred_permit: Option<OwnedSemaphorePermit>,
+    glb_permit: Option<OwnedSemaphorePermit>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发送初始事件
     let initial_stream = stream::iter(
@@ -1154,8 +1165,8 @@ fn create_sse_stream(
     let body_stream = response.bytes_stream();
 
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS))),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| async move {
+        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), cred_permit, glb_permit),
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, cred_permit, glb_permit)| async move {
             if finished {
                 return None;
             }
@@ -1192,26 +1203,30 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, cred_permit, glb_permit)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
-                            // 发送最终事件并结束
+                            // 上游异常结束 → 立即释放 permit（占用语义 = 一次上游来回，不绑客户端消费速度）
+                            drop(cred_permit);
+                            drop(glb_permit);
                             let final_events = ctx.generate_final_events();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, None, None)))
                         }
                         None => {
-                            // 流结束，发送最终事件
+                            // 上游正常结束 → 立即释放 permit
+                            drop(cred_permit);
+                            drop(glb_permit);
                             let final_events = ctx.generate_final_events();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, None, None)))
                         }
                     }
                 }
@@ -1219,7 +1234,7 @@ fn create_sse_stream(
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, cred_permit, glb_permit)))
                 }
             }
         },
@@ -1808,10 +1823,12 @@ async fn handle_stream_request_buffered(
     user_id: Option<&str>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let api_result = match provider.call_api_stream(request_body, user_id).await {
+    let mut api_result = match provider.call_api_stream(request_body, user_id).await {
         Ok(resp) => resp,
         Err(e) => return map_kiro_provider_error_to_response(request_body, e),
     };
+    let _cred_permit = api_result._credential_permit.take();
+    let _glb_permit = api_result._global_permit.take();
     let response = api_result.response;
     let _credential_id = api_result.credential_id;
 
@@ -1824,7 +1841,7 @@ async fn handle_stream_request_buffered(
     );
 
     // 创建缓冲 SSE 流
-    let stream = create_buffered_sse_stream(response, ctx);
+    let stream = create_buffered_sse_stream(response, ctx, _cred_permit, _glb_permit);
 
     // 返回 SSE 响应
     Response::builder()
@@ -1846,6 +1863,8 @@ async fn handle_stream_request_buffered(
 fn create_buffered_sse_stream(
     response: reqwest::Response,
     ctx: BufferedStreamContext,
+    cred_permit: Option<OwnedSemaphorePermit>,
+    glb_permit: Option<OwnedSemaphorePermit>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let body_stream = response.bytes_stream();
 
@@ -1856,8 +1875,10 @@ fn create_buffered_sse_stream(
             EventStreamDecoder::new(),
             false,
             interval(Duration::from_secs(PING_INTERVAL_SECS)),
+            cred_permit,
+            glb_permit,
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| async move {
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, cred_permit, glb_permit)| async move {
             if finished {
                 return None;
             }
@@ -1872,7 +1893,7 @@ fn create_buffered_sse_stream(
                     _ = ping_interval.tick() => {
                         tracing::trace!("发送 ping 保活事件（缓冲模式）");
                         let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)));
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, cred_permit, glb_permit)));
                     }
 
                     // 然后处理数据流
@@ -1901,22 +1922,26 @@ fn create_buffered_sse_stream(
                             }
                             Some(Err(e)) => {
                                 tracing::error!("读取响应流失败: {}", e);
-                                // 发生错误，完成处理并返回所有事件
+                                // 上游异常结束 → 立即释放 permit
+                                drop(cred_permit);
+                                drop(glb_permit);
                                 let all_events = ctx.finish_and_get_all_events();
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, None, None)));
                             }
                             None => {
-                                // 流结束，完成处理并返回所有事件（已更正 input_tokens）
+                                // 上游正常结束 → 立即释放 permit
+                                drop(cred_permit);
+                                drop(glb_permit);
                                 let all_events = ctx.finish_and_get_all_events();
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, None, None)));
                             }
                         }
                     }
