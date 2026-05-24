@@ -1216,6 +1216,13 @@ impl MultiTokenManager {
                                     error = %e,
                                     "亲和绑定凭据 token 刷新失败，回退到 rank"
                                 );
+                                // 与 acquire_context 主路径同步记账，
+                                // 否则该凭据看起来比实际健康
+                                if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
+                                    self.report_refresh_token_invalid(bound_id);
+                                } else {
+                                    self.report_refresh_failure(bound_id);
+                                }
                             }
                         }
                     } else {
@@ -1227,11 +1234,14 @@ impl MultiTokenManager {
                         credential_id = %bound_id,
                         "亲和绑定凭据 sema 满，本次分流（保留绑定）"
                     );
+                    // 保留绑定：分流到 rank 选出的其他凭据，但不覆盖 affinity 映射，
+                    // 等下次该 session 请求时再尝试黏回原凭据。
+                    return self.acquire_context(model).await;
                 }
             }
         }
 
-        // 未命中 / 命中失败：走 rank 分发，并在成功时记录绑定
+        // 未命中 / 凭据不可用 / token 刷新失败：rank 选 + 建立（或覆盖到新）绑定
         let ctx = self.acquire_context(model).await?;
         self.session_affinity.set(sid, ctx.id);
         Ok(ctx)
@@ -2166,7 +2176,7 @@ impl MultiTokenManager {
     /// 连续刷新失败达到阈值后禁用凭据，阈值内保持原状，
     /// 与 API 401/403 的累计失败策略保持一致。
     pub fn report_refresh_failure(&self, id: u64) -> bool {
-        let result = {
+        let (result, disabled_now) = {
             let mut entries = self.entries.lock();
 
             let entry = match entries.iter_mut().find(|e| e.id == id) {
@@ -2206,8 +2216,11 @@ impl MultiTokenManager {
             if !has_available {
                 tracing::error!("所有凭据均已禁用！");
             }
-            has_available
+            (has_available, true)
         };
+        if disabled_now {
+            self.session_affinity.remove_by_credential(id);
+        }
         self.save_stats_debounced();
         result
     }
