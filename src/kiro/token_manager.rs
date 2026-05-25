@@ -656,6 +656,8 @@ pub struct MultiTokenManager {
     credential_semaphores: Mutex<HashMap<u64, Arc<Semaphore>>>,
     /// 全局并发信号量（None 表示不限，对应 config.global_concurrency = 0）
     global_semaphore: Mutex<Option<Arc<Semaphore>>>,
+    /// Credit usage 观察者（用于将 meteringEvent 同步到 admin disk 缓存）
+    credit_observer: Mutex<Option<std::sync::Weak<dyn CreditUsageObserver>>>,
     /// Session 亲和性：让同一会话连续请求黏住同一凭据（提升上游 prompt cache 命中率）
     session_affinity: SessionAffinity,
 }
@@ -700,6 +702,27 @@ pub struct CallContext {
     pub(crate) _credential_permit: Option<OwnedSemaphorePermit>,
     /// 全局并发 permit（Drop 时归还全局信号量配额；None = 未启用全局限流）
     pub(crate) _global_permit: Option<OwnedSemaphorePermit>,
+}
+
+/// Credit usage 观察者：每次 meteringEvent 命中后回调
+///
+/// 实现方（如 `AdminService`）通常持有自己的 disk balance cache，
+/// 需要在请求级 metering 上报时同步扣减，避免 dashboard 显示与运行时
+/// 余额缓存（rank_candidates 调度依据）出现漂移。
+pub trait CreditUsageObserver: Send + Sync {
+    /// 当某凭据应用 credit 扣减后调用
+    ///
+    /// * `id` - 凭据 ID
+    /// * `credit` - 本次 metering 上报的 credit 数（>0）
+    /// * `new_primary_remaining` - 扣减后 primary 剩余
+    /// * `new_overage_remaining` - 扣减后 overage 剩余
+    fn on_credit_usage(
+        &self,
+        id: u64,
+        credit: f64,
+        new_primary_remaining: f64,
+        new_overage_remaining: f64,
+    );
 }
 
 impl MultiTokenManager {
@@ -847,6 +870,7 @@ impl MultiTokenManager {
             background_refresher: Mutex::new(None),
             credential_semaphores: Mutex::new(credential_semaphores),
             global_semaphore: Mutex::new(global_semaphore),
+            credit_observer: Mutex::new(None),
             session_affinity: SessionAffinity::default(),
         };
 
@@ -915,11 +939,11 @@ impl MultiTokenManager {
     /// 1. `priority` asc：用户优先级（0 最高），分层匹配，同 priority 才参与下层比较。
     /// 2. `has_primary` desc：还有正式剩余（>=1.0）的永远压制只剩超额的，
     ///    即使后者总额更大。
-    /// 3. `primary_bucket = log2(primary).floor()` desc：正式剩余多的优先（量级粒度，
-    ///    避免 ±几次调用的浮点抖动反复重排）。
+    /// 3. `primary_q = (primary*1000).round()` desc：正式剩余多的优先（千分之一量化，
+    ///    消除浮点抖动；不再做 log2 分桶，避免 30 vs 50 这类 <2x 差距被并入同桶）。
     /// 4. `has_overage` desc：primary 全为 0 时，**超额已开启且有剩余**的优先；
     ///    上游未开 overage 时缓存内 overage_remaining=0 → has_overage=false → 排末尾。
-    /// 5. `overage_bucket = log2(overage).floor()` desc：超额剩余多的优先。
+    /// 5. `overage_q` desc：超额剩余多的优先（同样千分之一量化）。
     /// 6. `in_flight = max_permits - available_permits` asc：仅作最末位 tie-breaker，
     ///    LEAST_REQUEST 兜底打散并发；不能盖过余额，否则会出现"剩余少但暂时空闲"
     ///    压过"剩余多但 1 个在飞"的反直觉行为。
@@ -1008,24 +1032,21 @@ impl MultiTokenManager {
             }
         };
 
-        // 5. 排序键：(priority asc, has_primary desc, primary_bucket desc,
-        //              has_overage desc, overage_bucket desc, in_flight asc)
+        // 5. 排序键：(priority asc, has_primary desc, primary_q desc,
+        //              has_overage desc, overage_q desc, in_flight asc)
         //    - priority asc：用户优先级（0 最高），分层匹配的最外层
         //    - has_primary desc：还有正式剩余的永远压制只剩超额的（即使后者总额更大）
-        //    - primary_bucket desc：在 has_primary 同档内，正式剩余多的优先
+        //    - primary_q desc：在 has_primary 同档内，正式剩余多的优先（千分之一量化）
         //    - has_overage desc：primary 全 0 时，开了超额且有剩余的优先
-        //    - overage_bucket desc：超额剩余多的优先
+        //    - overage_q desc：超额剩余多的优先
         //    - in_flight asc：以上全 tie 时，把当前最少在飞的放前面（仅作 tie-breaker，
         //      不能盖过余额；否则会出现"剩余少但空闲"压过"剩余多但 1 个在飞"的反直觉行为）
         const REMAINING_EPS: f64 = 1e-3;
-        let bucket = |r: f64| -> i32 {
-            if r <= REMAINING_EPS {
-                i32::MIN
-            } else {
-                r.log2().floor() as i32
-            }
-        };
-        let mut scored: Vec<(u64, u32, bool, i32, bool, i32, usize)> = candidate_ids
+        // 千分之一量化：消除浮点抖动 (e.g. 50.0001 vs 50.0002) 但保留真实差距
+        // 之前用 log2 分桶 → 30 vs 50 同桶 5、100 vs 180 同桶 6/7 边缘抖动，
+        // 同桶后只剩 in_flight 决定顺序，看起来就是"按顺序派送"。
+        let quantize = |r: f64| -> i64 { (r.max(0.0) * 1000.0).round() as i64 };
+        let mut scored: Vec<(u64, u32, bool, i64, bool, i64, usize)> = candidate_ids
             .iter()
             .map(|&id| {
                 let max = *max_permits_map.get(&id).unwrap_or(&global_per_cred);
@@ -1046,9 +1067,9 @@ impl MultiTokenManager {
                     id,
                     pri,
                     has_primary,
-                    bucket(primary.max(REMAINING_EPS)),
+                    quantize(primary),
                     has_overage,
-                    bucket(overage.max(REMAINING_EPS)),
+                    quantize(overage),
                     in_flight,
                 )
             })
@@ -1057,9 +1078,9 @@ impl MultiTokenManager {
         scored.sort_by(|a, b| {
             a.1.cmp(&b.1) // priority asc
                 .then(b.2.cmp(&a.2)) // has_primary desc
-                .then(b.3.cmp(&a.3)) // primary_bucket desc
+                .then(b.3.cmp(&a.3)) // primary_q desc
                 .then(b.4.cmp(&a.4)) // has_overage desc
-                .then(b.5.cmp(&a.5)) // overage_bucket desc
+                .then(b.5.cmp(&a.5)) // overage_q desc
                 .then(a.6.cmp(&b.6)) // in_flight asc (tie-breaker)
         });
 
@@ -1159,6 +1180,11 @@ impl MultiTokenManager {
         session_id: Option<&str>,
         model: Option<&str>,
     ) -> anyhow::Result<CallContext> {
+        // 全局 session 亲和开关：关闭时每条消息独立走 rank，多号天然平摊
+        if !self.config.read().session_affinity_enabled {
+            return self.acquire_context(model).await;
+        }
+
         let sid = match session_id {
             Some(s) if !s.is_empty() => s,
             _ => return self.acquire_context(model).await,
@@ -1587,7 +1613,7 @@ impl MultiTokenManager {
     /// 更新余额缓存（含超额额度）
     ///
     /// `overage_remaining` 仅在 overage_status=ENABLED 时 > 0；
-    /// rank 用 (has_primary, primary_bucket, overage_bucket) 区分主备额度优先级。
+    /// rank 用 (has_primary, primary_q, overage_q) 区分主备额度优先级（千分之一量化）。
     pub fn update_balance_cache_full(
         &self,
         id: u64,
@@ -1720,6 +1746,55 @@ impl MultiTokenManager {
             entry.initialized = false;
             entry.recent_usage = 0;
         }
+    }
+
+    /// 注册 credit usage 观察者（弱引用，避免循环引用）
+    ///
+    /// AdminService 可注册自身以便 metering 时同步更新 disk balance_cache。
+    pub fn set_credit_observer(&self, observer: std::sync::Weak<dyn CreditUsageObserver>) {
+        *self.credit_observer.lock() = Some(observer);
+    }
+
+    /// 应用 meteringEvent 上报的 credit 消耗：从运行时余额缓存扣减
+    ///
+    /// 仅对已初始化的缓存生效（未查过余额的凭据先不扣，避免基于 0 反而把 remaining 拉负）。
+    /// 优先扣 primary remaining，不足再扣 overage_remaining。返回是否已应用。
+    /// 同时回调观察者，让 admin 端 disk cache 同步更新。
+    pub fn apply_credit_usage(&self, id: u64, credit: f64) -> bool {
+        if !credit.is_finite() || credit <= 0.0 {
+            return false;
+        }
+        let (new_remaining, new_overage, applied) = {
+            let mut cache = self.balance_cache.lock();
+            let Some(entry) = cache.get_mut(&id) else {
+                return false;
+            };
+            if !entry.initialized {
+                return false;
+            }
+            let from_primary = entry.remaining.min(credit);
+            entry.remaining = (entry.remaining - from_primary).max(0.0);
+            let leftover = (credit - from_primary).max(0.0);
+            if leftover > 0.0 {
+                entry.overage_remaining = (entry.overage_remaining - leftover).max(0.0);
+            }
+            (entry.remaining, entry.overage_remaining, true)
+        };
+        if applied {
+            tracing::debug!(
+                credential_id = id,
+                credit,
+                new_primary = new_remaining,
+                new_overage = new_overage,
+                "已应用 metering 扣减"
+            );
+            if let Some(weak) = self.credit_observer.lock().as_ref() {
+                if let Some(observer) = weak.upgrade() {
+                    observer.on_credit_usage(id, credit, new_remaining, new_overage);
+                }
+            }
+        }
+        applied
     }
 
     /// 取指定凭据的刷新锁（懒分配）
@@ -2287,7 +2362,7 @@ impl MultiTokenManager {
         // 短暂 lock sema map 拷贝 Arc（纯内存查询，不阻塞），释放后再在 map 闭包内读 available_permits
         let sema_snapshot: std::collections::HashMap<u64, std::sync::Arc<tokio::sync::Semaphore>> =
             self.credential_semaphores.lock().clone();
-        let max_permits = self.config.read().per_credential_concurrency;
+        let global_per_cred = self.config.read().per_credential_concurrency.max(1);
 
         ManagerSnapshot {
             entries: entries
@@ -2352,7 +2427,11 @@ impl MultiTokenManager {
                         .get(&e.id)
                         .map(|s| s.available_permits())
                         .unwrap_or(0),
-                    max_permits,
+                    max_permits: e
+                        .credentials
+                        .concurrency
+                        .map(|v| (v as usize).max(1))
+                        .unwrap_or(global_per_cred),
                     concurrency: e.credentials.concurrency,
                 })
                 .collect(),
@@ -2453,9 +2532,14 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 清空所有 session 亲和绑定（关闭 affinity 开关后调用）
+    pub fn clear_session_affinity(&self) {
+        self.session_affinity.clear();
+    }
+
     /// 设置凭据级最大并发数（Admin API）
     ///
-    /// 语义：先把“含新 concurrency 的 snapshot”原子写入凭据文件，写盘成功后再修改
+    /// 语义：先把"含新 concurrency 的 snapshot"原子写入凭据文件，写盘成功后再修改
     /// in-memory 与单凭据 Semaphore。写盘失败 → 返回 Err，
     /// in-memory 与 Semaphore 维持原状。
     ///

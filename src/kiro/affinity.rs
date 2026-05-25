@@ -85,6 +85,11 @@ impl SessionAffinity {
             .retain(|_, entry| entry.credential_id != credential_id);
     }
 
+    /// 清空全部绑定（关闭 affinity 开关时调用）
+    pub fn clear(&self) {
+        self.inner.lock().clear();
+    }
+
     /// 清理过期条目
     #[allow(dead_code)]
     pub fn cleanup(&self) {

@@ -835,6 +835,41 @@ pub async fn post_messages(
         message_count = %payload.messages.len(),
         "Received POST /v1/messages request"
     );
+    // 入口诊断：统计每条消息的 role + content block types，定位 trae/Claude Code 等客户端
+    // 历史 tool_use/tool_result 配对问题（call_* 风格 ID 来自 OpenAI 协议翻译）
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        for (idx, m) in payload.messages.iter().enumerate() {
+            let mut tool_use_ids: Vec<&str> = Vec::new();
+            let mut tool_result_ids: Vec<&str> = Vec::new();
+            if let serde_json::Value::Array(arr) = &m.content {
+                for b in arr {
+                    let ty = b.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    match ty {
+                        "tool_use" => {
+                            if let Some(id) = b.get("id").and_then(|v| v.as_str()) {
+                                tool_use_ids.push(id);
+                            }
+                        }
+                        "tool_result" => {
+                            if let Some(id) = b.get("tool_use_id").and_then(|v| v.as_str()) {
+                                tool_result_ids.push(id);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if !tool_use_ids.is_empty() || !tool_result_ids.is_empty() {
+                tracing::debug!(
+                    idx,
+                    role = %m.role,
+                    tool_use_ids = ?tool_use_ids,
+                    tool_result_ids = ?tool_result_ids,
+                    "msg tool entries"
+                );
+            }
+        }
+    }
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
         Some(p) => p.clone(),
@@ -878,7 +913,8 @@ pub async fn post_messages(
 
     // 转换请求
     let compression = state.compression_config.read().clone();
-    let conversion_result = match convert_request(&payload, &compression) {
+    let prompt_filter = state.prompt_filter_config.read().clone();
+    let conversion_result = match convert_request(&payload, &compression, &prompt_filter) {
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
@@ -1123,12 +1159,16 @@ async fn handle_stream_request(
     // 创建 SSE 流（permit 随 stream 一起持有，body 消费完成后再释放）
     let cred_permit = api_result._credential_permit.take();
     let glb_permit = api_result._global_permit.take();
+    let tm = provider.token_manager().clone();
+    let credential_id = api_result.credential_id;
     let stream = create_sse_stream(
         api_result.response,
         ctx,
         initial_events,
         cred_permit,
         glb_permit,
+        tm,
+        credential_id,
     );
 
     // 返回 SSE 响应
@@ -1156,6 +1196,8 @@ fn create_sse_stream(
     initial_events: Vec<SseEvent>,
     cred_permit: Option<OwnedSemaphorePermit>,
     glb_permit: Option<OwnedSemaphorePermit>,
+    tm: std::sync::Arc<crate::kiro::token_manager::MultiTokenManager>,
+    credential_id: u64,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发送初始事件
     let initial_stream = stream::iter(
@@ -1168,8 +1210,8 @@ fn create_sse_stream(
     let body_stream = response.bytes_stream();
 
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), cred_permit, glb_permit),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, cred_permit, glb_permit)| async move {
+        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), cred_permit, glb_permit, tm, credential_id),
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, cred_permit, glb_permit, tm, credential_id)| async move {
             if finished {
                 return None;
             }
@@ -1206,30 +1248,36 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, cred_permit, glb_permit)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, cred_permit, glb_permit, tm, credential_id)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
                             // 上游异常结束 → 立即释放 permit（占用语义 = 一次上游来回，不绑客户端消费速度）
                             drop(cred_permit);
                             drop(glb_permit);
+                            if let Some(m) = ctx.metering.as_ref() {
+                                tm.apply_credit_usage(credential_id, m.usage);
+                            }
                             let final_events = ctx.generate_final_events();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, None, None)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, None, None, tm, credential_id)))
                         }
                         None => {
                             // 上游正常结束 → 立即释放 permit
                             drop(cred_permit);
                             drop(glb_permit);
+                            if let Some(m) = ctx.metering.as_ref() {
+                                tm.apply_credit_usage(credential_id, m.usage);
+                            }
                             let final_events = ctx.generate_final_events();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, None, None)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, None, None, tm, credential_id)))
                         }
                     }
                 }
@@ -1237,7 +1285,7 @@ fn create_sse_stream(
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, cred_permit, glb_permit)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, cred_permit, glb_permit, tm, credential_id)))
                 }
             }
         },
@@ -1280,6 +1328,7 @@ async fn handle_non_stream_request(
     };
 
     // 读取响应体
+    let credential_id = api_result.credential_id;
     let body_bytes = match api_result.response.bytes().await {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -1491,6 +1540,10 @@ async fn handle_non_stream_request(
         });
         if let Some(ref metering) = metering {
             inject_credit_usage_fields(&mut usage, metering);
+            // 同步扣减运行时余额缓存（drains primary→overage），观察者回调 admin disk cache
+            provider
+                .token_manager()
+                .apply_credit_usage(credential_id, metering.usage);
         }
         if let Some(cache_context) = final_cache_context {
             inject_cache_usage_fields(&mut usage, cache_context);
@@ -1629,7 +1682,8 @@ pub async fn post_messages_cc(
 
     // 转换请求
     let compression = state.compression_config.read().clone();
-    let conversion_result = match convert_request(&payload, &compression) {
+    let prompt_filter = state.prompt_filter_config.read().clone();
+    let conversion_result = match convert_request(&payload, &compression, &prompt_filter) {
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
@@ -1846,7 +1900,8 @@ async fn handle_stream_request_buffered(
     );
 
     // 创建缓冲 SSE 流
-    let stream = create_buffered_sse_stream(response, ctx, _cred_permit, _glb_permit);
+    let tm = provider.token_manager().clone();
+    let stream = create_buffered_sse_stream(response, ctx, _cred_permit, _glb_permit, tm, _credential_id);
 
     // 返回 SSE 响应
     Response::builder()
@@ -1870,6 +1925,8 @@ fn create_buffered_sse_stream(
     ctx: BufferedStreamContext,
     cred_permit: Option<OwnedSemaphorePermit>,
     glb_permit: Option<OwnedSemaphorePermit>,
+    tm: std::sync::Arc<crate::kiro::token_manager::MultiTokenManager>,
+    credential_id: u64,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let body_stream = response.bytes_stream();
 
@@ -1882,8 +1939,10 @@ fn create_buffered_sse_stream(
             interval(Duration::from_secs(PING_INTERVAL_SECS)),
             cred_permit,
             glb_permit,
+            tm,
+            credential_id,
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, cred_permit, glb_permit)| async move {
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, cred_permit, glb_permit, tm, credential_id)| async move {
             if finished {
                 return None;
             }
@@ -1898,7 +1957,7 @@ fn create_buffered_sse_stream(
                     _ = ping_interval.tick() => {
                         tracing::trace!("发送 ping 保活事件（缓冲模式）");
                         let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, cred_permit, glb_permit)));
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, cred_permit, glb_permit, tm, credential_id)));
                     }
 
                     // 然后处理数据流
@@ -1930,23 +1989,29 @@ fn create_buffered_sse_stream(
                                 // 上游异常结束 → 立即释放 permit
                                 drop(cred_permit);
                                 drop(glb_permit);
+                                if let Some(m) = ctx.metering() {
+                                    tm.apply_credit_usage(credential_id, m.usage);
+                                }
                                 let all_events = ctx.finish_and_get_all_events();
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, None, None)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, None, None, tm, credential_id)));
                             }
                             None => {
                                 // 上游正常结束 → 立即释放 permit
                                 drop(cred_permit);
                                 drop(glb_permit);
+                                if let Some(m) = ctx.metering() {
+                                    tm.apply_credit_usage(credential_id, m.usage);
+                                }
                                 let all_events = ctx.finish_and_get_all_events();
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, None, None)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, None, None, tm, credential_id)));
                             }
                         }
                     }

@@ -188,6 +188,12 @@ impl KiroProvider {
         self.call_api_with_retry(request_body, true, user_id).await
     }
 
+    /// 获取内部 `MultiTokenManager` 引用（用于在请求生命周期外同步运行时缓存，
+    /// 例如 metering 透传后 `apply_credit_usage`）
+    pub fn token_manager(&self) -> &Arc<MultiTokenManager> {
+        &self.token_manager
+    }
+
     /// 发送 MCP API 请求（WebSearch 等工具调用）
     pub async fn call_mcp(
         &self,

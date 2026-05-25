@@ -11,12 +11,13 @@ use axum::{
 use parking_lot::RwLock;
 
 use crate::kiro::provider::KiroProvider;
-use crate::model::config::CompressionConfig;
+use crate::model::config::{CompressionConfig, PromptFilterConfig};
 
 use super::{
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
     middleware::{AppState, auth_middleware, cors_layer},
 };
+use crate::openai::handlers::{post_chat_completions, post_responses};
 
 /// 请求体最大大小限制 (50MB)
 const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
@@ -43,10 +44,12 @@ pub fn create_router_with_provider(
     profile_arn: Option<String>,
     extract_thinking: bool,
     compression: Arc<RwLock<CompressionConfig>>,
+    prompt_filter: Arc<RwLock<PromptFilterConfig>>,
     prompt_cache_runtime: Arc<RwLock<super::middleware::PromptCacheRuntime>>,
 ) -> Router {
     let mut state = AppState::new(api_key, extract_thinking, prompt_cache_runtime)
-        .with_compression_config(compression);
+        .with_compression_config(compression)
+        .with_prompt_filter_config(prompt_filter);
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
     }
@@ -59,6 +62,8 @@ pub fn create_router_with_provider(
         .route("/models", get(get_models))
         .route("/messages", post(post_messages))
         .route("/messages/count_tokens", post(count_tokens))
+        .route("/chat/completions", post(post_chat_completions))
+        .route("/responses", post(post_responses))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,

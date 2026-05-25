@@ -11,14 +11,18 @@ import {
   addCredential,
   deleteCredential,
 } from '@/api/credentials'
+import { usePageActive } from '@/hooks/use-page-active'
 import type { AddCredentialRequest } from '@/types/api'
 
 // 查询凭据列表
 export function useCredentials() {
+  const pageActive = usePageActive()
   return useQuery({
     queryKey: ['credentials'],
     queryFn: getCredentials,
-    refetchInterval: 30000, // 每 30 秒刷新一次
+    // 仅在用户停留前端时周期刷新；离开后停止
+    refetchInterval: pageActive ? 30000 : false,
+    refetchIntervalInBackground: false,
   })
 }
 

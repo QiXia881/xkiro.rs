@@ -1286,6 +1286,11 @@ impl BufferedStreamContext {
 
         std::mem::take(&mut self.event_buffer)
     }
+
+    /// 已收到的 metering（meteringEvent.usage）；用于驱动余额扣减
+    pub fn metering(&self) -> Option<&MeteringEvent> {
+        self.inner.metering.as_ref()
+    }
 }
 
 /// 简单的 token 估算

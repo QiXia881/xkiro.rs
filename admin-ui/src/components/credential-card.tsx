@@ -54,17 +54,10 @@ function formatLastUsed(lastUsedAt: string | null): string {
   return `${days} 天前`
 }
 
+// 重置时间，参考 BK：toLocaleString 完整时间戳
 function formatResetDate(ts: number | null): string | null {
   if (!ts) return null
-  const date = new Date(ts * 1000)
-  return date.toLocaleDateString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit' })
-}
-
-function daysUntil(ts: number | null): number | null {
-  if (!ts) return null
-  const diff = ts * 1000 - Date.now()
-  if (diff <= 0) return 0
-  return Math.ceil(diff / (1000 * 60 * 60 * 24))
+  return new Date(ts * 1000).toLocaleString('zh-CN')
 }
 
 interface BalanceBlockProps {
@@ -105,7 +98,6 @@ function BalanceBlock({ balance, loading, overageMutating, onToggleOverage }: Ba
   const overPercent = overCap > 0 ? Math.min(100, (overUsed / overCap) * 100) : 0
 
   const resetStr = formatResetDate(balance.nextResetAt)
-  const daysLeft = daysUntil(balance.nextResetAt)
   const showOverage = balance.overageCapability === 'OVERAGE_CAPABLE' || overUsed > 0 || overCap > 0
   const baseTone = basePercent >= 90 ? 'bg-destructive' : basePercent >= 70 ? 'bg-warning' : 'bg-foreground/80'
 
@@ -128,7 +120,7 @@ function BalanceBlock({ balance, loading, overageMutating, onToggleOverage }: Ba
         </div>
         {resetStr && (
           <div className="text-2xs text-muted-foreground tabular">
-            {resetStr} 重置 · {daysLeft === 0 ? '今日' : daysLeft != null ? `${daysLeft} 天后` : ''}
+            {resetStr} 重置
           </div>
         )}
       </div>
@@ -200,7 +192,7 @@ export function CredentialCard({
   // n4: 让「最后调用时间」相对时间动态刷新
   // formatLastUsed 内部 new Date() 取的是渲染时刻，所以只要触发组件重渲染就能滚动。
   // 这里用一个轻量 tick state，每 30s 触发一次 setState 强制重渲染；
-  // 与 runtime-stats 1.5s 轮询解耦，避免每次接口返回都把所有卡片掀一遍。
+  // 与 runtime-stats 3s 轮询解耦，避免每次接口返回都把所有卡片掀一遍。
   const [, setTick] = useState(0)
   useEffect(() => {
     const timer = setInterval(() => setTick((t) => t + 1), 30_000)
@@ -363,11 +355,11 @@ export function CredentialCard({
     credential.authMethod === 'social' ? 'Social' :
     credential.authMethod || ''
 
+  const inFlight = Math.max(0, credential.maxPermits - credential.availablePermits)
   const usagePct = credential.maxPermits > 0
-    ? Math.round(((credential.maxPermits - credential.availablePermits) / credential.maxPermits) * 100)
+    ? Math.min(100, Math.round((inFlight / credential.maxPermits) * 100))
     : 0
-  const usageBusy = credential.maxPermits > 0 &&
-    credential.maxPermits - credential.availablePermits >= credential.maxPermits
+  const usageBusy = credential.maxPermits > 0 && inFlight >= credential.maxPermits
 
   return (
     <>
@@ -483,6 +475,14 @@ export function CredentialCard({
                   min="1"
                   placeholder="全局"
                 />
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-6 px-1.5 text-2xs"
+                  onClick={() => { setConcurrencyValue(''); }}
+                  disabled={setConcurrency.isPending}
+                  title="清空 = 恢复全局默认"
+                >全局</Button>
                 <Button size="sm" variant="ghost" className="h-6 w-6 p-0" onClick={handleConcurrencyChange} disabled={setConcurrency.isPending}>✓</Button>
                 <Button size="sm" variant="ghost" className="h-6 w-6 p-0" onClick={() => { setEditingConcurrency(false); setConcurrencyValue(credential.concurrency == null ? '' : String(credential.concurrency)) }}>✕</Button>
               </div>
@@ -490,9 +490,9 @@ export function CredentialCard({
               <button
                 className="tabular font-medium hover:underline"
                 onClick={() => setEditingConcurrency(true)}
-                title="点击编辑"
+                title={credential.concurrency == null ? '当前跟随全局；点击编辑' : '已自定义；点击编辑'}
               >
-                {credential.concurrency == null ? '全局' : credential.concurrency}
+                {credential.concurrency == null ? '跟随全局' : credential.concurrency}
               </button>
             )}
           </div>
@@ -501,7 +501,7 @@ export function CredentialCard({
           <div className="flex items-center justify-between gap-2">
             <span className="text-muted-foreground">并发占用</span>
             <span className={`tabular font-medium ${usageBusy ? 'text-warning' : ''}`}>
-              {credential.maxPermits - credential.availablePermits}/{credential.maxPermits}
+              {inFlight}/{credential.maxPermits}
               {credential.maxPermits > 0 && (
                 <span className="ml-1 text-2xs text-muted-foreground">({usagePct}%)</span>
               )}

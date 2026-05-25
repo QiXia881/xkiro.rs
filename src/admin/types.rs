@@ -310,6 +310,14 @@ pub struct GlobalConfigResponse {
     pub global_concurrency: usize,
     /// 凭据队列等待超时（秒），超时后返回 429 overloaded_error
     pub acquire_wait_timeout_secs: u64,
+    /// 是否启用周期余额刷新
+    pub balance_refresh_enabled: bool,
+    /// 周期余额刷新间隔（秒，最小 180）
+    pub balance_refresh_interval_secs: u64,
+    /// 周期余额刷新并发上限（1..=10）
+    pub balance_refresh_concurrency: usize,
+    /// 是否启用 session 亲和（同会话黏住同凭据；关闭则每条消息独立平摊）
+    pub session_affinity_enabled: bool,
     /// 压缩配置
     pub compression: CompressionConfigResponse,
 }
@@ -355,6 +363,14 @@ pub struct UpdateGlobalConfigRequest {
     pub global_concurrency: Option<usize>,
     /// 凭据队列等待超时（秒，可选）
     pub acquire_wait_timeout_secs: Option<u64>,
+    /// 是否启用周期余额刷新（可选）
+    pub balance_refresh_enabled: Option<bool>,
+    /// 周期余额刷新间隔（秒，可选；< 180 会被 clamp 到 180）
+    pub balance_refresh_interval_secs: Option<u64>,
+    /// 周期余额刷新并发上限（可选；clamp 到 1..=10）
+    pub balance_refresh_concurrency: Option<usize>,
+    /// 是否启用 session 亲和（可选）
+    pub session_affinity_enabled: Option<bool>,
     /// 压缩配置（可选）
     pub compression: Option<UpdateCompressionConfigRequest>,
 }
@@ -544,6 +560,27 @@ pub struct RuntimeStatsItem {
     pub available_permits: usize,
     pub max_permits: usize,
     pub disabled: bool,
+    /// 余额快照（来自 5min disk cache + 后台周期刷新）；缓存未命中时为 None
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub balance: Option<RuntimeBalanceSnapshot>,
+}
+
+/// runtime-stats 内嵌的余额快照
+///
+/// 字段与 [`CachedBalanceItem`] 中"非 TTL 元数据"部分一一对应；前端可直接投影到
+/// `BalanceResponse` 复用现有渲染逻辑。1.5s 轮询批量带回，避免单条强制刷新 RTT。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeBalanceSnapshot {
+    pub subscription_title: Option<String>,
+    pub current_usage: f64,
+    pub usage_limit: f64,
+    pub remaining: f64,
+    pub usage_percentage: f64,
+    pub next_reset_at: Option<f64>,
+    pub overage_cap: f64,
+    pub overage_capability: Option<String>,
+    pub overage_status: Option<String>,
 }
 
 /// 运行时状态响应

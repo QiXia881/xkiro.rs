@@ -84,16 +84,19 @@ export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialo
             </div>
 
             {/* 超额额度进度 */}
-            {(balance.overageCapability === 'OVERAGE_CAPABLE' || balance.overageCap > 0 || balance.currentUsage > balance.usageLimit) && (
+            {(balance.overageCapability === 'OVERAGE_CAPABLE' || balance.overageCap > 0 || balance.currentUsage > balance.usageLimit) && (() => {
+              const overUsed = Math.max(0, balance.currentUsage - balance.usageLimit)
+              const overRemaining = Math.max(0, balance.overageCap - overUsed)
+              return (
               <div className="space-y-2 pt-2 border-t">
                 <div className="flex justify-between text-sm">
                   <span>超额额度</span>
                   <span className="text-muted-foreground">
-                    {formatNumber(Math.max(0, balance.currentUsage - balance.usageLimit))} / {balance.overageCap > 0 ? formatNumber(balance.overageCap) : '—'}
+                    {formatNumber(overRemaining)} / {balance.overageCap > 0 ? formatNumber(balance.overageCap) : '—'}
                   </span>
                 </div>
                 {balance.overageCap > 0 ? (
-                  <Progress value={Math.min(100, ((balance.currentUsage - balance.usageLimit) / balance.overageCap) * 100)} />
+                  <Progress value={Math.min(100, (overUsed / balance.overageCap) * 100)} />
                 ) : (
                   <div className="text-xs text-muted-foreground">订阅未提供超额上限</div>
                 )}
@@ -107,7 +110,8 @@ export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialo
                         : ''}
                 </div>
               </div>
-            )}
+              )
+            })()}
           </div>
         )}
       </DialogContent>

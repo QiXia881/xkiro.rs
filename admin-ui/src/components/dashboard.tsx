@@ -171,6 +171,45 @@ export function Dashboard({ onLogout }: DashboardProps) {
     }
   }, [])
 
+  // 把 runtime-stats（3s 轮询）里嵌的余额投影到 balanceMap，实现实时显示
+  // 后端余额来自 5min disk cache + 周期后台刷新；前端只负责消费快照
+  useEffect(() => {
+    if (!runtimeMap || runtimeMap.size === 0) return
+    setBalanceMap(prev => {
+      let mutated = false
+      const next = new Map(prev)
+      runtimeMap.forEach((runtime, id) => {
+        if (!runtime.balance) return
+        const existing = prev.get(id)
+        // 浅比较关键字段，避免无变化时触发卡片重渲染
+        if (
+          existing
+          && existing.currentUsage === runtime.balance.currentUsage
+          && existing.usageLimit === runtime.balance.usageLimit
+          && existing.remaining === runtime.balance.remaining
+          && existing.overageStatus === runtime.balance.overageStatus
+          && existing.overageCap === runtime.balance.overageCap
+        ) {
+          return
+        }
+        next.set(id, {
+          id,
+          subscriptionTitle: runtime.balance.subscriptionTitle,
+          currentUsage: runtime.balance.currentUsage,
+          usageLimit: runtime.balance.usageLimit,
+          remaining: runtime.balance.remaining,
+          usagePercentage: runtime.balance.usagePercentage,
+          nextResetAt: runtime.balance.nextResetAt,
+          overageCap: runtime.balance.overageCap,
+          overageCapability: runtime.balance.overageCapability,
+          overageStatus: runtime.balance.overageStatus,
+        })
+        mutated = true
+      })
+      return mutated ? next : prev
+    })
+  }, [runtimeMap])
+
   const toggleDarkMode = () => {
     const next = !darkMode
     setDarkMode(next)

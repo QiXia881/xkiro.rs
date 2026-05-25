@@ -46,6 +46,14 @@ export interface GlobalConfigResponse {
   globalConcurrency: number
   /** 凭据队列等待超时（秒），超时返回 503 */
   acquireWaitTimeoutSecs: number
+  /** 是否启用周期余额刷新 */
+  balanceRefreshEnabled: boolean
+  /** 周期余额刷新间隔（秒，最小 180） */
+  balanceRefreshIntervalSecs: number
+  /** 周期余额刷新并发上限（1..=10） */
+  balanceRefreshConcurrency: number
+  /** session 亲和：true=同会话黏住同凭据；false=每条消息独立平摊 */
+  sessionAffinityEnabled: boolean
   compression: CompressionConfigPayload
 }
 
@@ -78,6 +86,10 @@ export interface UpdateGlobalConfigRequest {
   perCredentialConcurrency?: number
   globalConcurrency?: number
   acquireWaitTimeoutSecs?: number
+  balanceRefreshEnabled?: boolean
+  balanceRefreshIntervalSecs?: number
+  balanceRefreshConcurrency?: number
+  sessionAffinityEnabled?: boolean
   compression?: Partial<CompressionConfigPayload>
 }
 
@@ -163,6 +175,21 @@ export interface RuntimeStatsItem {
   availablePermits: number
   maxPermits: number
   disabled: boolean
+  /** 余额快照（来自 disk cache + 后台周期刷新）；未命中则 undefined */
+  balance?: RuntimeBalanceSnapshot
+}
+
+/** runtime-stats 内嵌的余额快照（字段子集对齐 BalanceResponse） */
+export interface RuntimeBalanceSnapshot {
+  subscriptionTitle: string | null
+  currentUsage: number
+  usageLimit: number
+  remaining: number
+  usagePercentage: number
+  nextResetAt: number | null
+  overageCap: number
+  overageCapability: string | null
+  overageStatus: string | null
 }
 
 /** 运行时状态响应 */

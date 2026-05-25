@@ -25,8 +25,8 @@ use super::types::{
     CachedBalanceItem, CachedBalancesResponse, CompressionConfigResponse, CredentialStatusItem,
     CredentialsStatusResponse, GlobalConfigResponse, ImportAction, ImportItemResult,
     ImportSummary, ImportTokenJsonRequest, ImportTokenJsonResponse, ProxyConfigResponse,
-    RuntimeStatsItem, RuntimeStatsResponse, TokenJsonItem, UpdateCompressionConfigRequest,
-    UpdateGlobalConfigRequest, UpdateProxyConfigRequest,
+    RuntimeBalanceSnapshot, RuntimeStatsItem, RuntimeStatsResponse, TokenJsonItem,
+    UpdateCompressionConfigRequest, UpdateGlobalConfigRequest, UpdateProxyConfigRequest,
 };
 use crate::kiro::token_manager::CachedBalanceInfo;
 
@@ -154,24 +154,44 @@ impl AdminService {
 
     /// 启动周期性余额刷新任务
     ///
-    /// 每 `interval_secs` 触发一次，并发拉取所有未禁用凭据的最新余额/订阅/超额信息，
+    /// 每轮读 token_manager.config 的 `balance_refresh_*` 字段（支持热更新）：
+    /// - `enabled=false`：跳过本轮拉取，仅 sleep 1 个 tick 后再读
+    /// - `interval_secs`：触发周期（最小 180s，外部已 clamp）
+    /// - `concurrency`：每批并发上限；凭据数 > 此值时 chunks 顺序分批，
+    ///   上一批完成才进入下一批（避免单轮内同时占用过多上游连接）
+    ///
     /// 写回 admin disk-cache + token_manager 运行时缓存。低余额自动禁用。
     /// 与启动预取共享 `refresh_balances_concurrent`，复用上游限流。
-    pub fn start_periodic_balance_refresh(self: Arc<Self>, interval_secs: u64) {
-        if interval_secs == 0 {
-            tracing::warn!("interval_secs=0，余额定时刷新未启动");
-            return;
-        }
+    pub fn start_periodic_balance_refresh(self: Arc<Self>) {
         tokio::spawn(async move {
             tracing::info!(
-                "余额定时刷新已启动: 间隔 {}s, 并发 cap=8",
-                interval_secs
+                "余额定时刷新已启动: 当前 enabled={}, 间隔={}s, 并发={}",
+                self.token_manager.config().balance_refresh_enabled,
+                self.token_manager.config().balance_refresh_interval_secs,
+                self.token_manager.config().balance_refresh_concurrency,
             );
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-            // 跳过首 tick（启动预取已处理过一次）
-            ticker.tick().await;
+            // 启动后跳过首轮（启动预取已处理），先 sleep 一轮再开始
+            let mut next_sleep =
+                self.token_manager.config().balance_refresh_interval_secs.max(
+                    crate::model::config::MIN_BALANCE_REFRESH_INTERVAL_SECS,
+                );
             loop {
-                ticker.tick().await;
+                tokio::time::sleep(std::time::Duration::from_secs(next_sleep)).await;
+
+                let cfg = self.token_manager.config();
+                next_sleep = cfg
+                    .balance_refresh_interval_secs
+                    .max(crate::model::config::MIN_BALANCE_REFRESH_INTERVAL_SECS);
+
+                if !cfg.balance_refresh_enabled {
+                    tracing::debug!("余额定时刷新：已禁用，跳过本轮");
+                    continue;
+                }
+                let concurrency = cfg
+                    .balance_refresh_concurrency
+                    .clamp(1, crate::model::config::MAX_BALANCE_REFRESH_CONCURRENCY);
+                drop(cfg);
+
                 let snapshot = self.token_manager.snapshot();
                 let active_ids: Vec<u64> = snapshot
                     .entries
@@ -184,13 +204,23 @@ impl AdminService {
                     continue;
                 }
                 let total = active_ids.len();
-                let stats = self.refresh_balances_concurrent(active_ids, 8).await;
+                // 凭据数 > concurrency 时分批，上一批完成才进入下一批
+                let mut agg = RefreshBalanceStats::default();
+                for chunk in active_ids.chunks(concurrency) {
+                    let stats = self
+                        .refresh_balances_concurrent(chunk.to_vec(), concurrency)
+                        .await;
+                    agg.success += stats.success;
+                    agg.failed += stats.failed;
+                    agg.low_balance_disabled += stats.low_balance_disabled;
+                }
                 tracing::info!(
-                    "余额定时刷新完成：成功 {}，失败 {}，低余额禁用 {}（共 {}）",
-                    stats.success,
-                    stats.failed,
-                    stats.low_balance_disabled,
-                    total
+                    "余额定时刷新完成：成功 {}，失败 {}，低余额禁用 {}（共 {}, 批大小 {}）",
+                    agg.success,
+                    agg.failed,
+                    agg.low_balance_disabled,
+                    total,
+                    concurrency,
                 );
             }
         });
@@ -728,15 +758,30 @@ impl AdminService {
     /// - `disabled`：手动禁用标记
     pub fn get_runtime_stats(&self) -> RuntimeStatsResponse {
         let snapshot = self.token_manager.snapshot();
+        let disk_cache = self.balance_cache.lock();
         let credentials = snapshot
             .entries
             .into_iter()
-            .map(|entry| RuntimeStatsItem {
-                id: entry.id,
-                last_used_at: entry.last_used_at.clone(),
-                available_permits: entry.available_permits,
-                max_permits: entry.max_permits,
-                disabled: entry.disabled,
+            .map(|entry| {
+                let balance = disk_cache.get(&entry.id).map(|cached| RuntimeBalanceSnapshot {
+                    subscription_title: cached.data.subscription_title.clone(),
+                    current_usage: cached.data.current_usage,
+                    usage_limit: cached.data.usage_limit,
+                    remaining: cached.data.remaining,
+                    usage_percentage: cached.data.usage_percentage,
+                    next_reset_at: cached.data.next_reset_at,
+                    overage_cap: cached.data.overage_cap,
+                    overage_capability: cached.data.overage_capability.clone(),
+                    overage_status: cached.data.overage_status.clone(),
+                });
+                RuntimeStatsItem {
+                    id: entry.id,
+                    last_used_at: entry.last_used_at.clone(),
+                    available_permits: entry.available_permits,
+                    max_permits: entry.max_permits,
+                    disabled: entry.disabled,
+                    balance,
+                }
             })
             .collect();
         RuntimeStatsResponse { credentials }
@@ -1261,6 +1306,10 @@ impl AdminService {
             per_credential_concurrency: config.per_credential_concurrency,
             global_concurrency: config.global_concurrency,
             acquire_wait_timeout_secs: config.acquire_wait_timeout_secs,
+            balance_refresh_enabled: config.balance_refresh_enabled,
+            balance_refresh_interval_secs: config.balance_refresh_interval_secs,
+            balance_refresh_concurrency: config.balance_refresh_concurrency,
+            session_affinity_enabled: config.session_affinity_enabled,
             compression: CompressionConfigResponse {
                 enabled: c.enabled,
                 whitespace_compression: c.whitespace_compression,
@@ -1369,12 +1418,33 @@ impl AdminService {
                 cfg.global_concurrency = v;
             }
 
+            // 余额刷新三连：写入后统一 clamp（min 间隔 180s, 并发 1..=10）
+            if let Some(v) = req.balance_refresh_enabled {
+                cfg.balance_refresh_enabled = v;
+            }
+            if let Some(v) = req.balance_refresh_interval_secs {
+                cfg.balance_refresh_interval_secs = v;
+            }
+            if let Some(v) = req.balance_refresh_concurrency {
+                cfg.balance_refresh_concurrency = v;
+            }
+            cfg.clamp_balance_refresh();
+
+            if let Some(v) = req.session_affinity_enabled {
+                cfg.session_affinity_enabled = v;
+            }
+
             cfg.save()
                 .map_err(|e| AdminServiceError::InternalError(e.to_string()))
         })?;
 
         // 2. 持久化成功后再应用运行时变更
         let config = self.token_manager.config();
+
+        // 关闭 session 亲和后清空已有绑定，避免残留
+        if let Some(false) = req.session_affinity_enabled {
+            self.token_manager.clear_session_affinity();
+        }
 
         // 热更新 region（注：xkiro 已剔除 credential_rpm，故不存在 update_credential_rpm 同步）
         if req.region.is_some() {
@@ -1678,5 +1748,49 @@ impl AdminService {
 
         // 默认 social
         "social".to_string()
+    }
+}
+
+use crate::kiro::token_manager::CreditUsageObserver;
+
+impl CreditUsageObserver for AdminService {
+    fn on_credit_usage(
+        &self,
+        id: u64,
+        credit: f64,
+        new_primary_remaining: f64,
+        new_overage_remaining: f64,
+    ) {
+        if !credit.is_finite() || credit <= 0.0 {
+            return;
+        }
+
+        let mutated = {
+            let mut cache = self.balance_cache.lock();
+            let Some(entry) = cache.get_mut(&id) else {
+                return;
+            };
+            let data = &mut entry.data;
+            data.current_usage = (data.current_usage + credit).max(0.0);
+            data.remaining = new_primary_remaining;
+            data.usage_percentage = if data.usage_limit > 0.0 {
+                ((data.current_usage / data.usage_limit) * 100.0).min(9_999.0)
+            } else {
+                0.0
+            };
+            entry.cached_at = Utc::now().timestamp() as f64;
+            tracing::debug!(
+                credential_id = id,
+                credit,
+                new_remaining = data.remaining,
+                new_overage = new_overage_remaining,
+                "AdminService disk cache 已同步 metering 扣减"
+            );
+            true
+        };
+
+        if mutated {
+            self.save_balance_cache();
+        }
     }
 }

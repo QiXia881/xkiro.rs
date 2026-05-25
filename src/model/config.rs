@@ -118,6 +118,44 @@ fn default_max_request_body_bytes() -> usize {
     4_718_592
 }
 
+/// 系统提示清洗配置
+///
+/// 镜像 KAM `gateway/prompt_filter.rs` 的 4 个开关 + 自定义规则。
+/// 默认全 `false`、规则为空 —— 与未启用此模块时行为一致。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptFilterConfig {
+    /// 检测 Claude Code 系统提示并整体替换为精简版
+    #[serde(default)]
+    pub filter_claude_code: bool,
+    /// 删除 `--- SYSTEM PROMPT ---` / `--- END SYSTEM PROMPT ---` 边界标记
+    #[serde(default)]
+    pub filter_strip_boundaries: bool,
+    /// 跳过 `# Environment` / `# auto memory` section 与单行噪音
+    #[serde(default)]
+    pub filter_env_noise: bool,
+    /// 自定义过滤规则
+    #[serde(default)]
+    pub rules: Vec<PromptFilterRule>,
+}
+
+/// 自定义提示过滤规则
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptFilterRule {
+    pub id: String,
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// "regex" | "lines-containing" | "contains"
+    pub rule_type: String,
+    /// 匹配模式（正则或子串）
+    pub match_pattern: String,
+    /// 替换内容（仅 regex 类型使用）
+    #[serde(default)]
+    pub replace: String,
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -210,6 +248,10 @@ pub struct Config {
     #[serde(default)]
     pub compression: CompressionConfig,
 
+    /// 系统提示清洗配置（默认全关，向后兼容）
+    #[serde(default)]
+    pub prompt_filter: PromptFilterConfig,
+
     /// Prompt Cache TTL（秒），默认 300 秒
     #[serde(default = "default_prompt_cache_ttl_seconds")]
     pub prompt_cache_ttl_seconds: u64,
@@ -239,6 +281,32 @@ pub struct Config {
     /// 返回，避免客户端无限等待。
     #[serde(default = "default_acquire_wait_timeout_secs")]
     pub acquire_wait_timeout_secs: u64,
+
+    /// 是否启用周期余额/订阅刷新（默认 true）
+    ///
+    /// 关闭后停止后台周期拉取，调度仅用最后一次缓存值；启动预取不受影响。
+    #[serde(default = "default_true")]
+    pub balance_refresh_enabled: bool,
+
+    /// 周期余额刷新间隔（秒，默认 300，最小 180）
+    ///
+    /// 反序列化与 setter 都会 clamp 到 >=180，避免对上游过频。
+    #[serde(default = "default_balance_refresh_interval_secs")]
+    pub balance_refresh_interval_secs: u64,
+
+    /// 周期余额刷新并发上限（默认 10，范围 1..=10）
+    ///
+    /// 凭据数 > 此值时分批，上一批完成才进入下一批；每批内 Semaphore 限并发。
+    #[serde(default = "default_balance_refresh_concurrency")]
+    pub balance_refresh_concurrency: usize,
+
+    /// 是否启用 session 亲和（同会话黏住同凭据，提升上游 prompt cache 命中率）
+    ///
+    /// false（默认）：每条消息独立走 rank 调度，多号天然平摊；上游 prompt cache 必失，
+    /// 但客户端每次都带完整 history，模型不会"失忆"。
+    /// true：同 session_id 黏住首条选中的凭据，长会话内不切号；只在该号 sema 满 / 禁用 / 模型不支持时回退 rank。
+    #[serde(default)]
+    pub session_affinity_enabled: bool,
 
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
@@ -298,6 +366,19 @@ fn default_acquire_wait_timeout_secs() -> u64 {
     60
 }
 
+/// 余额刷新最小间隔（秒），低于此值会被 clamp
+pub const MIN_BALANCE_REFRESH_INTERVAL_SECS: u64 = 180;
+/// 余额刷新并发硬上限
+pub const MAX_BALANCE_REFRESH_CONCURRENCY: usize = 10;
+
+fn default_balance_refresh_interval_secs() -> u64 {
+    300
+}
+
+fn default_balance_refresh_concurrency() -> usize {
+    MAX_BALANCE_REFRESH_CONCURRENCY
+}
+
 fn default_endpoint() -> String {
     crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
 }
@@ -327,11 +408,16 @@ impl Default for Config {
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
             compression: CompressionConfig::default(),
+            prompt_filter: PromptFilterConfig::default(),
             prompt_cache_ttl_seconds: default_prompt_cache_ttl_seconds(),
             prompt_cache_accounting_enabled: default_true(),
             per_credential_concurrency: default_per_credential_concurrency(),
             global_concurrency: default_global_concurrency(),
             acquire_wait_timeout_secs: default_acquire_wait_timeout_secs(),
+            balance_refresh_enabled: true,
+            balance_refresh_interval_secs: default_balance_refresh_interval_secs(),
+            balance_refresh_concurrency: default_balance_refresh_concurrency(),
+            session_affinity_enabled: false,
             config_path: None,
         }
     }
@@ -368,7 +454,21 @@ impl Config {
         let content = fs::read_to_string(path)?;
         let mut config: Config = serde_json::from_str(&content)?;
         config.config_path = Some(path.to_path_buf());
+        config.clamp_balance_refresh();
         Ok(config)
+    }
+
+    /// 把余额刷新参数 clamp 到合法范围
+    /// (interval >= MIN_BALANCE_REFRESH_INTERVAL_SECS, concurrency in 1..=MAX)
+    pub fn clamp_balance_refresh(&mut self) {
+        if self.balance_refresh_interval_secs < MIN_BALANCE_REFRESH_INTERVAL_SECS {
+            self.balance_refresh_interval_secs = MIN_BALANCE_REFRESH_INTERVAL_SECS;
+        }
+        if self.balance_refresh_concurrency == 0 {
+            self.balance_refresh_concurrency = 1;
+        } else if self.balance_refresh_concurrency > MAX_BALANCE_REFRESH_CONCURRENCY {
+            self.balance_refresh_concurrency = MAX_BALANCE_REFRESH_CONCURRENCY;
+        }
     }
 
     /// 获取配置文件路径（如果有）

@@ -6,6 +6,7 @@ mod http_client;
 pub mod image;
 mod kiro;
 mod model;
+mod openai;
 pub mod token;
 
 use std::collections::HashMap;
@@ -175,6 +176,9 @@ async fn main() {
     // 共享压缩配置（admin API 可运行时修改）
     let compression_config = Arc::new(RwLock::new(config.compression.clone()));
 
+    // 共享系统提示清洗配置（admin API 可运行时修改）
+    let prompt_filter_config = Arc::new(RwLock::new(config.prompt_filter.clone()));
+
     // Prompt Cache 运行时（共享引用，支持热更新）
     let prompt_cache_runtime = Arc::new(RwLock::new(
         anthropic::middleware::PromptCacheRuntime::new(
@@ -190,6 +194,7 @@ async fn main() {
         first_credentials.profile_arn.clone(),
         config.extract_thinking,
         compression_config.clone(),
+        prompt_filter_config.clone(),
         prompt_cache_runtime.clone(),
     );
 
@@ -215,18 +220,25 @@ async fn main() {
             );
             let admin_state = admin::AdminState::new(admin_key, admin_service, compression_config.clone());
 
+            // 注册 credit usage 观察者：metering 事件透传时同步更新 admin disk cache
+            {
+                let observer: std::sync::Arc<dyn crate::kiro::token_manager::CreditUsageObserver> =
+                    admin_state.service.clone();
+                token_manager.set_credit_observer(std::sync::Arc::downgrade(&observer));
+            }
+
             // 启动时后台并行预取所有未禁用凭据余额，写入 disk-cache
             // 让前端首次访问 dashboard 时就能从 /balances/cached 直接拿到完整快照
             {
                 let svc = admin_state.service.clone();
                 tokio::spawn(async move { svc.prefetch_balances_on_startup().await });
             }
-            // 启动周期性余额刷新：每 600s 拉一次所有未禁用凭据余额/订阅/超额
+            // 启动周期性余额刷新：周期/并发/启停由 config.balance_refresh_* 控制（热更新）
             // 同步两层缓存（admin disk + token_manager 运行时），低余额自动禁用
             admin_state
                 .service
                 .clone()
-                .start_periodic_balance_refresh(300);
+                .start_periodic_balance_refresh();
 
             let admin_app = admin::create_admin_router(admin_state);
 
@@ -251,6 +263,8 @@ async fn main() {
     tracing::info!("  GET  /v1/models");
     tracing::info!("  POST /v1/messages");
     tracing::info!("  POST /v1/messages/count_tokens");
+    tracing::info!("  POST /v1/chat/completions");
+    tracing::info!("  POST /v1/responses");
     if admin_key_valid {
         tracing::info!("Admin API:");
         tracing::info!("  GET  /api/admin/credentials");

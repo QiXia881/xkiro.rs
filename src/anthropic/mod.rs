@@ -22,16 +22,17 @@
 //! axum::serve(listener, app).await?;
 //! ```
 
-mod converter;
+pub(crate) mod converter;
 pub mod cache_tracker;
 pub mod compressor;
 mod handlers;
 pub mod middleware;
+pub mod prompt_filter;
 mod router;
 mod stream;
 pub mod tool_compression;
 pub mod truncation;
 pub mod types;
-mod websearch;
+pub mod websearch;
 
 pub use router::create_router_with_provider;

@@ -43,3 +43,4 @@ rust-embed = "8"      # 嵌入静态文件
 mime_guess = "2"      # MIME 类型推断
 unicode-segmentation = "1.13"  # UAX #29 grapheme cluster 安全截断
 serde_cbor = "0.11"   # CBOR 编解码（Web Portal API）
+regex = "1"           # 系统提示清洗的正则规则

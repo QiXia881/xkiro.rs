@@ -14,7 +14,7 @@ use parking_lot::RwLock;
 
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
-use crate::model::config::CompressionConfig;
+use crate::model::config::{CompressionConfig, PromptFilterConfig};
 
 use super::cache_tracker::CacheTracker;
 use super::types::ErrorResponse;
@@ -78,6 +78,8 @@ pub struct AppState {
     pub profile_arn: Option<String>,
     /// 共享压缩配置（运行时可修改）
     pub compression_config: Arc<RwLock<CompressionConfig>>,
+    /// 共享系统提示清洗配置（运行时可修改）
+    pub prompt_filter_config: Arc<RwLock<PromptFilterConfig>>,
     /// Prompt Cache 运行时配置（共享引用，支持热更新）
     pub prompt_cache_runtime: Arc<RwLock<PromptCacheRuntime>>,
 }
@@ -95,6 +97,7 @@ impl AppState {
             extract_thinking,
             profile_arn: None,
             compression_config: Arc::new(RwLock::new(CompressionConfig::default())),
+            prompt_filter_config: Arc::new(RwLock::new(PromptFilterConfig::default())),
             prompt_cache_runtime,
         }
     }
@@ -115,6 +118,12 @@ impl AppState {
     /// 设置压缩配置（接受共享引用）
     pub fn with_compression_config(mut self, config: Arc<RwLock<CompressionConfig>>) -> Self {
         self.compression_config = config;
+        self
+    }
+
+    /// 设置系统提示清洗配置（接受共享引用）
+    pub fn with_prompt_filter_config(mut self, config: Arc<RwLock<PromptFilterConfig>>) -> Self {
+        self.prompt_filter_config = config;
         self
     }
 

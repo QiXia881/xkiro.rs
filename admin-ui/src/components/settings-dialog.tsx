@@ -90,12 +90,27 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
       toast.error('排队等待超时不能小于 1 秒')
       return
     }
+    if (globalConfig.balanceRefreshIntervalSecs < 180) {
+      toast.error('余额刷新间隔不能小于 180 秒')
+      return
+    }
+    if (
+      globalConfig.balanceRefreshConcurrency < 1 ||
+      globalConfig.balanceRefreshConcurrency > 10
+    ) {
+      toast.error('余额刷新并发必须在 1..=10')
+      return
+    }
     setSaving(true)
     try {
       const payload: UpdateGlobalConfigRequest = {
         perCredentialConcurrency: globalConfig.perCredentialConcurrency,
         globalConcurrency: globalConfig.globalConcurrency,
         acquireWaitTimeoutSecs: globalConfig.acquireWaitTimeoutSecs,
+        balanceRefreshEnabled: globalConfig.balanceRefreshEnabled,
+        balanceRefreshIntervalSecs: globalConfig.balanceRefreshIntervalSecs,
+        balanceRefreshConcurrency: globalConfig.balanceRefreshConcurrency,
+        sessionAffinityEnabled: globalConfig.sessionAffinityEnabled,
         compression: config,
       }
       const next = await updateGlobalConfig(payload)
@@ -194,6 +209,36 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                             desc="等待空闲凭据的最大秒数，超时返回 503"
                             value={globalConfig.acquireWaitTimeoutSecs}
                             onChange={v => updateGlobal('acquireWaitTimeoutSecs', v)}
+                          />
+                          <div className="pt-3 mt-2 border-t">
+                            <div className="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-1">余额刷新</div>
+                          </div>
+                          <ToggleRow
+                            label="启用周期刷新"
+                            desc="关闭后停止后台拉取，调度只用最后一次缓存（启动预取仍执行）"
+                            checked={globalConfig.balanceRefreshEnabled}
+                            onChange={v => updateGlobal('balanceRefreshEnabled', v)}
+                          />
+                          <NumberRow
+                            label="刷新间隔（秒）"
+                            desc="周期触发间隔，最小 180 秒"
+                            value={globalConfig.balanceRefreshIntervalSecs}
+                            onChange={v => updateGlobal('balanceRefreshIntervalSecs', v)}
+                          />
+                          <NumberRow
+                            label="并发上限"
+                            desc="同时刷新的凭据数（1..=10），超出按批顺序处理"
+                            value={globalConfig.balanceRefreshConcurrency}
+                            onChange={v => updateGlobal('balanceRefreshConcurrency', v)}
+                          />
+                          <div className="pt-3 mt-2 border-t">
+                            <div className="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-1">调度策略</div>
+                          </div>
+                          <ToggleRow
+                            label="会话亲和（Session Affinity）"
+                            desc="开启：同一会话黏住首次选中的凭据，整轮对话不切号 → 上游 prompt cache 命中率高，多号利用不均匀。关闭（默认）：每条消息独立走调度，按余额 / 并发占用平摊到所有可用号 → 多号同时跑，上游 cache 必失（客户端每次带完整 history，模型不会失忆），但更省 quota / 更快释放阻塞。"
+                            checked={globalConfig.sessionAffinityEnabled}
+                            onChange={v => updateGlobal('sessionAffinityEnabled', v)}
                           />
                         </>
                       )}
