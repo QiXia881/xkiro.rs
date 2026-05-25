@@ -59,6 +59,12 @@ pub const PRESETS: &[PromptPreset] = &[
         description: "去除所有寒暄、前言、铺垫和 hedging，直击答案。",
         content: include_str!("presets/concise.md"),
     },
+    PromptPreset {
+        id: "chunked_write",
+        name: "长文件分块写入",
+        description: "规避 AWS 输出截断导致的 Write/Edit 死循环：强制按 50 行一段写入与编辑，使用占位符续写。",
+        content: include_str!("presets/chunked_write.md"),
+    },
 ];
 
 /// 按 id 查找预设

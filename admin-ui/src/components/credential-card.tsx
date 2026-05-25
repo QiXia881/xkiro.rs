@@ -192,7 +192,7 @@ export function CredentialCard({
   // n4: 让「最后调用时间」相对时间动态刷新
   // formatLastUsed 内部 new Date() 取的是渲染时刻，所以只要触发组件重渲染就能滚动。
   // 这里用一个轻量 tick state，每 30s 触发一次 setState 强制重渲染；
-  // 与 runtime-stats 3s 轮询解耦，避免每次接口返回都把所有卡片掀一遍。
+  // 与 runtime-stats 1s 轮询解耦，避免每次接口返回都把所有卡片掀一遍。
   const [, setTick] = useState(0)
   useEffect(() => {
     const timer = setInterval(() => setTick((t) => t + 1), 30_000)

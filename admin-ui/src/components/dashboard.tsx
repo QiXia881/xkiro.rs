@@ -173,7 +173,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
     }
   }, [])
 
-  // 把 runtime-stats（3s 轮询）里嵌的余额投影到 balanceMap，实现实时显示
+  // 把 runtime-stats（1s 轮询）里嵌的余额投影到 balanceMap，实现实时显示
   // 后端余额来自 5min disk cache + 周期后台刷新；前端只负责消费快照
   useEffect(() => {
     if (!runtimeMap || runtimeMap.size === 0) return
