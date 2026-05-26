@@ -751,6 +751,16 @@ fn process_message_content(
                             if let Some(source) = block.source
                                 && let Some(format) = get_image_format(&source.media_type)
                             {
+                                // 全局图片压缩开关：关闭则透传原始 base64
+                                if !compression_config.image_compression_enabled {
+                                    if *remaining_image_budget == 0 {
+                                        tracing::warn!("图片配额已用尽，跳过原图透传");
+                                        continue;
+                                    }
+                                    images.push(KiroImage::from_base64(format, source.data));
+                                    *remaining_image_budget -= 1;
+                                    continue;
+                                }
                                 if format.eq_ignore_ascii_case("gif") {
                                     if *remaining_image_budget == 0 {
                                         tracing::warn!("图片配额已用尽，跳过 GIF");

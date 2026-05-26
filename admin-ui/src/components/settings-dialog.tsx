@@ -39,6 +39,7 @@ const DEFAULT_CONFIG: CompressionConfig = {
   imageMaxPixelsSingle: 4000000,
   imageMaxPixelsMulti: 4000000,
   imageMultiThreshold: 20,
+  imageCompressionEnabled: true,
   maxRequestBodyBytes: 4718592,
 }
 
@@ -264,6 +265,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 
                   {activeTab === 'image' && (
                     <>
+                      <ToggleRow label="图片压缩" desc="关闭后透传原图（上游已压缩时建议关闭，如 TRAE 国际版）" checked={config.imageCompressionEnabled} onChange={v => update('imageCompressionEnabled', v)} />
                       <NumberRow label="最大长边 (px)" desc="超出后等比缩放" value={config.imageMaxLongEdge} onChange={v => update('imageMaxLongEdge', v)} />
                       <NumberRow label="单图最大像素" desc="单张图片总像素上限" value={config.imageMaxPixelsSingle} onChange={v => update('imageMaxPixelsSingle', v)} />
                       <NumberRow label="多图最大像素" desc="多图场景每张像素上限" value={config.imageMaxPixelsMulti} onChange={v => update('imageMaxPixelsMulti', v)} />

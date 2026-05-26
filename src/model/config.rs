@@ -80,6 +80,9 @@ pub struct CompressionConfig {
     pub image_max_pixels_multi: u32,
     #[serde(default = "default_image_multi_threshold")]
     pub image_multi_threshold: usize,
+    /// 图片压缩开关：关闭后透传原始图片（适用于上游已压缩的场景，如 TRAE 国际版）
+    #[serde(default = "default_true")]
+    pub image_compression_enabled: bool,
     #[serde(default = "default_max_request_body_bytes")]
     pub max_request_body_bytes: usize,
 }
@@ -101,6 +104,7 @@ impl Default for CompressionConfig {
             image_max_pixels_single: default_image_max_pixels_single(),
             image_max_pixels_multi: default_image_max_pixels_multi(),
             image_multi_threshold: default_image_multi_threshold(),
+            image_compression_enabled: true,
             max_request_body_bytes: default_max_request_body_bytes(),
         }
     }

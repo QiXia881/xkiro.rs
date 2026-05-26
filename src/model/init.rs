@@ -114,12 +114,19 @@ pub fn run_init(path: &Path, force: bool) -> Result<()> {
         Some(admin_api_key)
     };
 
+    // 图片压缩开关
+    println!();
+    println!("【图片压缩】对入站图片做缩放 + 重编码，节省 token + 请求体。");
+    println!("            上游若已压缩（如 TRAE 国际版），重复压缩会损失质量，建议关闭。");
+    let image_compression_enabled = prompt_yes_no("启用图片压缩？", true)?;
+
     // 组装配置：从 default 起步，仅覆盖问到的字段
     let mut config = Config::default();
     config.host = host;
     config.port = port;
     config.api_key = Some(api_key);
     config.admin_api_key = admin_api_key.clone();
+    config.compression.image_compression_enabled = image_compression_enabled;
 
     // 写盘
     let content = serde_json::to_string_pretty(&config).context("序列化配置失败")?;
@@ -152,6 +159,14 @@ pub fn run_init(path: &Path, force: bool) -> Result<()> {
     } else {
         println!("  Admin UI: 未启用（adminApiKey 留空）");
     }
+    println!(
+        "  图片压缩: {}",
+        if image_compression_enabled {
+            "启用"
+        } else {
+            "禁用（透传原图）"
+        }
+    );
     println!("------------------------------------------------------------");
     println!("下一步：");
     println!("  1. 准备 credentials.json（社交登录或 idc 账号）");

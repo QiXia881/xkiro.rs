@@ -73,6 +73,7 @@ export interface CompressionConfigPayload {
   imageMaxPixelsSingle: number
   imageMaxPixelsMulti: number
   imageMultiThreshold: number
+  imageCompressionEnabled: boolean
   maxRequestBodyBytes: number
 }
 

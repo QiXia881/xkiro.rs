@@ -179,6 +179,7 @@ export interface CompressionConfig {
   imageMaxPixelsSingle: number
   imageMaxPixelsMulti: number
   imageMultiThreshold: number
+  imageCompressionEnabled: boolean
   maxRequestBodyBytes: number
 }
 

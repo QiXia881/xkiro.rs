@@ -47,10 +47,17 @@ async fn main() {
         )
         .init();
 
-    // 加载配置
+    // 加载配置：文件不存在则进交互式向导（运行 init 流程后再加载）
     let config_path = args
         .config
         .unwrap_or_else(|| Config::default_config_path().to_string());
+    if !std::path::Path::new(&config_path).exists() {
+        eprintln!("未检测到配置文件 {}，进入初始化向导。", config_path);
+        if let Err(e) = model::init::run_init(std::path::Path::new(&config_path), false) {
+            eprintln!("初始化失败: {:#}", e);
+            std::process::exit(1);
+        }
+    }
     let config = Config::load(&config_path).unwrap_or_else(|e| {
         tracing::error!("加载配置失败: {}", e);
         std::process::exit(1);
