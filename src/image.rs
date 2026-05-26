@@ -57,6 +57,8 @@ pub struct ImageProcessResult {
     pub original_bytes_len: usize,
     /// 处理后图片字节数（编码后、base64 前）
     pub final_bytes_len: usize,
+    /// 处理后的图片格式（可能与输入不同：例如 PNG 大文件兜底转码为 JPEG）
+    pub final_format: String,
 }
 
 /// 将 GIF 抽帧并重编码为多张静态图（用于降低请求体、提升"动图内容"识别效果）
@@ -167,6 +169,7 @@ pub fn process_gif_frames(
                 was_reencoded: true,
                 original_bytes_len,
                 final_bytes_len,
+                final_format: GIF_FRAME_OUTPUT_FORMAT.to_string(),
             });
 
             next_sample_ms = frame_start_ms.saturating_add(sampling_interval_ms);
@@ -242,6 +245,7 @@ pub fn process_image_to_format(
         was_reencoded: true,
         original_bytes_len,
         final_bytes_len,
+        final_format: output_format.to_string(),
     })
 }
 
@@ -329,38 +333,74 @@ pub fn process_image(
     let should_decode_and_encode = needs_resize || force_reencode_gif || force_reencode_large;
 
     // 仅在需要缩放或强制重编码时才全量解码图片
-    let (output_data, final_size, final_bytes_len, was_reencoded) = if should_decode_and_encode {
-        let img = image::load_from_memory(&bytes).map_err(|e| format!("图片加载失败: {}", e))?;
-        let processed = if needs_resize {
-            img.resize(target_w, target_h, image::imageops::FilterType::Lanczos3)
+    let (output_data, final_size, final_bytes_len, was_reencoded, final_format) =
+        if should_decode_and_encode {
+            let img = image::load_from_memory(&bytes).map_err(|e| format!("图片加载失败: {}", e))?;
+            let processed = if needs_resize {
+                img.resize(target_w, target_h, image::imageops::FilterType::Lanczos3)
+            } else {
+                img
+            };
+            let size = (processed.width(), processed.height());
+
+            // 用原 format 编码
+            let (mut best_data, mut best_bytes_len) = encode_image(&processed, format)?;
+            let mut best_format = format.to_string();
+
+            // PNG 大文件兜底：尝试 JPEG（有损 + 无 alpha 通道），挑最小的
+            // 仅在 force_reencode_large 时才转码，避免对小 PNG 多余转码
+            if force_reencode_large && format.eq_ignore_ascii_case("png") {
+                let rgb = DynamicImage::ImageRgb8(processed.to_rgb8());
+                if let Ok((jpeg_data, jpeg_bytes_len)) = encode_image(&rgb, "jpeg") {
+                    if jpeg_bytes_len < best_bytes_len {
+                        best_data = jpeg_data;
+                        best_bytes_len = jpeg_bytes_len;
+                        best_format = "jpeg".to_string();
+                    }
+                }
+            }
+
+            // 回退保护：未缩放且重编码后比原始大 → 透传原始
+            if !needs_resize && best_bytes_len >= original_bytes_len {
+                tracing::info!(
+                    original_bytes = original_bytes_len,
+                    reencoded_bytes = best_bytes_len,
+                    format = format,
+                    "重编码反而变大，透传原始数据"
+                );
+                (
+                    base64_data.to_string(),
+                    original_size,
+                    original_bytes_len,
+                    false,
+                    format.to_string(),
+                )
+            } else {
+                let was_reencoded =
+                    (force_reencode_gif || force_reencode_large) && !needs_resize;
+                if force_reencode_large && !needs_resize {
+                    tracing::info!(
+                        original_bytes = original_bytes_len,
+                        final_bytes = best_bytes_len,
+                        final_format = best_format.as_str(),
+                        compression_ratio = format!(
+                            "{:.1}%",
+                            (1.0 - best_bytes_len as f64 / original_bytes_len as f64) * 100.0
+                        ),
+                        "大文件重新编码完成"
+                    );
+                }
+                (best_data, size, best_bytes_len, was_reencoded, best_format)
+            }
         } else {
-            img
+            (
+                base64_data.to_string(),
+                original_size,
+                original_bytes_len,
+                false,
+                format.to_string(),
+            )
         };
-        let size = (processed.width(), processed.height());
-        let (data, bytes_len) = encode_image(&processed, format)?;
-        let was_reencoded = (force_reencode_gif || force_reencode_large) && !needs_resize;
-
-        if force_reencode_large && !needs_resize {
-            tracing::info!(
-                original_bytes = original_bytes_len,
-                final_bytes = bytes_len,
-                compression_ratio = format!(
-                    "{:.1}%",
-                    (1.0 - bytes_len as f64 / original_bytes_len as f64) * 100.0
-                ),
-                "大文件重新编码完成"
-            );
-        }
-
-        (data, size, bytes_len, was_reencoded)
-    } else {
-        (
-            base64_data.to_string(),
-            original_size,
-            original_bytes_len,
-            false,
-        )
-    };
 
     let tokens = calculate_tokens(final_size.0, final_size.1);
 
@@ -373,6 +413,7 @@ pub fn process_image(
         was_reencoded,
         original_bytes_len,
         final_bytes_len,
+        final_format,
     })
 }
 

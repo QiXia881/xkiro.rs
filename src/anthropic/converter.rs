@@ -861,7 +861,8 @@ fn process_message_content(
                                                     result.tokens
                                                 );
                                             }
-                                            images.push(KiroImage::from_base64(format, result.data));
+                                            let out_fmt = result.final_format.clone();
+                                            images.push(KiroImage::from_base64(out_fmt, result.data));
                                             *remaining_image_budget -= 1;
                                         }
                                         Err(e) => {

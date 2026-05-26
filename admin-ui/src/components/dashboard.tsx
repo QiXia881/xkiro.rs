@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Settings, ZoomIn, FileText } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Settings, ZoomIn, FileText, Download } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -8,6 +8,7 @@ import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { CredentialCard } from '@/components/credential-card'
 import { BalanceDialog } from '@/components/balance-dialog'
+import { ModelsDialog } from '@/components/models-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
@@ -17,7 +18,7 @@ import { SystemPromptDialog } from '@/components/system-prompt-dialog'
 import { useCredentials, useDeleteCredential, useResetFailure } from '@/hooks/use-credentials'
 import { useRuntimeStats } from '@/hooks/use-runtime-stats'
 import { useUiScale } from '@/hooks/use-ui-scale'
-import { getCredentialBalance, refreshBatch, refreshBalancesBatch, getCachedBalances } from '@/api/credentials'
+import { getCredentialBalance, refreshBatch, refreshBalancesBatch, getCachedBalances, exportTokenJson } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse } from '@/types/api'
 
@@ -28,6 +29,7 @@ interface DashboardProps {
 export function Dashboard({ onLogout }: DashboardProps) {
   const [selectedCredentialId, setSelectedCredentialId] = useState<number | null>(null)
   const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
+  const [modelsDialogOpen, setModelsDialogOpen] = useState(false)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false)
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false)
@@ -222,6 +224,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const handleViewBalance = (id: number) => {
     setSelectedCredentialId(id)
     setBalanceDialogOpen(true)
+  }
+
+  const handleViewModels = (id: number) => {
+    setSelectedCredentialId(id)
+    setModelsDialogOpen(true)
   }
 
   const handleRefresh = () => {
@@ -547,6 +554,41 @@ export function Dashboard({ onLogout }: DashboardProps) {
     }
   }
 
+  // 批量导出（token.json 兼容格式）
+  const handleBatchExport = async () => {
+    if (selectedIds.size === 0) {
+      toast.error('请先选择要导出的凭据')
+      return
+    }
+    try {
+      const ids = Array.from(selectedIds)
+      const items = await exportTokenJson(ids)
+      if (items.length === 0) {
+        toast.warning('未导出任何凭据（API Key 凭据不支持导出）')
+        return
+      }
+      const json = JSON.stringify(items, null, 2)
+      const blob = new Blob([json], { type: 'application/json' })
+      const url = URL.createObjectURL(blob)
+      const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `kiro-tokens-${ts}.json`
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+      const skipped = ids.length - items.length
+      toast.success(
+        skipped > 0
+          ? `已导出 ${items.length} 项，跳过 ${skipped} 项（API Key / 缺 refreshToken）`
+          : `已导出 ${items.length} 项`
+      )
+    } catch (error) {
+      toast.error(`导出失败：${extractErrorMessage(error)}`)
+    }
+  }
+
   // 批量验活
   const handleBatchVerify = async () => {
     if (selectedIds.size === 0) {
@@ -774,6 +816,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   <RotateCcw className="h-3.5 w-3.5 mr-1.5" />
                   恢复异常
                 </Button>
+                <Button onClick={handleBatchExport} size="sm" variant="outline" className="h-8">
+                  <Download className="h-3.5 w-3.5 mr-1.5" />
+                  批量导出
+                </Button>
                 <Button
                   onClick={handleBatchDelete}
                   size="sm"
@@ -849,6 +895,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   key={credential.id}
                   credential={credential}
                   onViewBalance={handleViewBalance}
+                  onViewModels={handleViewModels}
                   selected={selectedIds.has(credential.id)}
                   onToggleSelect={() => toggleSelect(credential.id)}
                   balance={balanceMap.get(credential.id) || null}
@@ -900,6 +947,13 @@ export function Dashboard({ onLogout }: DashboardProps) {
         credentialId={selectedCredentialId}
         open={balanceDialogOpen}
         onOpenChange={setBalanceDialogOpen}
+      />
+
+      {/* 模型列表对话框 */}
+      <ModelsDialog
+        credentialId={selectedCredentialId}
+        open={modelsDialogOpen}
+        onOpenChange={setModelsDialogOpen}
       />
 
       {/* 添加凭据对话框 */}

@@ -2801,6 +2801,94 @@ impl MultiTokenManager {
         Ok(usage_limits)
     }
 
+    /// 拉取指定凭据可用模型列表
+    ///
+    /// 包含 token 自动刷新；不维护磁盘缓存，调用方按需缓存。
+    /// API Key 凭据返回错误（无法访问 ListAvailableModels）。
+    pub async fn list_available_models_for(
+        &self,
+        id: u64,
+        model_provider: Option<&str>,
+    ) -> anyhow::Result<crate::kiro::models::ListAvailableModelsResponse> {
+        let credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+        };
+
+        if credentials.is_api_key_credential() {
+            anyhow::bail!("API Key 凭据不支持查询模型列表");
+        }
+
+        let needs_refresh =
+            is_token_expired(&credentials) || is_token_expiring_soon(&credentials);
+        let token = if needs_refresh {
+            let lock = self.refresh_lock_for(id);
+            let _guard = lock.lock().await;
+            let current_creds = {
+                let entries = self.entries.lock();
+                entries
+                    .iter()
+                    .find(|e| e.id == id)
+                    .map(|e| e.credentials.clone())
+                    .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+            };
+            if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
+                let proxy_snap = self.proxy.read().clone();
+                let config_snap = self.config.read().clone();
+                let effective_proxy = current_creds.effective_proxy(proxy_snap.as_ref());
+                let new_creds =
+                    refresh_token(&current_creds, &config_snap, effective_proxy.as_ref()).await?;
+                {
+                    let mut entries = self.entries.lock();
+                    if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                        entry.credentials = new_creds.clone();
+                    }
+                }
+                if let Err(e) = self.persist_credentials() {
+                    tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
+                }
+                new_creds
+                    .access_token
+                    .ok_or_else(|| anyhow::anyhow!("刷新后无 access_token"))?
+            } else {
+                current_creds
+                    .access_token
+                    .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?
+            }
+        } else {
+            credentials
+                .access_token
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?
+        };
+
+        let credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+        };
+        let proxy_snap = self.proxy.read().clone();
+        let config_snap = self.config.read().clone();
+        let effective_proxy = credentials.effective_proxy(proxy_snap.as_ref());
+
+        crate::kiro::models::fetch_all_available_models(
+            &credentials,
+            &config_snap,
+            &token,
+            effective_proxy.as_ref(),
+            model_provider,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!(e))
+    }
+
     /// 切换指定凭据的上游 overage 开关
     ///
     /// 调 Kiro `setUserPreference` 接口，成功后返回。本方法不维护本地缓存，
@@ -2913,6 +3001,22 @@ impl MultiTokenManager {
                 })
                 .unwrap_or(false)
         })
+    }
+
+    /// 按 ID 列表导出原始凭据（用于 token.json 格式导出）
+    ///
+    /// 返回顺序与 `ids` 相同；不存在的 ID 跳过。
+    /// 调用方负责保护明文 refreshToken / clientSecret 不外泄到非授权场景。
+    pub fn export_credentials_by_ids(&self, ids: &[u64]) -> Vec<KiroCredentials> {
+        let entries = self.entries.lock();
+        ids.iter()
+            .filter_map(|id| {
+                entries
+                    .iter()
+                    .find(|e| e.id == *id)
+                    .map(|e| e.credentials.clone())
+            })
+            .collect()
     }
 
     /// 添加新凭据（Admin API）

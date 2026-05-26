@@ -7,6 +7,7 @@ import {
   resetCredentialFailure,
   forceRefreshToken,
   getCredentialBalance,
+  getCredentialModels,
   setOverageStatus,
   addCredential,
   deleteCredential,
@@ -33,6 +34,21 @@ export function useCredentialBalance(id: number | null, force = false) {
     queryFn: () => getCredentialBalance(id!, force),
     enabled: id !== null,
     retry: false, // 余额查询失败时不重试（避免重复请求被封禁的账号）
+  })
+}
+
+// 查询凭据可用模型列表；force=true 跳过后端 30min 缓存
+export function useCredentialModels(
+  id: number | null,
+  options: { provider?: string; force?: boolean; enabled?: boolean } = {},
+) {
+  const { provider, force = false, enabled = true } = options
+  return useQuery({
+    queryKey: ['credential-models', id, provider ?? null, force],
+    queryFn: () => getCredentialModels(id!, { provider, force }),
+    enabled: enabled && id !== null,
+    retry: false,
+    staleTime: 30 * 60 * 1000,
   })
 }
 

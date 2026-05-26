@@ -24,8 +24,8 @@ use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, BatchRefreshBalanceResponse,
     BatchRefreshBalanceResultItem, BatchRefreshResponse, BatchRefreshResultItem,
     CachedBalanceItem, CachedBalancesResponse, CompressionConfigResponse, CredentialStatusItem,
-    CredentialsStatusResponse, GlobalConfigResponse, ImportAction, ImportItemResult,
-    ImportSummary, ImportTokenJsonRequest, ImportTokenJsonResponse, PresetItem,
+    CredentialsStatusResponse, ExportTokenJsonItem, GlobalConfigResponse, ImportAction,
+    ImportItemResult, ImportSummary, ImportTokenJsonRequest, ImportTokenJsonResponse, PresetItem,
     ProxyConfigResponse, RuntimeBalanceSnapshot, RuntimeStatsItem, RuntimeStatsResponse,
     SystemPromptResponse, TokenJsonItem, UpdateCompressionConfigRequest,
     UpdateGlobalConfigRequest, UpdateProxyConfigRequest, UpdateSystemPromptRequest,
@@ -62,6 +62,15 @@ struct CachedBalance {
     data: BalanceResponse,
 }
 
+/// 缓存的模型列表条目（仅进程内）
+#[derive(Debug, Clone)]
+struct CachedModels {
+    cached_at: std::time::Instant,
+    data: crate::kiro::models::ListAvailableModelsResponse,
+}
+
+const MODELS_CACHE_TTL_SECS: u64 = 30 * 60;
+
 /// Admin 服务
 ///
 /// 封装所有 Admin API 的业务逻辑
@@ -85,6 +94,8 @@ pub struct AdminService {
     /// 许可，确保系统级别上对单凭据池的余额上游调用并发不会失控。
     /// 容量 8 与历史批量 Semaphore 等价。
     balance_semaphore: Arc<Semaphore>,
+    /// 模型列表缓存（仅内存，TTL 30 分钟；按 (id, provider) 区分）
+    models_cache: Mutex<HashMap<(u64, Option<String>), CachedModels>>,
 }
 
 impl AdminService {
@@ -112,6 +123,7 @@ impl AdminService {
             cache_path,
             known_endpoints: known_endpoints.into_iter().collect(),
             balance_semaphore: Arc::new(Semaphore::new(8)),
+            models_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -519,6 +531,55 @@ impl AdminService {
             overage_capability: usage.overage_capability().map(|s| s.to_string()),
             overage_status: usage.overage_status().map(|s| s.to_string()),
         })
+    }
+
+    /// 拉取指定凭据可用模型列表（30 分钟内存缓存；force=true 跳过缓存）
+    ///
+    /// API Key 凭据 / 不存在 / 被禁用 → InvalidCredential / NotFound；
+    /// 上游 401 / 403 → UpstreamError，由前端展示。
+    pub async fn list_available_models(
+        &self,
+        id: u64,
+        model_provider: Option<&str>,
+        force: bool,
+    ) -> Result<crate::kiro::models::ListAvailableModelsResponse, AdminServiceError> {
+        {
+            let snapshot = self.token_manager.snapshot();
+            let entry = snapshot
+                .entries
+                .iter()
+                .find(|e| e.id == id)
+                .ok_or(AdminServiceError::NotFound { id })?;
+            if entry.disabled {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "credential {id} disabled"
+                )));
+            }
+        }
+
+        let key = (id, model_provider.map(str::to_string));
+        if !force {
+            if let Some(cached) = self.models_cache.lock().get(&key) {
+                if cached.cached_at.elapsed().as_secs() < MODELS_CACHE_TTL_SECS {
+                    return Ok(cached.data.clone());
+                }
+            }
+        }
+
+        let response = self
+            .token_manager
+            .list_available_models_for(id, model_provider)
+            .await
+            .map_err(|e| self.classify_balance_error(e, id))?;
+
+        self.models_cache.lock().insert(
+            key,
+            CachedModels {
+                cached_at: std::time::Instant::now(),
+                data: response.clone(),
+            },
+        );
+        Ok(response)
     }
 
     /// 获取所有凭据的缓存余额
@@ -1781,6 +1842,52 @@ impl AdminService {
         if let Some(v) = src.max_request_body_bytes {
             target.max_request_body_bytes = v;
         }
+    }
+
+    // ============ 导出 token.json ============
+
+    /// 按 ID 列表导出凭据为 token.json 兼容格式
+    ///
+    /// - API Key 凭据（无 refreshToken）跳过
+    /// - 不存在的 ID 跳过
+    /// - 输出顺序与 `ids` 一致；可被 `import_token_json` 直接吃回
+    pub fn export_credentials_to_token_json(&self, ids: &[u64]) -> Vec<ExportTokenJsonItem> {
+        let creds = self.token_manager.export_credentials_by_ids(ids);
+        creds
+            .into_iter()
+            .filter_map(|c| {
+                let refresh_token = c.refresh_token.clone()?;
+                if refresh_token.is_empty() {
+                    return None;
+                }
+                let auth_method = match c.auth_method.as_deref() {
+                    Some(m) => {
+                        let lower = m.to_lowercase();
+                        match lower.as_str() {
+                            "builder-id" | "builderid" | "iam" | "idc" => "idc".to_string(),
+                            "api_key" => return None, // API Key 不可导出为 token.json
+                            other => other.to_string(),
+                        }
+                    }
+                    None => "social".to_string(),
+                };
+                let provider = match auth_method.as_str() {
+                    "idc" => "BuilderId".to_string(),
+                    _ => "Social".to_string(),
+                };
+                Some(ExportTokenJsonItem {
+                    provider,
+                    refresh_token,
+                    client_id: c.client_id,
+                    client_secret: c.client_secret,
+                    auth_method,
+                    priority: c.priority,
+                    region: c.region,
+                    api_region: c.api_region,
+                    machine_id: c.machine_id,
+                })
+            })
+            .collect()
     }
 
     // ============ 批量导入 token.json ============

@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
-import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2, RotateCcw } from 'lucide-react'
+import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2, RotateCcw, Boxes } from 'lucide-react'
 import { Card } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -30,6 +30,7 @@ import { getCredentialBalance } from '@/api/credentials'
 interface CredentialCardProps {
   credential: CredentialStatusItem
   onViewBalance: (id: number) => void
+  onViewModels: (id: number) => void
   selected: boolean
   onToggleSelect: () => void
   balance: BalanceResponse | null
@@ -175,6 +176,7 @@ function BalanceBlock({ balance, loading, overageMutating, onToggleOverage }: Ba
 export function CredentialCard({
   credential,
   onViewBalance,
+  onViewModels,
   selected,
   onToggleSelect,
   balance,
@@ -560,6 +562,17 @@ export function CredentialCard({
           >
             <Wallet className="mr-1 h-3 w-3" />
             余额
+          </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-7 px-2 text-xs"
+            onClick={() => onViewModels(credential.id)}
+            disabled={credential.authMethod === 'api_key'}
+            title={credential.authMethod === 'api_key' ? 'API Key 凭据不支持模型查询' : '查看可用模型'}
+          >
+            <Boxes className="mr-1 h-3 w-3" />
+            模型
           </Button>
           <Button
             size="sm"

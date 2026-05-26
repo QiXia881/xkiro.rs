@@ -96,6 +96,48 @@ export async function getCredentialBalance(
   return data
 }
 
+// 获取凭据可用模型列表（30 分钟内存缓存；force=true 跳过缓存）
+export interface AvailableModel {
+  modelId: string
+  modelName?: string
+  description?: string
+  provider?: string
+  capabilities?: string[]
+  contextWindow?: number
+  isDefault?: boolean
+  rateMultiplier?: number
+  rateUnit?: string
+  promptCaching?: {
+    maximumCacheCheckpointsPerRequest?: number
+    minimumTokensPerCacheCheckpoint?: number
+    supportsPromptCaching?: boolean
+  }
+  supportedInputTypes?: string[]
+  tokenLimits?: {
+    maxInputTokens?: number
+    maxOutputTokens?: number
+  }
+}
+
+export interface ListAvailableModelsResponse {
+  availableModels: AvailableModel[]
+  nextToken?: string | null
+  defaultModel?: AvailableModel | null
+}
+
+export async function getCredentialModels(
+  id: number,
+  options: { provider?: string; force?: boolean } = {},
+): Promise<ListAvailableModelsResponse> {
+  const params = new URLSearchParams()
+  if (options.provider) params.set('provider', options.provider)
+  if (options.force) params.set('force', '1')
+  const qs = params.toString()
+  const url = qs ? `/credentials/${id}/models?${qs}` : `/credentials/${id}/models`
+  const { data } = await api.get<ListAvailableModelsResponse>(url)
+  return data
+}
+
 // 切换上游 overage 开关
 export async function setOverageStatus(
   id: number,
@@ -190,6 +232,27 @@ export async function refreshBalancesBatch(
   const { data } = await api.post<import('../types/api').BatchRefreshBalanceResponse>(
     '/credentials/refresh-balances-batch',
     { ids } as import('../types/api').BatchRefreshRequest,
+  )
+  return data
+}
+
+// 按 ID 列表导出 token.json 兼容格式（可被批量导入直接吃回）
+export interface ExportTokenJsonItem {
+  provider: string
+  refreshToken: string
+  clientId?: string
+  clientSecret?: string
+  authMethod: string
+  priority?: number
+  region?: string
+  apiRegion?: string
+  machineId?: string
+}
+
+export async function exportTokenJson(ids: number[]): Promise<ExportTokenJsonItem[]> {
+  const { data } = await api.post<ExportTokenJsonItem[]>(
+    '/credentials/export-token-json',
+    { ids },
   )
   return data
 }

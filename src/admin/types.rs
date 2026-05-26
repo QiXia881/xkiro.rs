@@ -484,6 +484,47 @@ pub enum ImportAction {
     Invalid,
 }
 
+// ============ 导出 token.json ============
+
+/// 导出请求（POST body）
+///
+/// `ids` 为空时报 400；调用方需指定要导出哪些凭据。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportTokenJsonRequest {
+    pub ids: Vec<u64>,
+}
+
+/// 导出项（与 [`TokenJsonItem`] 字段对齐，可被批量导入直接吃回）
+///
+/// 仅写入有意义的字段：
+/// - API Key 凭据无 refreshToken，不导出（导入端不支持，会被识别为 Invalid）
+/// - `clientId` / `clientSecret`：仅 idc 凭据携带
+/// - `region` / `apiRegion` / `machineId`：未配置则 None 序列化时省略
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportTokenJsonItem {
+    pub provider: String,
+    pub refresh_token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<String>,
+    pub auth_method: String,
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    pub priority: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_region: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
 // ============ 通用响应 ============
 
 /// 操作成功响应

@@ -9,10 +9,10 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, BatchRefreshRequest, ImportTokenJsonRequest, SetConcurrencyRequest,
-        SetDisabledRequest, SetEndpointRequest, SetOverageRequest, SetPriorityRequest,
-        SetRegionRequest, SuccessResponse, UpdateGlobalConfigRequest, UpdateProxyConfigRequest,
-        UpdateSystemPromptRequest, UpsertUserPresetRequest,
+        AddCredentialRequest, BatchRefreshRequest, ExportTokenJsonRequest, ImportTokenJsonRequest,
+        SetConcurrencyRequest, SetDisabledRequest, SetEndpointRequest, SetOverageRequest,
+        SetPriorityRequest, SetRegionRequest, SuccessResponse, UpdateGlobalConfigRequest,
+        UpdateProxyConfigRequest, UpdateSystemPromptRequest, UpsertUserPresetRequest,
     },
 };
 use crate::model::config::CompressionConfig;
@@ -115,6 +115,31 @@ pub async fn get_credential_balance(
     }
 }
 
+/// GET /api/admin/credentials/:id/models?provider=anthropic&force=1
+/// 拉取指定凭据可用模型列表（30 分钟内缓存复用）
+pub async fn get_credential_models(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let force = params
+        .get("force")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    let provider = params
+        .get("provider")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    match state
+        .service
+        .list_available_models(id, provider.as_deref(), force)
+        .await
+    {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// POST /api/admin/credentials
 /// 添加新凭据
 pub async fn add_credential(
@@ -181,6 +206,23 @@ pub async fn import_token_json(
 ) -> impl IntoResponse {
     let response = state.service.import_token_json(payload).await;
     Json(response)
+}
+
+/// POST /api/admin/credentials/export-token-json
+/// 按 ID 列表导出 token.json 兼容格式（可被 import-token-json 直接吃回）
+pub async fn export_token_json(
+    State(state): State<AdminState>,
+    Json(payload): Json<ExportTokenJsonRequest>,
+) -> impl IntoResponse {
+    if payload.ids.is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "ids 不能为空"})),
+        )
+            .into_response();
+    }
+    let items = state.service.export_credentials_to_token_json(&payload.ids);
+    Json(items).into_response()
 }
 
 /// POST /api/admin/credentials/:id/region
