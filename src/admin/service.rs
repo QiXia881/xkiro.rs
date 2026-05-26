@@ -1394,6 +1394,7 @@ impl AdminService {
                 image_max_pixels_single: c.image_max_pixels_single,
                 image_max_pixels_multi: c.image_max_pixels_multi,
                 image_multi_threshold: c.image_multi_threshold,
+                image_compression_enabled: c.image_compression_enabled,
                 max_request_body_bytes: c.max_request_body_bytes,
             },
         }
@@ -1839,6 +1840,9 @@ impl AdminService {
         }
         if let Some(v) = src.image_multi_threshold {
             target.image_multi_threshold = v;
+        }
+        if let Some(v) = src.image_compression_enabled {
+            target.image_compression_enabled = v;
         }
         if let Some(v) = src.max_request_body_bytes {
             target.max_request_body_bytes = v;

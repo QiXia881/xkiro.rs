@@ -340,6 +340,7 @@ pub struct CompressionConfigResponse {
     pub image_max_pixels_single: u32,
     pub image_max_pixels_multi: u32,
     pub image_multi_threshold: usize,
+    pub image_compression_enabled: bool,
     pub max_request_body_bytes: usize,
 }
 
@@ -393,6 +394,7 @@ pub struct UpdateCompressionConfigRequest {
     pub image_max_pixels_single: Option<u32>,
     pub image_max_pixels_multi: Option<u32>,
     pub image_multi_threshold: Option<usize>,
+    pub image_compression_enabled: Option<bool>,
     pub max_request_body_bytes: Option<usize>,
 }
 
