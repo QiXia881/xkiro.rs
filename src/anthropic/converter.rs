@@ -751,14 +751,24 @@ fn process_message_content(
                             if let Some(source) = block.source
                                 && let Some(format) = get_image_format(&source.media_type)
                             {
-                                // 全局图片压缩开关：关闭则透传原始 base64
+                                // 全局图片压缩开关：关闭则透传原始 base64（参考 caidaoli/kiro2api）
                                 if !compression_config.image_compression_enabled {
                                     if *remaining_image_budget == 0 {
                                         tracing::warn!("图片配额已用尽，跳过原图透传");
                                         continue;
                                     }
-                                    images.push(KiroImage::from_base64(format, source.data));
-                                    *remaining_image_budget -= 1;
+                                    match crate::image::validate_passthrough(&source.data, &format) {
+                                        Ok(real_format) => {
+                                            images.push(KiroImage::from_base64(
+                                                real_format.to_string(),
+                                                source.data,
+                                            ));
+                                            *remaining_image_budget -= 1;
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("图片透传校验失败，跳过: {}", e);
+                                        }
+                                    }
                                     continue;
                                 }
                                 if format.eq_ignore_ascii_case("gif") {

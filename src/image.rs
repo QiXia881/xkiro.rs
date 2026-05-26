@@ -450,6 +450,63 @@ fn calculate_tokens(width: u32, height: u32) -> u64 {
     ((width as u64 * height as u64) + 375) / 750 // 四舍五入
 }
 
+/// 透传模式硬上限：参考 caidaoli/kiro2api 的 20MB 上限，避免上游传天文级图片
+pub const PASSTHROUGH_MAX_BYTES: usize = 20 * 1024 * 1024;
+
+/// 通过 magic bytes 识别真实图片格式，返回 Anthropic 格式名（"jpeg"/"png"/"gif"/"webp"）
+///
+/// 不信任 media_type 头，避免错误声明导致下游解码失败。
+pub fn sniff_image_format(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xD8 {
+        return Some("jpeg");
+    }
+    if bytes.len() >= 8
+        && bytes[0..8] == [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+    {
+        return Some("png");
+    }
+    if bytes.len() >= 6
+        && (bytes[0..6] == *b"GIF87a" || bytes[0..6] == *b"GIF89a")
+    {
+        return Some("gif");
+    }
+    if bytes.len() >= 12
+        && &bytes[0..4] == b"RIFF"
+        && &bytes[8..12] == b"WEBP"
+    {
+        return Some("webp");
+    }
+    None
+}
+
+/// 透传模式校验：base64 解码 + 大小上限 + magic bytes 一致性
+///
+/// 返回真实格式（与声明可能不同），错误信息附带原因。
+pub fn validate_passthrough(
+    base64_data: &str,
+    declared_format: &str,
+) -> Result<&'static str, String> {
+    let bytes = BASE64
+        .decode(base64_data)
+        .map_err(|e| format!("base64 解码失败: {}", e))?;
+    if bytes.len() > PASSTHROUGH_MAX_BYTES {
+        return Err(format!(
+            "图片超过透传上限 {} 字节: {}",
+            PASSTHROUGH_MAX_BYTES,
+            bytes.len()
+        ));
+    }
+    let actual = sniff_image_format(&bytes).ok_or("无法识别图片格式")?;
+    if !declared_format.eq_ignore_ascii_case(actual) {
+        tracing::warn!(
+            declared = declared_format,
+            actual = actual,
+            "图片声明格式与实际不一致，按实际格式透传"
+        );
+    }
+    Ok(actual)
+}
+
 /// 将图片编码为 base64
 fn encode_image(img: &DynamicImage, format: &str) -> Result<(String, usize), String> {
     let mut buffer = Cursor::new(Vec::new());
@@ -498,6 +555,31 @@ mod tests {
         assert_eq!(calculate_tokens(200, 200), 53); // 小图
     }
 
+    #[test]
+    fn test_sniff_image_format() {
+        // JPEG magic
+        assert_eq!(sniff_image_format(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("jpeg"));
+        // PNG magic
+        let png = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00];
+        assert_eq!(sniff_image_format(&png), Some("png"));
+        // GIF89a
+        assert_eq!(sniff_image_format(b"GIF89a..."), Some("gif"));
+        // GIF87a
+        assert_eq!(sniff_image_format(b"GIF87a..."), Some("gif"));
+        // WEBP
+        let mut webp = b"RIFF\0\0\0\0WEBP".to_vec();
+        webp.extend_from_slice(b"VP8 ");
+        assert_eq!(sniff_image_format(&webp), Some("webp"));
+        // unknown
+        assert_eq!(sniff_image_format(b"hello world!!"), None);
+    }
+
+    #[test]
+    fn test_validate_passthrough_size_limit() {
+        let oversize = vec![0xFFu8; PASSTHROUGH_MAX_BYTES + 1];
+        let b64 = BASE64.encode(&oversize);
+        assert!(validate_passthrough(&b64, "jpeg").is_err());
+    }
     #[test]
     fn test_gif_is_reencoded_even_without_resize() {
         use image::codecs::gif::{GifEncoder, Repeat};
