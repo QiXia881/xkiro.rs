@@ -9,215 +9,12 @@ use uuid::Uuid;
 
 use crate::kiro::model::events::{Event, MeteringEvent};
 
-/// 找到小于等于目标位置的最近有效UTF-8字符边界
-///
-/// UTF-8字符可能占用1-4个字节，直接按字节位置切片可能会切在多字节字符中间导致panic。
-/// 这个函数从目标位置向前搜索，找到最近的有效字符边界。
-fn find_char_boundary(s: &str, target: usize) -> usize {
-    if target >= s.len() {
-        return s.len();
-    }
-    if target == 0 {
-        return 0;
-    }
-    // 从目标位置向前搜索有效的字符边界
-    let mut pos = target;
-    while pos > 0 && !s.is_char_boundary(pos) {
-        pos -= 1;
-    }
-    pos
-}
+use super::thinking_parser::{
+    find_char_boundary, find_real_thinking_end_tag, find_real_thinking_end_tag_at_buffer_end,
+    find_real_thinking_start_tag,
+};
 
-/// 需要跳过的包裹字符
-///
-/// 当 thinking 标签被这些字符包裹时，认为是在引用标签而非真正的标签：
-/// - 反引号 (`)：行内代码
-/// - 双引号 (")：字符串
-/// - 单引号 (')：字符串
-const QUOTE_CHARS: &[u8] = &[
-    b'`', b'"', b'\'', b'\\', b'#', b'!', b'@', b'$', b'%', b'^', b'&', b'*', b'(', b')', b'-',
-    b'_', b'=', b'+', b'[', b']', b'{', b'}', b';', b':', b'<', b'>', b',', b'.', b'?', b'/',
-];
-
-/// 检查指定位置的字符是否是引用字符
-fn is_quote_char(buffer: &str, pos: usize) -> bool {
-    buffer
-        .as_bytes()
-        .get(pos)
-        .map(|c| QUOTE_CHARS.contains(c))
-        .unwrap_or(false)
-}
-
-/// 查找真正的 thinking 结束标签（不被引用字符包裹，且后面有双换行符）
-///
-/// 当模型在思考过程中提到 `</thinking>` 时，通常会用反引号、引号等包裹，
-/// 或者在同一行有其他内容（如"关于 </thinking> 标签"）。
-/// 这个函数会跳过这些情况，只返回真正的结束标签位置。
-///
-/// 跳过的情况：
-/// - 被引用字符包裹（反引号、引号等）
-/// - 后面没有双换行符（真正的结束标签后面会有 `\n\n`）
-/// - 标签在缓冲区末尾（流式处理时需要等待更多内容）
-///
-/// # 参数
-/// - `buffer`: 要搜索的字符串
-///
-/// # 返回值
-/// - `Some(pos)`: 真正的结束标签的起始位置
-/// - `None`: 没有找到真正的结束标签
-fn find_real_thinking_end_tag(buffer: &str) -> Option<usize> {
-    const TAG: &str = "</thinking>";
-    let mut search_start = 0;
-
-    while let Some(pos) = buffer[search_start..].find(TAG) {
-        let absolute_pos = search_start + pos;
-
-        // 检查前面是否有引用字符
-        let has_quote_before = absolute_pos > 0 && is_quote_char(buffer, absolute_pos - 1);
-
-        // 检查后面是否有引用字符
-        let after_pos = absolute_pos + TAG.len();
-        let has_quote_after = is_quote_char(buffer, after_pos);
-
-        // 如果被引用字符包裹，跳过
-        if has_quote_before || has_quote_after {
-            search_start = absolute_pos + 1;
-            continue;
-        }
-
-        // 检查后面的内容
-        let after_content = &buffer[after_pos..];
-
-        // 如果标签后面内容不足以判断是否有双换行符，等待更多内容
-        if after_content.len() < 2 {
-            return None;
-        }
-
-        // 真正的 thinking 结束标签后面会有双换行符 `\n\n`
-        if after_content.starts_with("\n\n") {
-            return Some(absolute_pos);
-        }
-
-        // 不是双换行符，跳过继续搜索
-        search_start = absolute_pos + 1;
-    }
-
-    None
-}
-
-/// 查找缓冲区末尾的 thinking 结束标签（允许末尾只有空白字符）
-///
-/// 用于“边界事件”场景：例如 thinking 结束后立刻进入 tool_use，或流结束，
-/// 此时 `</thinking>` 后面可能没有 `\n\n`，但结束标签依然应被识别并过滤。
-///
-/// 约束：只有当 `</thinking>` 之后全部都是空白字符时才认为是结束标签，
-/// 以避免在 thinking 内容中提到 `</thinking>`（非结束标签）时误判。
-fn find_real_thinking_end_tag_at_buffer_end(buffer: &str) -> Option<usize> {
-    const TAG: &str = "</thinking>";
-    let mut search_start = 0;
-
-    while let Some(pos) = buffer[search_start..].find(TAG) {
-        let absolute_pos = search_start + pos;
-
-        // 检查前面是否有引用字符
-        let has_quote_before = absolute_pos > 0 && is_quote_char(buffer, absolute_pos - 1);
-
-        // 检查后面是否有引用字符
-        let after_pos = absolute_pos + TAG.len();
-        let has_quote_after = is_quote_char(buffer, after_pos);
-
-        if has_quote_before || has_quote_after {
-            search_start = absolute_pos + 1;
-            continue;
-        }
-
-        // 只有当标签后面全部是空白字符时才认定为结束标签
-        if buffer[after_pos..].trim().is_empty() {
-            return Some(absolute_pos);
-        }
-
-        search_start = absolute_pos + 1;
-    }
-
-    None
-}
-
-/// 查找真正的 thinking 开始标签（不被引用字符包裹）
-///
-/// 与 `find_real_thinking_end_tag` 类似，跳过被引用字符包裹的开始标签。
-fn find_real_thinking_start_tag(buffer: &str) -> Option<usize> {
-    const TAG: &str = "<thinking>";
-    let mut search_start = 0;
-
-    while let Some(pos) = buffer[search_start..].find(TAG) {
-        let absolute_pos = search_start + pos;
-
-        // 检查前面是否有引用字符
-        let has_quote_before = absolute_pos > 0 && is_quote_char(buffer, absolute_pos - 1);
-
-        // 检查后面是否有引用字符
-        let after_pos = absolute_pos + TAG.len();
-        let has_quote_after = is_quote_char(buffer, after_pos);
-
-        // 如果不被引用字符包裹，则是真正的开始标签
-        if !has_quote_before && !has_quote_after {
-            return Some(absolute_pos);
-        }
-
-        // 继续搜索下一个匹配
-        search_start = absolute_pos + 1;
-    }
-
-    None
-}
-
-/// 从完整文本中提取 thinking 块（用于非流式响应）
-///
-/// 使用与流式处理相同的标签检测逻辑（引用字符过滤），确保一致性。
-/// 非流式场景下文本已完整，无需处理跨 chunk 分割问题。
-///
-/// # 返回值
-/// - `(Some(thinking_content), remaining_text)` — 检测到有效 thinking 块
-/// - `(None, original_text)` — 未检测到，原样返回
-pub(crate) fn extract_thinking_from_complete_text(text: &str) -> (Option<String>, String) {
-    let start_pos = match find_real_thinking_start_tag(text) {
-        Some(pos) => pos,
-        None => return (None, text.to_string()),
-    };
-
-    let before = &text[..start_pos];
-    let after_open = &text[start_pos + "<thinking>".len()..];
-
-    // 查找结束标签：优先匹配带 \n\n 后缀的，退而使用末尾匹配
-    let (thinking_raw, text_after) = if let Some(end_pos) = find_real_thinking_end_tag(after_open) {
-        (
-            &after_open[..end_pos],
-            &after_open[end_pos + "</thinking>\n\n".len()..],
-        )
-    } else if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(after_open) {
-        let after_tag = end_pos + "</thinking>".len();
-        (&after_open[..end_pos], after_open[after_tag..].trim_start())
-    } else {
-        // 找不到有效的结束标签，不做提取
-        return (None, text.to_string());
-    };
-
-    // 剥离开头的换行符（与流式处理一致：模型输出 <thinking>\n）
-    let thinking_content = thinking_raw.strip_prefix('\n').unwrap_or(thinking_raw);
-
-    // 组装剩余文本：跳过纯空白的 before 部分
-    let mut remaining = String::new();
-    if !before.trim().is_empty() {
-        remaining.push_str(before);
-    }
-    remaining.push_str(text_after);
-
-    if thinking_content.is_empty() {
-        (None, remaining)
-    } else {
-        (Some(thinking_content.to_string()), remaining)
-    }
-}
+pub(crate) use super::thinking_parser::extract_thinking_from_complete_text;
 
 /// SSE 事件
 #[derive(Debug, Clone)]
@@ -348,6 +145,11 @@ impl SseStateManager {
     /// 记录工具调用
     pub fn set_has_tool_use(&mut self, has: bool) {
         self.has_tool_use = has;
+    }
+
+    /// 是否已记录工具调用
+    pub fn has_tool_use(&self) -> bool {
+        self.has_tool_use
     }
 
     /// 设置 stop_reason
@@ -581,6 +383,8 @@ pub struct StreamContext {
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
+    /// 已发出的 text_delta 聚合内容（用于流末尾 bracket 工具调用回退检测）
+    pub emitted_text: String,
 }
 
 impl StreamContext {
@@ -610,6 +414,7 @@ impl StreamContext {
             text_block_index: None,
             metering: None,
             strip_thinking_leading_newline: false,
+            emitted_text: String::new(),
         }
     }
 
@@ -894,6 +699,9 @@ impl StreamContext {
     fn create_text_delta_events(&mut self, text: &str) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
+        // 累积已发出的文本，便于流末尾的 bracket 工具调用回退检测
+        self.emitted_text.push_str(text);
+
         // 如果当前 text_block_index 指向的块已经被关闭（例如 tool_use 开始时自动 stop），
         // 则丢弃该索引并创建新的文本块继续输出，避免 delta 被状态机拒绝导致“吞字”。
         if let Some(idx) = self.text_block_index {
@@ -1159,6 +967,77 @@ impl StreamContext {
         {
             self.state_manager.set_stop_reason("max_tokens");
             events.extend(self.create_text_delta_events(" "));
+        }
+
+        // Bracket-style 工具调用回退：仅在结构化 toolUseEvent 未出现工具调用时扫描。
+        // 文本已经发出，无法撤回；这里只在末尾补发 tool_use blocks，让客户端能识别工具调用。
+        if !self.state_manager.has_tool_use() {
+            let bracket_calls =
+                super::bracket_tool_parser::parse_bracket_tool_calls(&self.emitted_text);
+            if !bracket_calls.is_empty() {
+                tracing::info!(
+                    count = bracket_calls.len(),
+                    "流末尾检出 bracket 风格工具调用，补发 tool_use blocks"
+                );
+                self.state_manager.set_has_tool_use(true);
+                self.state_manager.set_stop_reason("tool_use");
+
+                // 关闭仍开着的 text block，让 tool_use 拿到新的索引
+                if let Some(idx) = self.text_block_index.take() {
+                    if let Some(stop_event) =
+                        self.state_manager.handle_content_block_stop(idx)
+                    {
+                        events.push(stop_event);
+                    }
+                }
+
+                for call in bracket_calls {
+                    let block_index = self.state_manager.next_block_index();
+                    let tool_id = format!("toolu_{}", Uuid::new_v4().simple());
+                    let original_name = self
+                        .tool_name_map
+                        .get(&call.name)
+                        .cloned()
+                        .unwrap_or(call.name);
+                    let input_json = serde_json::to_string(&call.input)
+                        .unwrap_or_else(|_| "{}".to_string());
+
+                    events.extend(self.state_manager.handle_content_block_start(
+                        block_index,
+                        "tool_use",
+                        json!({
+                            "type": "content_block_start",
+                            "index": block_index,
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": tool_id,
+                                "name": original_name,
+                                "input": {}
+                            }
+                        }),
+                    ));
+
+                    if let Some(delta_event) = self.state_manager.handle_content_block_delta(
+                        block_index,
+                        json!({
+                            "type": "content_block_delta",
+                            "index": block_index,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": input_json
+                            }
+                        }),
+                    ) {
+                        events.push(delta_event);
+                    }
+
+                    if let Some(stop_event) =
+                        self.state_manager.handle_content_block_stop(block_index)
+                    {
+                        events.push(stop_event);
+                    }
+                }
+            }
         }
 
         // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
@@ -1581,129 +1460,6 @@ mod tests {
     }
 
     #[test]
-    fn test_find_real_thinking_start_tag_basic() {
-        // 基本情况：正常的开始标签
-        assert_eq!(find_real_thinking_start_tag("<thinking>"), Some(0));
-        assert_eq!(find_real_thinking_start_tag("prefix<thinking>"), Some(6));
-    }
-
-    #[test]
-    fn test_find_real_thinking_start_tag_with_backticks() {
-        // 被反引号包裹的应该被跳过
-        assert_eq!(find_real_thinking_start_tag("`<thinking>`"), None);
-        assert_eq!(find_real_thinking_start_tag("use `<thinking>` tag"), None);
-
-        // 先有被包裹的，后有真正的开始标签
-        assert_eq!(
-            find_real_thinking_start_tag("about `<thinking>` tag<thinking>content"),
-            Some(22)
-        );
-    }
-
-    #[test]
-    fn test_find_real_thinking_start_tag_with_quotes() {
-        // 被双引号包裹的应该被跳过
-        assert_eq!(find_real_thinking_start_tag("\"<thinking>\""), None);
-        assert_eq!(find_real_thinking_start_tag("the \"<thinking>\" tag"), None);
-
-        // 被单引号包裹的应该被跳过
-        assert_eq!(find_real_thinking_start_tag("'<thinking>'"), None);
-
-        // 混合情况
-        assert_eq!(
-            find_real_thinking_start_tag("about \"<thinking>\" and '<thinking>' then<thinking>"),
-            Some(40)
-        );
-    }
-
-    #[test]
-    fn test_find_real_thinking_end_tag_basic() {
-        // 基本情况：正常的结束标签后面有双换行符
-        assert_eq!(find_real_thinking_end_tag("</thinking>\n\n"), Some(0));
-        assert_eq!(
-            find_real_thinking_end_tag("content</thinking>\n\n"),
-            Some(7)
-        );
-        assert_eq!(
-            find_real_thinking_end_tag("some text</thinking>\n\nmore text"),
-            Some(9)
-        );
-
-        // 没有双换行符的情况
-        assert_eq!(find_real_thinking_end_tag("</thinking>"), None);
-        assert_eq!(find_real_thinking_end_tag("</thinking>\n"), None);
-        assert_eq!(find_real_thinking_end_tag("</thinking> more"), None);
-    }
-
-    #[test]
-    fn test_find_real_thinking_end_tag_with_backticks() {
-        // 被反引号包裹的应该被跳过
-        assert_eq!(find_real_thinking_end_tag("`</thinking>`\n\n"), None);
-        assert_eq!(
-            find_real_thinking_end_tag("mention `</thinking>` in code\n\n"),
-            None
-        );
-
-        // 只有前面有反引号
-        assert_eq!(find_real_thinking_end_tag("`</thinking>\n\n"), None);
-
-        // 只有后面有反引号
-        assert_eq!(find_real_thinking_end_tag("</thinking>`\n\n"), None);
-    }
-
-    #[test]
-    fn test_find_real_thinking_end_tag_with_quotes() {
-        // 被双引号包裹的应该被跳过
-        assert_eq!(find_real_thinking_end_tag("\"</thinking>\"\n\n"), None);
-        assert_eq!(
-            find_real_thinking_end_tag("the string \"</thinking>\" is a tag\n\n"),
-            None
-        );
-
-        // 被单引号包裹的应该被跳过
-        assert_eq!(find_real_thinking_end_tag("'</thinking>'\n\n"), None);
-        assert_eq!(
-            find_real_thinking_end_tag("use '</thinking>' as marker\n\n"),
-            None
-        );
-
-        // 混合情况：双引号包裹后有真正的标签
-        assert_eq!(
-            find_real_thinking_end_tag("about \"</thinking>\" tag</thinking>\n\n"),
-            Some(23)
-        );
-
-        // 混合情况：单引号包裹后有真正的标签
-        assert_eq!(
-            find_real_thinking_end_tag("about '</thinking>' tag</thinking>\n\n"),
-            Some(23)
-        );
-    }
-
-    #[test]
-    fn test_find_real_thinking_end_tag_mixed() {
-        // 先有被包裹的，后有真正的结束标签
-        assert_eq!(
-            find_real_thinking_end_tag("discussing `</thinking>` tag</thinking>\n\n"),
-            Some(28)
-        );
-
-        // 多个被包裹的，最后一个是真正的
-        assert_eq!(
-            find_real_thinking_end_tag("`</thinking>` and `</thinking>` done</thinking>\n\n"),
-            Some(36)
-        );
-
-        // 多种引用字符混合
-        assert_eq!(
-            find_real_thinking_end_tag(
-                "`</thinking>` and \"</thinking>\" and '</thinking>' done</thinking>\n\n"
-            ),
-            Some(54)
-        );
-    }
-
-    #[test]
     fn test_tool_use_immediately_after_thinking_filters_end_tag_and_closes_thinking_block() {
         let mut ctx = StreamContext::new_with_thinking("test-model", 1, None, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
@@ -2116,6 +1872,75 @@ mod tests {
         assert_eq!(
             message_delta.data["delta"]["stop_reason"], "tool_use",
             "stop_reason should be tool_use when tool_use is present"
+        );
+    }
+
+    #[test]
+    fn test_bracket_tool_call_fallback_in_stream_finalize() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, None, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_assistant_response(
+            r#"hello [Called get_weather with args: {"city":"London"}] done"#,
+        );
+        let final_events = ctx.generate_final_events();
+
+        let tool_start = final_events
+            .iter()
+            .find(|e| {
+                e.event == "content_block_start"
+                    && e.data["content_block"]["type"] == "tool_use"
+            })
+            .expect("bracket fallback should emit a tool_use content_block_start");
+        assert_eq!(tool_start.data["content_block"]["name"], "get_weather");
+
+        let input_delta = final_events
+            .iter()
+            .find(|e| {
+                e.event == "content_block_delta"
+                    && e.data["delta"]["type"] == "input_json_delta"
+            })
+            .expect("bracket fallback should emit input_json_delta");
+        let partial = input_delta.data["delta"]["partial_json"]
+            .as_str()
+            .unwrap_or("");
+        assert!(partial.contains("\"city\""));
+        assert!(partial.contains("London"));
+
+        let message_delta = final_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("message_delta should be present");
+        assert_eq!(message_delta.data["delta"]["stop_reason"], "tool_use");
+    }
+
+    #[test]
+    fn test_bracket_fallback_skipped_when_structured_tool_use_present() {
+        use crate::kiro::model::events::ToolUseEvent;
+
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, None, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_assistant_response(
+            r#"prefix [Called fake_one with args: {"x":1}]"#,
+        );
+        let _ = ctx.process_kiro_event(&Event::ToolUse(ToolUseEvent {
+            name: "real_tool".to_string(),
+            tool_use_id: "toolu_real".to_string(),
+            input: r#"{"y":2}"#.to_string(),
+            stop: true,
+        }));
+        let final_events = ctx.generate_final_events();
+
+        let tool_starts: Vec<_> = final_events
+            .iter()
+            .chain(std::iter::empty())
+            .filter(|e| {
+                e.event == "content_block_start"
+                    && e.data["content_block"]["type"] == "tool_use"
+            })
+            .collect();
+        assert!(
+            tool_starts.is_empty(),
+            "fallback must not fire when a structured tool_use already arrived"
         );
     }
 }

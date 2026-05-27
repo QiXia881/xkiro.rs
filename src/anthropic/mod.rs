@@ -23,6 +23,7 @@
 //! ```
 
 pub(crate) mod converter;
+pub mod bracket_tool_parser;
 pub mod cache_tracker;
 pub mod compressor;
 mod handlers;
@@ -31,6 +32,7 @@ pub mod prompt_filter;
 pub mod prompt_presets;
 mod router;
 mod stream;
+pub mod thinking_parser;
 pub mod tool_compression;
 pub mod truncation;
 pub mod types;

@@ -168,7 +168,12 @@ fn prepare_kiro_request(
 
     let compression = state.compression_config.read().clone();
     let prompt_filter = state.prompt_filter_config.read().clone();
-    let conversion_result = match convert_request(&payload, &compression, &prompt_filter) {
+    let conversion_result = match convert_request(
+        &payload,
+        &compression,
+        &prompt_filter,
+        state.truncation_recovery_notice_enabled(),
+    ) {
         Ok(r) => r,
         Err(e) => {
             let (code, msg) = match &e {

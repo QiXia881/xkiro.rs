@@ -919,7 +919,12 @@ pub async fn post_messages(
     // 转换请求
     let compression = state.compression_config.read().clone();
     let prompt_filter = state.prompt_filter_config.read().clone();
-    let conversion_result = match convert_request(&payload, &compression, &prompt_filter) {
+    let conversion_result = match convert_request(
+        &payload,
+        &compression,
+        &prompt_filter,
+        state.truncation_recovery_notice_enabled(),
+    ) {
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
@@ -1418,6 +1423,38 @@ async fn handle_non_stream_request(
                                     })
                                 };
 
+                                // 解析成功后，对已知 critical 工具检测 MissingFields
+                                if !buffer.is_empty() {
+                                    let required = super::truncation::required_fields_for(
+                                        &tool_use.name,
+                                    );
+                                    if !required.is_empty() {
+                                        if let Some(info) =
+                                            super::truncation::detect_truncation_with_required(
+                                                &tool_use.name,
+                                                &tool_use.tool_use_id,
+                                                buffer,
+                                                required,
+                                            )
+                                        {
+                                            if info.truncation_type
+                                                == super::truncation::TruncationType::MissingFields
+                                            {
+                                                let soft_msg =
+                                                    super::truncation::build_soft_failure_result(
+                                                        &info,
+                                                    );
+                                                tracing::warn!(
+                                                    tool_use_id = %tool_use.tool_use_id,
+                                                    truncation_type = %info.truncation_type,
+                                                    "工具调用缺少必填字段（疑似截断）: {}",
+                                                    soft_msg
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+
                                 let original_name = context
                                     .tool_name_map
                                     .get(&tool_use.name)
@@ -1476,6 +1513,38 @@ async fn handle_non_stream_request(
     // 确定 stop_reason
     if has_tool_use && stop_reason == "end_turn" {
         stop_reason = "tool_use".to_string();
+    }
+
+    // Bracket-style 工具调用回退：仅在结构化 toolUseEvent 未出现工具调用、
+    // 且文本里包含 `[Called name with args: {...}]` 模式时才扫描，避免误伤普通文本。
+    if !has_tool_use {
+        let bracket_calls =
+            super::bracket_tool_parser::parse_bracket_tool_calls(&text_content);
+        if !bracket_calls.is_empty() {
+            tracing::info!(
+                count = bracket_calls.len(),
+                "检出 bracket 风格工具调用，回退转为标准 tool_use"
+            );
+            text_content =
+                super::bracket_tool_parser::strip_bracket_spans(&text_content, &bracket_calls);
+            for call in bracket_calls {
+                let original_name = context
+                    .tool_name_map
+                    .get(&call.name)
+                    .cloned()
+                    .unwrap_or(call.name);
+                let id = format!("toolu_{}", uuid::Uuid::new_v4().simple());
+                tool_uses.push(json!({
+                    "type": "tool_use",
+                    "id": id,
+                    "name": original_name,
+                    "input": call.input,
+                }));
+            }
+            if stop_reason == "end_turn" {
+                stop_reason = "tool_use".to_string();
+            }
+        }
     }
 
     // 构建响应内容
@@ -1758,7 +1827,12 @@ pub async fn post_messages_cc(
     // 转换请求
     let compression = state.compression_config.read().clone();
     let prompt_filter = state.prompt_filter_config.read().clone();
-    let conversion_result = match convert_request(&payload, &compression, &prompt_filter) {
+    let conversion_result = match convert_request(
+        &payload,
+        &compression,
+        &prompt_filter,
+        state.truncation_recovery_notice_enabled(),
+    ) {
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {

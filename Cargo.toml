@@ -44,3 +44,4 @@ mime_guess = "2"      # MIME 类型推断
 unicode-segmentation = "1.13"  # UAX #29 grapheme cluster 安全截断
 serde_cbor = "0.11"   # CBOR 编解码（Web Portal API）
 regex = "1"           # 系统提示清洗的正则规则
+tiktoken-rs = "0.11"  # cl100k_base 精确 token 计数（precise_token_counting 开启时启用）

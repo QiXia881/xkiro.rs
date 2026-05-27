@@ -192,6 +192,9 @@ async fn main() {
         tls_backend: config.tls_backend,
     });
 
+    // tiktoken cl100k_base 精确计数开关（admin API 不暴露热改，需重启）
+    token::set_precise_counting(config.precise_token_counting);
+
     // 共享压缩配置（admin API 可运行时修改）
     let compression_config = Arc::new(RwLock::new(config.compression.clone()));
 
@@ -202,11 +205,17 @@ async fn main() {
     let prompt_runtime = crate::model::runtime::shared_from_config(&config);
 
     // Prompt Cache 运行时（共享引用，支持热更新）
+    // Prompt Cache 运行时（共享引用，支持热更新）
     let prompt_cache_runtime = Arc::new(RwLock::new(
         anthropic::middleware::PromptCacheRuntime::new(
             config.prompt_cache_ttl_seconds,
             config.prompt_cache_accounting_enabled,
         ),
+    ));
+
+    // 截断恢复识别开关（admin API 可运行时修改）
+    let truncation_recovery_notice = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+        config.truncation_recovery_system_notice,
     ));
 
     // 构建 Anthropic API 路由（profile_arn 由首个凭据提供）
@@ -219,6 +228,7 @@ async fn main() {
         prompt_filter_config.clone(),
         prompt_runtime.clone(),
         prompt_cache_runtime.clone(),
+        truncation_recovery_notice.clone(),
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
@@ -240,6 +250,7 @@ async fn main() {
                 compression_config.clone(),
                 prompt_cache_runtime.clone(),
                 prompt_runtime.clone(),
+                truncation_recovery_notice.clone(),
                 endpoint_names.clone(),
             );
             let admin_state = admin::AdminState::new(admin_key, admin_service, compression_config.clone());

@@ -224,6 +224,7 @@ fn clean_system_prompt(text: &str) -> String {
     // xkiro 自注入物（整段移除）
     result = result.replace(SYSTEM_CHUNKED_POLICY, "");
     result = result.replace(KIRO_AGENTIC_SYSTEM_PROMPT, "");
+    result = result.replace(super::truncation::TRUNCATION_RECOVERY_SYSTEM_NOTICE, "");
 
     // thinking 模板（用 regex 兼容动态参数）
     let thinking_mode = THINKING_MODE_RE
@@ -317,6 +318,8 @@ struct BuildHistoryContext<'a> {
     tool_name_map: &'a mut HashMap<String, String>,
     /// 长工具描述抽离后的文档段，追加到系统提示末尾
     tool_docs: Option<&'a str>,
+    /// 是否在 system prompt 末尾注入截断恢复识别说明
+    truncation_recovery_notice: bool,
 }
 
 const MAX_TOTAL_IMAGES: usize = 20;
@@ -476,11 +479,47 @@ fn create_placeholder_tool(name: &str) -> Tool {
     }
 }
 
+/// Codex App / 其他客户端可能发 `developer` / `system` / 自定义角色，
+/// Kiro 后端只支持 `user` 和 `assistant`。把非这两个的角色统一改写为 `user`。
+///
+/// 全部已是 user/assistant → 返回 `Cow::Borrowed`，零拷贝。
+/// 否则克隆并改写。
+fn normalize_message_roles(
+    messages: &[super::types::Message],
+) -> std::borrow::Cow<'_, [super::types::Message]> {
+    let needs_normalize = messages
+        .iter()
+        .any(|m| m.role != "user" && m.role != "assistant");
+    if !needs_normalize {
+        return std::borrow::Cow::Borrowed(messages);
+    }
+
+    let mut converted = 0usize;
+    let normalized: Vec<super::types::Message> = messages
+        .iter()
+        .map(|m| {
+            if m.role == "user" || m.role == "assistant" {
+                m.clone()
+            } else {
+                converted += 1;
+                let original = m.role.clone();
+                let mut cloned = m.clone();
+                cloned.role = "user".to_string();
+                tracing::debug!(role = %original, "归一化未知 role 为 user");
+                cloned
+            }
+        })
+        .collect();
+    tracing::info!(count = converted, "Codex 兼容：未知 role → user");
+    std::borrow::Cow::Owned(normalized)
+}
+
 /// 将 Anthropic 请求转换为 Kiro 请求
 pub fn convert_request(
     req: &MessagesRequest,
     compression_config: &CompressionConfig,
     prompt_filter: &PromptFilterConfig,
+    truncation_recovery_notice: bool,
 ) -> Result<ConversionResult, ConversionError> {
     // 1. 映射模型
     let model_id = map_model(&req.model)
@@ -491,18 +530,27 @@ pub fn convert_request(
         return Err(ConversionError::EmptyMessages);
     }
 
+    // 2.1. Codex App 兼容：把非 user/assistant 角色（developer/system/tool 等）
+    // 归一化为 user。Kiro 后端只接受 user/assistant，未知角色直接喂会被静默丢弃
+    // 或触发 "Improperly formed request"。下游的 user/assistant buffer 合并机制
+    // 会自动把连续 user 拼成一条，无需额外占位。参考 jwadow/kiro-gateway PR #64。
+    let normalized_messages = normalize_message_roles(&req.messages);
+    let source_messages: &[super::types::Message] = match &normalized_messages {
+        std::borrow::Cow::Borrowed(_) => &req.messages,
+        std::borrow::Cow::Owned(v) => v,
+    };
+
     // 2.5. 预处理 prefill：如果末尾是 assistant，静默丢弃并截断到最后一条 user
     // Claude 4.x 已弃用 assistant prefill，Kiro API 也不支持
-    let messages: &[_] = if req.messages.last().is_some_and(|m| m.role != "user") {
+    let messages: &[_] = if source_messages.last().is_some_and(|m| m.role != "user") {
         tracing::info!("检测到末尾 assistant 消息（prefill），静默丢弃");
-        let last_user_idx = req
-            .messages
+        let last_user_idx = source_messages
             .iter()
             .rposition(|m| m.role == "user")
             .ok_or(ConversionError::EmptyMessages)?;
-        &req.messages[..=last_user_idx]
+        &source_messages[..=last_user_idx]
     } else {
-        &req.messages
+        source_messages
     };
 
     // 2.6. 验证最后一条消息内容不为空
@@ -578,6 +626,7 @@ pub fn convert_request(
             is_agentic: is_agentic_model(&req.model),
             tool_name_map: &mut tool_name_map,
             tool_docs: tool_docs.as_deref(),
+            truncation_recovery_notice,
         },
     )?;
 
@@ -1367,6 +1416,7 @@ fn build_history(
         is_agentic,
         tool_name_map,
         tool_docs,
+        truncation_recovery_notice,
     } = ctx;
     let mut history = Vec::new();
 
@@ -1391,9 +1441,8 @@ fn build_history(
         clean_system_prompt(&s)
     });
 
-    let needs_inject = thinking_prefix.is_some()
-        || should_inject_chunked_policy
-        || tool_docs.is_some();
+    let needs_inject =
+        thinking_prefix.is_some() || should_inject_chunked_policy || tool_docs.is_some();
 
     let final_system = match base_system {
         Some(s) if !s.is_empty() => {
@@ -1429,6 +1478,18 @@ fn build_history(
             Some(content)
         }
         _ => None,
+    };
+
+    // 截断恢复识别说明：始终在 system 末尾追加（独立开关，不走 preset）
+    // NOTICE 常量自带前导 "\n"，直接拼接即可，避免双换行残留导致 cleaner 反引用对不齐
+    let final_system = match final_system {
+        Some(s) if truncation_recovery_notice => {
+            Some(format!("{}{}", s, super::truncation::TRUNCATION_RECOVERY_SYSTEM_NOTICE))
+        }
+        None if truncation_recovery_notice => {
+            Some(super::truncation::TRUNCATION_RECOVERY_SYSTEM_NOTICE.to_string())
+        }
+        other => other,
     };
 
     if let Some(content) = final_system {
@@ -2397,7 +2458,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req, &CompressionConfig::default(), &PromptFilterConfig::default()).unwrap();
+        let result = convert_request(&req, &CompressionConfig::default(), &PromptFilterConfig::default(), false).unwrap();
 
         // 应该有映射
         assert_eq!(result.tool_name_map.len(), 1);
@@ -2466,7 +2527,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req, &CompressionConfig::default(), &PromptFilterConfig::default()).unwrap();
+        let result = convert_request(&req, &CompressionConfig::default(), &PromptFilterConfig::default(), false).unwrap();
         let short_name = result.tool_name_map.iter().next().unwrap().0.clone();
 
         // 历史中 assistant 消息的 tool_use name 也应该被映射
@@ -2523,7 +2584,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req, &CompressionConfig::default(), &PromptFilterConfig::default()).unwrap();
+        let result = convert_request(&req, &CompressionConfig::default(), &PromptFilterConfig::default(), false).unwrap();
 
         // 验证 tools 列表中包含了历史中使用的工具的占位符定义
         let tools = &result
@@ -2611,7 +2672,7 @@ mod tests {
             }),
         };
 
-        let result = convert_request(&req, &CompressionConfig::default(), &PromptFilterConfig::default()).unwrap();
+        let result = convert_request(&req, &CompressionConfig::default(), &PromptFilterConfig::default(), false).unwrap();
         assert_eq!(
             result.conversation_state.conversation_id,
             "a0662283-7fd3-4399-a7eb-52b9a717ae88"
@@ -2639,7 +2700,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req, &CompressionConfig::default(), &PromptFilterConfig::default()).unwrap();
+        let result = convert_request(&req, &CompressionConfig::default(), &PromptFilterConfig::default(), false).unwrap();
         // 验证生成的是有效的 UUID 格式
         assert_eq!(result.conversation_state.conversation_id.len(), 36);
         assert_eq!(
@@ -3075,7 +3136,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req, &CompressionConfig::default(), &PromptFilterConfig::default());
+        let result = convert_request(&req, &CompressionConfig::default(), &PromptFilterConfig::default(), false);
         assert!(
             result.is_ok(),
             "连续 assistant 消息场景不应报错: {:?}",
@@ -3208,7 +3269,7 @@ mod tests {
         ]));
         let cfg = crate::model::config::CompressionConfig::default();
         let pf = crate::model::config::PromptFilterConfig::default();
-        let kr = convert_request(&req, &cfg, &pf).expect("convert");
+        let kr = convert_request(&req, &cfg, &pf, false).expect("convert");
         let history = kr.conversation_state.history;
         // leading orphan assistant 必须被丢弃；history 不应以 assistant 开头
         if let Some(first) = history.first() {
@@ -3246,7 +3307,7 @@ mod tests {
         ]));
         let cfg = crate::model::config::CompressionConfig::default();
         let pf = crate::model::config::PromptFilterConfig::default();
-        let kr = convert_request(&req, &cfg, &pf).expect("convert");
+        let kr = convert_request(&req, &cfg, &pf, false).expect("convert");
         let mut found_ws = false;
         for m in &kr.conversation_state.history {
             if let Message::Assistant(a) = m
@@ -3289,7 +3350,7 @@ mod tests {
         ]));
         let cfg = crate::model::config::CompressionConfig::default();
         let pf = crate::model::config::PromptFilterConfig::default();
-        let kr = convert_request(&req, &cfg, &pf).expect("convert");
+        let kr = convert_request(&req, &cfg, &pf, false).expect("convert");
         let mut found = false;
         for m in &kr.conversation_state.history {
             if let Message::Assistant(a) = m
@@ -3308,5 +3369,63 @@ mod tests {
             }
         }
         assert!(found, "应找到 tu1");
+    }
+
+    // ----- Codex App 兼容：未知 role 归一化 -----
+
+    #[test]
+    fn test_normalize_unknown_role_developer_to_user() {
+        let req = make_request_with_messages(serde_json::json!([
+            {"role": "developer", "content": "context A"},
+            {"role": "developer", "content": "context B"},
+            {"role": "user", "content": "question"}
+        ]));
+        let cfg = crate::model::config::CompressionConfig::default();
+        let pf = crate::model::config::PromptFilterConfig::default();
+        let kr = convert_request(&req, &cfg, &pf, false).expect("convert");
+
+        // currentMessage 应为最后一条 user
+        let cur_text = &kr.conversation_state.current_message.user_input_message.content;
+        assert!(cur_text.contains("question"), "currentMessage 应包含 question");
+
+        // 前两条 developer 归一化后合并到 history 第一条 user
+        let has_context_a = kr.conversation_state.history.iter().any(|m| {
+            if let Message::User(u) = m {
+                u.user_input_message.content.contains("context A")
+            } else {
+                false
+            }
+        });
+        assert!(has_context_a, "context A 应保留在 history");
+    }
+
+    #[test]
+    fn test_normalize_system_role_to_user() {
+        let req = make_request_with_messages(serde_json::json!([
+            {"role": "system", "content": "ignore me"},
+            {"role": "user", "content": "real question"}
+        ]));
+        let cfg = crate::model::config::CompressionConfig::default();
+        let pf = crate::model::config::PromptFilterConfig::default();
+        let kr = convert_request(&req, &cfg, &pf, false).expect("convert");
+        let cur_text = &kr.conversation_state.current_message.user_input_message.content;
+        assert!(cur_text.contains("real question"));
+    }
+
+    #[test]
+    fn test_normalize_preserves_user_assistant_zero_copy() {
+        let msgs = vec![
+            super::super::types::Message {
+                role: "user".to_string(),
+                content: serde_json::Value::String("hi".to_string()),
+            },
+            super::super::types::Message {
+                role: "assistant".to_string(),
+                content: serde_json::Value::String("ok".to_string()),
+            },
+        ];
+        let cow = normalize_message_roles(&msgs);
+        assert!(matches!(cow, std::borrow::Cow::Borrowed(_)),
+            "全 user/assistant 应零拷贝");
     }
 }

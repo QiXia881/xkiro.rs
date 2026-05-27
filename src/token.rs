@@ -13,6 +13,27 @@ use crate::anthropic::types::{
 use crate::http_client::{ProxyConfig, build_client};
 use crate::model::config::TlsBackend;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// 精确计数（cl100k_base）总开关
+static PRECISE_COUNTING: AtomicBool = AtomicBool::new(false);
+
+/// 设置是否启用 cl100k_base 精确 token 计数
+pub fn set_precise_counting(enabled: bool) {
+    PRECISE_COUNTING.store(enabled, Ordering::Relaxed);
+}
+
+fn precise_counting_enabled() -> bool {
+    PRECISE_COUNTING.load(Ordering::Relaxed)
+}
+
+/// 全局共享的 cl100k_base BPE 实例
+fn cl100k_bpe() -> &'static tiktoken_rs::CoreBPE {
+    static BPE: OnceLock<tiktoken_rs::CoreBPE> = OnceLock::new();
+    BPE.get_or_init(|| {
+        tiktoken_rs::cl100k_base().expect("cl100k_base BPE 加载失败")
+    })
+}
 
 /// Count Tokens API 配置
 #[derive(Clone, Default)]
@@ -77,7 +98,9 @@ fn is_non_western_char(c: char) -> bool {
 /// - 4 个字符单位 = 1 token（四舍五入）
 /// ```
 pub fn count_tokens(text: &str) -> u64 {
-    // println!("text: {}", text);
+    if precise_counting_enabled() {
+        return cl100k_bpe().encode_with_special_tokens(text).len() as u64;
+    }
 
     let char_units: f64 = text
         .chars()
@@ -283,5 +306,30 @@ pub fn count_message_content_tokens(value: &serde_json::Value) -> u64 {
             0
         }
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// 共享 atomic 的测试需串行化，避免并行污染
+    static GUARD: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn precise_counting_matches_known_cl100k_lengths() {
+        let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        set_precise_counting(true);
+        assert_eq!(count_tokens("hello world"), 2);
+        assert_eq!(count_tokens(""), 0);
+        set_precise_counting(false);
+    }
+
+    #[test]
+    fn heuristic_counting_default_path() {
+        let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        set_precise_counting(false);
+        assert!(count_tokens("hello world") > 0);
     }
 }

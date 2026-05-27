@@ -48,8 +48,14 @@ pub fn create_router_with_provider(
     prompt_filter: Arc<RwLock<PromptFilterConfig>>,
     prompt_runtime: SharedPromptConfig,
     prompt_cache_runtime: Arc<RwLock<super::middleware::PromptCacheRuntime>>,
+    truncation_recovery_notice: Arc<std::sync::atomic::AtomicBool>,
 ) -> Router {
-    let mut state = AppState::new(api_key, extract_thinking, prompt_cache_runtime)
+    let mut state = AppState::new(
+        api_key,
+        extract_thinking,
+        prompt_cache_runtime,
+        truncation_recovery_notice,
+    )
         .with_compression_config(compression)
         .with_prompt_filter_config(prompt_filter)
         .with_prompt_runtime(prompt_runtime);

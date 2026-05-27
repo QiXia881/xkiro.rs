@@ -54,6 +54,8 @@ export interface GlobalConfigResponse {
   balanceRefreshConcurrency: number
   /** session 亲和：true=同会话黏住同凭据；false=每条消息独立平摊 */
   sessionAffinityEnabled: boolean
+  /** 是否在 system prompt 末尾注入截断恢复识别说明 */
+  truncationRecoverySystemNotice: boolean
   compression: CompressionConfigPayload
 }
 
@@ -91,6 +93,7 @@ export interface UpdateGlobalConfigRequest {
   balanceRefreshIntervalSecs?: number
   balanceRefreshConcurrency?: number
   sessionAffinityEnabled?: boolean
+  truncationRecoverySystemNotice?: boolean
   compression?: Partial<CompressionConfigPayload>
 }
 
