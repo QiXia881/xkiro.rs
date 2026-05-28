@@ -351,13 +351,6 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub balance_refresh_enabled: bool,
 
-    /// 是否在 system prompt 末尾注入截断恢复识别说明
-    ///
-    /// 告知模型 `[System Notice]` / `[API Limitation]` 是 xkiro 的截断恢复标记，
-    /// 不是 prompt injection。避免模型把这些标记当作越权指令而拒答。
-    #[serde(default = "default_true")]
-    pub truncation_recovery_system_notice: bool,
-
     /// 是否启用 tiktoken cl100k_base 精确 token 计数
     ///
     /// 默认关闭，使用启发式 (字符比例 + 分段校准) — 与 Claude 真实计数偏差较小
@@ -508,7 +501,6 @@ impl Default for Config {
             balance_refresh_concurrency: default_balance_refresh_concurrency(),
             session_affinity_enabled: false,
             privacy_mode: true,
-            truncation_recovery_system_notice: true,
             precise_token_counting: false,
             config_path: None,
         }

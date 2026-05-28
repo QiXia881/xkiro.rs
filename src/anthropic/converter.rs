@@ -224,7 +224,6 @@ fn clean_system_prompt(text: &str) -> String {
     // xkiro 自注入物（整段移除）
     result = result.replace(SYSTEM_CHUNKED_POLICY, "");
     result = result.replace(KIRO_AGENTIC_SYSTEM_PROMPT, "");
-    result = result.replace(super::truncation::TRUNCATION_RECOVERY_SYSTEM_NOTICE, "");
 
     // thinking 模板（用 regex 兼容动态参数）
     let thinking_mode = THINKING_MODE_RE
@@ -318,8 +317,6 @@ struct BuildHistoryContext<'a> {
     tool_name_map: &'a mut HashMap<String, String>,
     /// 长工具描述抽离后的文档段，追加到系统提示末尾
     tool_docs: Option<&'a str>,
-    /// 是否在 system prompt 末尾注入截断恢复识别说明
-    truncation_recovery_notice: bool,
 }
 
 const MAX_TOTAL_IMAGES: usize = 20;
@@ -519,7 +516,6 @@ pub fn convert_request(
     req: &MessagesRequest,
     compression_config: &CompressionConfig,
     prompt_filter: &PromptFilterConfig,
-    truncation_recovery_notice: bool,
 ) -> Result<ConversionResult, ConversionError> {
     // 1. 映射模型
     let model_id = map_model(&req.model)
@@ -626,7 +622,6 @@ pub fn convert_request(
             is_agentic: is_agentic_model(&req.model),
             tool_name_map: &mut tool_name_map,
             tool_docs: tool_docs.as_deref(),
-            truncation_recovery_notice,
         },
     )?;
 
@@ -1416,7 +1411,6 @@ fn build_history(
         is_agentic,
         tool_name_map,
         tool_docs,
-        truncation_recovery_notice,
     } = ctx;
     let mut history = Vec::new();
 
@@ -1478,16 +1472,6 @@ fn build_history(
             Some(content)
         }
         _ => None,
-    };
-
-    // 截断恢复识别说明：仅在已存在 system 时追加（独立开关，不走 preset）
-    // NOTICE 常量自带前导 "\n"，直接拼接即可，避免双换行残留导致 cleaner 反引用对不齐
-    // 无 system 时不注入：避免凭空造出 user/assistant 对话改变模型起手上下文
-    let final_system = match final_system {
-        Some(s) if truncation_recovery_notice => {
-            Some(format!("{}{}", s, super::truncation::TRUNCATION_RECOVERY_SYSTEM_NOTICE))
-        }
-        other => other,
     };
 
     if let Some(content) = final_system {
@@ -2456,7 +2440,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req, &CompressionConfig::default(), &PromptFilterConfig::default(), false).unwrap();
+        let result = convert_request(&req, &CompressionConfig::default(), &PromptFilterConfig::default()).unwrap();
 
         // 应该有映射
         assert_eq!(result.tool_name_map.len(), 1);
@@ -2525,7 +2509,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req, &CompressionConfig::default(), &PromptFilterConfig::default(), false).unwrap();
+        let result = convert_request(&req, &CompressionConfig::default(), &PromptFilterConfig::default()).unwrap();
         let short_name = result.tool_name_map.iter().next().unwrap().0.clone();
 
         // 历史中 assistant 消息的 tool_use name 也应该被映射
@@ -2582,7 +2566,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req, &CompressionConfig::default(), &PromptFilterConfig::default(), false).unwrap();
+        let result = convert_request(&req, &CompressionConfig::default(), &PromptFilterConfig::default()).unwrap();
 
         // 验证 tools 列表中包含了历史中使用的工具的占位符定义
         let tools = &result
@@ -2670,7 +2654,7 @@ mod tests {
             }),
         };
 
-        let result = convert_request(&req, &CompressionConfig::default(), &PromptFilterConfig::default(), false).unwrap();
+        let result = convert_request(&req, &CompressionConfig::default(), &PromptFilterConfig::default()).unwrap();
         assert_eq!(
             result.conversation_state.conversation_id,
             "a0662283-7fd3-4399-a7eb-52b9a717ae88"
@@ -2698,7 +2682,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req, &CompressionConfig::default(), &PromptFilterConfig::default(), false).unwrap();
+        let result = convert_request(&req, &CompressionConfig::default(), &PromptFilterConfig::default()).unwrap();
         // 验证生成的是有效的 UUID 格式
         assert_eq!(result.conversation_state.conversation_id.len(), 36);
         assert_eq!(
@@ -3134,7 +3118,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req, &CompressionConfig::default(), &PromptFilterConfig::default(), false);
+        let result = convert_request(&req, &CompressionConfig::default(), &PromptFilterConfig::default());
         assert!(
             result.is_ok(),
             "连续 assistant 消息场景不应报错: {:?}",
@@ -3267,7 +3251,7 @@ mod tests {
         ]));
         let cfg = crate::model::config::CompressionConfig::default();
         let pf = crate::model::config::PromptFilterConfig::default();
-        let kr = convert_request(&req, &cfg, &pf, false).expect("convert");
+        let kr = convert_request(&req, &cfg, &pf).expect("convert");
         let history = kr.conversation_state.history;
         // leading orphan assistant 必须被丢弃；history 不应以 assistant 开头
         if let Some(first) = history.first() {
@@ -3305,7 +3289,7 @@ mod tests {
         ]));
         let cfg = crate::model::config::CompressionConfig::default();
         let pf = crate::model::config::PromptFilterConfig::default();
-        let kr = convert_request(&req, &cfg, &pf, false).expect("convert");
+        let kr = convert_request(&req, &cfg, &pf).expect("convert");
         let mut found_ws = false;
         for m in &kr.conversation_state.history {
             if let Message::Assistant(a) = m
@@ -3348,7 +3332,7 @@ mod tests {
         ]));
         let cfg = crate::model::config::CompressionConfig::default();
         let pf = crate::model::config::PromptFilterConfig::default();
-        let kr = convert_request(&req, &cfg, &pf, false).expect("convert");
+        let kr = convert_request(&req, &cfg, &pf).expect("convert");
         let mut found = false;
         for m in &kr.conversation_state.history {
             if let Message::Assistant(a) = m
@@ -3380,7 +3364,7 @@ mod tests {
         ]));
         let cfg = crate::model::config::CompressionConfig::default();
         let pf = crate::model::config::PromptFilterConfig::default();
-        let kr = convert_request(&req, &cfg, &pf, false).expect("convert");
+        let kr = convert_request(&req, &cfg, &pf).expect("convert");
 
         // currentMessage 应为最后一条 user
         let cur_text = &kr.conversation_state.current_message.user_input_message.content;
@@ -3405,7 +3389,7 @@ mod tests {
         ]));
         let cfg = crate::model::config::CompressionConfig::default();
         let pf = crate::model::config::PromptFilterConfig::default();
-        let kr = convert_request(&req, &cfg, &pf, false).expect("convert");
+        let kr = convert_request(&req, &cfg, &pf).expect("convert");
         let cur_text = &kr.conversation_state.current_message.user_input_message.content;
         assert!(cur_text.contains("real question"));
     }

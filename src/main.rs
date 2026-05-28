@@ -213,11 +213,6 @@ async fn main() {
         ),
     ));
 
-    // 截断恢复识别开关（admin API 可运行时修改）
-    let truncation_recovery_notice = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
-        config.truncation_recovery_system_notice,
-    ));
-
     // 构建 Anthropic API 路由（profile_arn 由首个凭据提供）
     let anthropic_app = anthropic::create_router_with_provider(
         &api_key,
@@ -228,7 +223,6 @@ async fn main() {
         prompt_filter_config.clone(),
         prompt_runtime.clone(),
         prompt_cache_runtime.clone(),
-        truncation_recovery_notice.clone(),
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
@@ -250,7 +244,6 @@ async fn main() {
                 compression_config.clone(),
                 prompt_cache_runtime.clone(),
                 prompt_runtime.clone(),
-                truncation_recovery_notice.clone(),
                 endpoint_names.clone(),
             );
             let admin_state = admin::AdminState::new(admin_key, admin_service, compression_config.clone());

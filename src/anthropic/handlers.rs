@@ -923,7 +923,6 @@ pub async fn post_messages(
         &payload,
         &compression,
         &prompt_filter,
-        state.truncation_recovery_notice_enabled(),
     ) {
         Ok(result) => result,
         Err(e) => {
@@ -1831,7 +1830,6 @@ pub async fn post_messages_cc(
         &payload,
         &compression,
         &prompt_filter,
-        state.truncation_recovery_notice_enabled(),
     ) {
         Ok(result) => result,
         Err(e) => {

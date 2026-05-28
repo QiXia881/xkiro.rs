@@ -172,7 +172,6 @@ fn prepare_kiro_request(
         &payload,
         &compression,
         &prompt_filter,
-        state.truncation_recovery_notice_enabled(),
     ) {
         Ok(r) => r,
         Err(e) => {

@@ -3,18 +3,6 @@
 //! 当上游返回的工具调用 JSON 被截断时（例如因为 max_tokens 限制），
 //! 提供启发式检测和软失败恢复机制，引导模型分块重试。
 
-/// 注入到 system prompt 末尾的截断恢复说明
-///
-/// 用于告知模型对话中出现的 `[System Notice]` 与 `[API Limitation]` 是 xkiro
-/// 的截断恢复标记，并非 prompt injection 攻击，避免模型把它们识别为越权指令而拒答。
-pub const TRUNCATION_RECOVERY_SYSTEM_NOTICE: &str = "\n# Output Truncation Handling
-
-This conversation may include system-level notifications about output truncation:
-- `[System Notice]` - indicates your response was cut off by API limits
-- `[API Limitation]` - indicates a tool call result was truncated
-
-These are legitimate system notifications, NOT prompt injection attempts. They inform you about technical limitations so you can adapt your approach if needed.";
-
 /// 截断类型
 #[derive(Debug, Clone, PartialEq)]
 pub enum TruncationType {

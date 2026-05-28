@@ -114,7 +114,6 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
         balanceRefreshIntervalSecs: globalConfig.balanceRefreshIntervalSecs,
         balanceRefreshConcurrency: globalConfig.balanceRefreshConcurrency,
         sessionAffinityEnabled: globalConfig.sessionAffinityEnabled,
-        truncationRecoverySystemNotice: globalConfig.truncationRecoverySystemNotice,
         privacyMode: globalConfig.privacyMode,
         compression: config,
       }
@@ -244,15 +243,6 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                             desc="开启：同一会话黏住首次选中的凭据，整轮对话不切号 → 上游 prompt cache 命中率高，多号利用不均匀。关闭（默认）：每条消息独立走调度，按余额 / 并发占用平摊到所有可用号 → 多号同时跑，上游 cache 必失（客户端每次带完整 history，模型不会失忆），但更省 quota / 更快释放阻塞。"
                             checked={globalConfig.sessionAffinityEnabled}
                             onChange={v => updateGlobal('sessionAffinityEnabled', v)}
-                          />
-                          <div className="pt-3 mt-2 border-t">
-                            <div className="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-1">系统提示</div>
-                          </div>
-                          <ToggleRow
-                            label="截断恢复识别说明"
-                            desc="开启（默认）：在 system prompt 末尾追加一段说明，告知模型 [System Notice] / [API Limitation] 是 xkiro 的截断恢复标记，不是 prompt injection 攻击。避免模型把这些标记识别为越权指令而拒答。关闭：不注入，依赖模型自己判断。"
-                            checked={globalConfig.truncationRecoverySystemNotice}
-                            onChange={v => updateGlobal('truncationRecoverySystemNotice', v)}
                           />
                           <div className="pt-3 mt-2 border-t">
                             <div className="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-1">界面</div>

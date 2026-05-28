@@ -318,8 +318,6 @@ pub struct GlobalConfigResponse {
     pub balance_refresh_concurrency: usize,
     /// 是否启用 session 亲和（同会话黏住同凭据；关闭则每条消息独立平摊）
     pub session_affinity_enabled: bool,
-    /// 是否在 system prompt 末尾注入截断恢复识别说明
-    pub truncation_recovery_system_notice: bool,
     /// admin UI 隐私模式（邮箱脱敏展示）
     pub privacy_mode: bool,
     /// 压缩配置
@@ -376,8 +374,6 @@ pub struct UpdateGlobalConfigRequest {
     pub balance_refresh_concurrency: Option<usize>,
     /// 是否启用 session 亲和（可选）
     pub session_affinity_enabled: Option<bool>,
-    /// 是否在 system prompt 末尾注入截断恢复识别说明（可选）
-    pub truncation_recovery_system_notice: Option<bool>,
     /// admin UI 隐私模式（可选）
     pub privacy_mode: Option<bool>,
     /// 压缩配置（可选）

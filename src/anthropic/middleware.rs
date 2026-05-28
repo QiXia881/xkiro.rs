@@ -1,7 +1,6 @@
 //! Anthropic API 中间件
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use axum::{
@@ -86,8 +85,6 @@ pub struct AppState {
     pub prompt_runtime: SharedPromptConfig,
     /// Prompt Cache 运行时配置（共享引用，支持热更新）
     pub prompt_cache_runtime: Arc<RwLock<PromptCacheRuntime>>,
-    /// 是否在 system prompt 末尾注入截断恢复识别说明（运行时可改）
-    pub truncation_recovery_notice: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -96,7 +93,6 @@ impl AppState {
         api_key: impl Into<String>,
         extract_thinking: bool,
         prompt_cache_runtime: Arc<RwLock<PromptCacheRuntime>>,
-        truncation_recovery_notice: Arc<AtomicBool>,
     ) -> Self {
         Self {
             api_key: api_key.into(),
@@ -113,7 +109,6 @@ impl AppState {
                 position: crate::model::config::SystemPromptPosition::default(),
             })),
             prompt_cache_runtime,
-            truncation_recovery_notice,
         }
     }
 
@@ -150,10 +145,6 @@ impl AppState {
 
     pub fn prompt_cache_snapshot(&self) -> PromptCacheSnapshot {
         self.prompt_cache_runtime.read().snapshot()
-    }
-
-    pub fn truncation_recovery_notice_enabled(&self) -> bool {
-        self.truncation_recovery_notice.load(Ordering::Relaxed)
     }
 }
 

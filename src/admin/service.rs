@@ -85,8 +85,6 @@ pub struct AdminService {
     prompt_cache_runtime: Arc<RwLock<PromptCacheRuntime>>,
     /// 系统提示注入运行时（共享引用，支持热更新）
     prompt_runtime: SharedPromptConfig,
-    /// 截断恢复识别开关（与 AppState 共享，admin 写入即热生效）
-    truncation_recovery_notice: Arc<std::sync::atomic::AtomicBool>,
     balance_cache: Mutex<HashMap<u64, CachedBalance>>,
     cache_path: Option<PathBuf>,
     /// 已注册的端点名称集合（用于 add_credential 校验）
@@ -108,7 +106,6 @@ impl AdminService {
         compression_config: Arc<RwLock<CompressionConfig>>,
         prompt_cache_runtime: Arc<RwLock<PromptCacheRuntime>>,
         prompt_runtime: SharedPromptConfig,
-        truncation_recovery_notice: Arc<std::sync::atomic::AtomicBool>,
         known_endpoints: impl IntoIterator<Item = String>,
     ) -> Self {
         let cache_path = token_manager
@@ -123,7 +120,6 @@ impl AdminService {
             compression_config,
             prompt_cache_runtime,
             prompt_runtime,
-            truncation_recovery_notice,
             balance_cache: Mutex::new(balance_cache),
             cache_path,
             known_endpoints: known_endpoints.into_iter().collect(),
@@ -1383,7 +1379,6 @@ impl AdminService {
             balance_refresh_interval_secs: config.balance_refresh_interval_secs,
             balance_refresh_concurrency: config.balance_refresh_concurrency,
             session_affinity_enabled: config.session_affinity_enabled,
-            truncation_recovery_system_notice: config.truncation_recovery_system_notice,
             privacy_mode: config.privacy_mode,
             compression: CompressionConfigResponse {
                 enabled: c.enabled,
@@ -1510,10 +1505,6 @@ impl AdminService {
                 cfg.session_affinity_enabled = v;
             }
 
-            if let Some(v) = req.truncation_recovery_system_notice {
-                cfg.truncation_recovery_system_notice = v;
-            }
-
             if let Some(v) = req.privacy_mode {
                 cfg.privacy_mode = v;
             }
@@ -1528,12 +1519,6 @@ impl AdminService {
         // 关闭 session 亲和后清空已有绑定，避免残留
         if let Some(false) = req.session_affinity_enabled {
             self.token_manager.clear_session_affinity();
-        }
-
-        // 截断恢复识别开关：直接同步到共享 atomic（converter 下次调用即生效）
-        if let Some(v) = req.truncation_recovery_system_notice {
-            self.truncation_recovery_notice
-                .store(v, std::sync::atomic::Ordering::Relaxed);
         }
 
         // 热更新 region（注：xkiro 已剔除 credential_rpm，故不存在 update_credential_rpm 同步）
