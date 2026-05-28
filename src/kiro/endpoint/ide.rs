@@ -163,12 +163,23 @@ impl KiroEndpoint for IdeEndpoint {
         Self::inject_profile_arn(body, ctx.credentials)
     }
 
-    fn usage_request_parts(&self, ctx: &RequestContext<'_>) -> anyhow::Result<UsageRequestParts> {
+    fn usage_request_parts(
+        &self,
+        ctx: &RequestContext<'_>,
+        need_email: bool,
+    ) -> anyhow::Result<UsageRequestParts> {
         let host = self.host(ctx);
-        let mut url = format!(
-            "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST",
-            host
-        );
+        let mut url = if need_email {
+            format!(
+                "https://{}/getUsageLimits?isEmailRequired=true&origin=AI_EDITOR&resourceType=AGENTIC_REQUEST",
+                host
+            )
+        } else {
+            format!(
+                "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST",
+                host
+            )
+        };
         if let Some(profile_arn) = Self::mcp_profile_arn_header_value(ctx.credentials) {
             url.push_str(&format!("&profileArn={}", urlencoding::encode(profile_arn)));
         }

@@ -104,7 +104,7 @@ fn list_models_request_parts(
     endpoint: &dyn KiroEndpoint,
     ctx: &RequestContext<'_>,
 ) -> anyhow::Result<UsageRequestParts> {
-    let mut parts = endpoint.usage_request_parts(ctx)?;
+    let mut parts = endpoint.usage_request_parts(ctx, false)?;
     let host = parts
         .headers
         .iter()

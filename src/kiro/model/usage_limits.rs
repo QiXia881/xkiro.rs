@@ -16,6 +16,14 @@ pub struct UsageLimitsResponse {
     #[serde(default)]
     pub subscription_info: Option<SubscriptionInfo>,
 
+    /// 用户信息（含 email），用于回填凭据
+    #[serde(default)]
+    pub user_info: Option<UsageUserInfo>,
+
+    /// 顶层 email（部分响应直接挂顶层）
+    #[serde(default)]
+    pub email: Option<String>,
+
     /// 超额配置 (overageConfiguration.overageStatus = ENABLED / DISABLED)
     #[serde(default)]
     pub overage_configuration: Option<OverageConfiguration>,
@@ -23,6 +31,17 @@ pub struct UsageLimitsResponse {
     /// 使用量明细列表
     #[serde(default)]
     pub usage_breakdown_list: Vec<UsageBreakdown>,
+}
+
+/// 用户信息
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct UsageUserInfo {
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub user_id: Option<String>,
 }
 
 /// 订阅信息

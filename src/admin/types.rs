@@ -320,6 +320,8 @@ pub struct GlobalConfigResponse {
     pub session_affinity_enabled: bool,
     /// 是否在 system prompt 末尾注入截断恢复识别说明
     pub truncation_recovery_system_notice: bool,
+    /// admin UI 隐私模式（邮箱脱敏展示）
+    pub privacy_mode: bool,
     /// 压缩配置
     pub compression: CompressionConfigResponse,
 }
@@ -376,6 +378,8 @@ pub struct UpdateGlobalConfigRequest {
     pub session_affinity_enabled: Option<bool>,
     /// 是否在 system prompt 末尾注入截断恢复识别说明（可选）
     pub truncation_recovery_system_notice: Option<bool>,
+    /// admin UI 隐私模式（可选）
+    pub privacy_mode: Option<bool>,
     /// 压缩配置（可选）
     pub compression: Option<UpdateCompressionConfigRequest>,
 }

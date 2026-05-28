@@ -353,6 +353,7 @@ pub(crate) async fn get_usage_limits(
     config: &Config,
     token: &str,
     proxy: Option<&ProxyConfig>,
+    need_email: bool,
 ) -> anyhow::Result<UsageLimitsResponse> {
     tracing::debug!(
         endpoint = %credentials.effective_endpoint_name(Some(&config.default_endpoint)),
@@ -367,7 +368,7 @@ pub(crate) async fn get_usage_limits(
         machine_id: &machine_id,
         config,
     };
-    let usage = endpoint.usage_request_parts(&ctx)?;
+    let usage = endpoint.usage_request_parts(&ctx, need_email)?;
 
     let client = build_client(proxy, 60, config.tls_backend)?;
     let mut request = client.get(&usage.url);
@@ -2752,7 +2753,19 @@ impl MultiTokenManager {
         let proxy_snap = self.proxy.read().clone();
         let config_snap = self.config.read().clone();
         let effective_proxy = credentials.effective_proxy(proxy_snap.as_ref());
-        let usage_limits = get_usage_limits(&credentials, &config_snap, &token, effective_proxy.as_ref()).await?;
+        let need_email = credentials
+            .email
+            .as_deref()
+            .map(|s| s.trim().is_empty())
+            .unwrap_or(true);
+        let usage_limits = get_usage_limits(
+            &credentials,
+            &config_snap,
+            &token,
+            effective_proxy.as_ref(),
+            need_email,
+        )
+        .await?;
 
         // 更新订阅等级到凭据（仅在发生变化时持久化）
         if let Some(subscription_title) = usage_limits.subscription_title() {
@@ -2781,6 +2794,35 @@ impl MultiTokenManager {
             if changed {
                 if let Err(e) = self.persist_credentials() {
                     tracing::warn!("订阅等级更新后持久化失败（不影响本次请求）: {}", e);
+                }
+            }
+        }
+
+        // 回填 email（仅当当前为空且 API 返回有效 email 时）
+        let resp_email = usage_limits
+            .user_info
+            .as_ref()
+            .and_then(|u| u.email.as_deref())
+            .or(usage_limits.email.as_deref())
+            .filter(|s| !s.is_empty());
+        if let Some(email) = resp_email {
+            let changed = {
+                let mut entries = self.entries.lock();
+                if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                    if entry.credentials.email.is_none() {
+                        entry.credentials.email = Some(email.to_string());
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            };
+            if changed {
+                tracing::info!("凭据 #{} email 已回填: {}", id, email);
+                if let Err(e) = self.persist_credentials() {
+                    tracing::warn!("email 回填后持久化失败（不影响本次请求）: {}", e);
                 }
             }
         }

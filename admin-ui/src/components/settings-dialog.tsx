@@ -18,6 +18,7 @@ import {
 } from '@/api/credentials'
 import type { GlobalConfigResponse, UpdateGlobalConfigRequest } from '@/types/api'
 import { extractErrorMessage } from '@/lib/utils'
+import { usePrivacyMode } from '@/hooks/use-privacy-mode'
 
 interface SettingsDialogProps {
   open: boolean
@@ -59,6 +60,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
   const [activeTab, setActiveTab] = useState<TabId>('general')
+  const { privacyMode, setPrivacyMode } = usePrivacyMode()
 
   useEffect(() => {
     if (open) loadConfig()
@@ -113,6 +115,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
         balanceRefreshConcurrency: globalConfig.balanceRefreshConcurrency,
         sessionAffinityEnabled: globalConfig.sessionAffinityEnabled,
         truncationRecoverySystemNotice: globalConfig.truncationRecoverySystemNotice,
+        privacyMode: globalConfig.privacyMode,
         compression: config,
       }
       const next = await updateGlobalConfig(payload)
@@ -250,6 +253,15 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                             desc="开启（默认）：在 system prompt 末尾追加一段说明，告知模型 [System Notice] / [API Limitation] 是 xkiro 的截断恢复标记，不是 prompt injection 攻击。避免模型把这些标记识别为越权指令而拒答。关闭：不注入，依赖模型自己判断。"
                             checked={globalConfig.truncationRecoverySystemNotice}
                             onChange={v => updateGlobal('truncationRecoverySystemNotice', v)}
+                          />
+                          <div className="pt-3 mt-2 border-t">
+                            <div className="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-1">界面</div>
+                          </div>
+                          <ToggleRow
+                            label="隐私模式"
+                            desc="开启（默认）：邮箱在卡片标题等位置脱敏显示（us***45@***.com）。仅影响本地浏览器展示，不影响后端数据。"
+                            checked={privacyMode}
+                            onChange={setPrivacyMode}
                           />
                         </>
                       )}

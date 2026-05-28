@@ -56,6 +56,8 @@ export interface GlobalConfigResponse {
   sessionAffinityEnabled: boolean
   /** 是否在 system prompt 末尾注入截断恢复识别说明 */
   truncationRecoverySystemNotice: boolean
+  /** admin UI 隐私模式（邮箱脱敏展示） */
+  privacyMode: boolean
   compression: CompressionConfigPayload
 }
 
@@ -94,6 +96,7 @@ export interface UpdateGlobalConfigRequest {
   balanceRefreshConcurrency?: number
   sessionAffinityEnabled?: boolean
   truncationRecoverySystemNotice?: boolean
+  privacyMode?: boolean
   compression?: Partial<CompressionConfigPayload>
 }
 

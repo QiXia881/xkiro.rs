@@ -1480,14 +1480,12 @@ fn build_history(
         _ => None,
     };
 
-    // 截断恢复识别说明：始终在 system 末尾追加（独立开关，不走 preset）
+    // 截断恢复识别说明：仅在已存在 system 时追加（独立开关，不走 preset）
     // NOTICE 常量自带前导 "\n"，直接拼接即可，避免双换行残留导致 cleaner 反引用对不齐
+    // 无 system 时不注入：避免凭空造出 user/assistant 对话改变模型起手上下文
     let final_system = match final_system {
         Some(s) if truncation_recovery_notice => {
             Some(format!("{}{}", s, super::truncation::TRUNCATION_RECOVERY_SYSTEM_NOTICE))
-        }
-        None if truncation_recovery_notice => {
-            Some(super::truncation::TRUNCATION_RECOVERY_SYSTEM_NOTICE.to_string())
         }
         other => other,
     };

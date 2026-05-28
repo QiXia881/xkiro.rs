@@ -72,7 +72,12 @@ pub trait KiroEndpoint: Send + Sync {
     ///
     /// 不同端点的查询参数和 user-agent 不同，由 provider 拿到 [`UsageRequestParts`]
     /// 后组装 reqwest 请求并发送。
-    fn usage_request_parts(&self, ctx: &RequestContext<'_>) -> anyhow::Result<UsageRequestParts>;
+    /// `need_email = true` 时 URL 追加 `isEmailRequired=true`，让上游返回 userInfo（用于回填本地凭据）。
+    fn usage_request_parts(
+        &self,
+        ctx: &RequestContext<'_>,
+        need_email: bool,
+    ) -> anyhow::Result<UsageRequestParts>;
 
     /// 构造 `setUserPreference` 请求所需的 URL + headers + body
     ///

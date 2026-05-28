@@ -6,6 +6,31 @@ export function cn(...inputs: ClassValue[]) {
 }
 
 /**
+ * 邮箱脱敏：user12345@example.com → us***45@***.com
+ *
+ * privacyMode=false 直接返回原值；空字符串原样返回。
+ */
+export function maskEmail(email: string | null | undefined, privacyMode: boolean): string {
+  if (!email) return email ?? ''
+  if (!privacyMode) return email
+  const [local, domain] = email.split('@')
+  if (!domain) return email
+
+  let maskedLocal: string
+  if (local.length <= 2) {
+    maskedLocal = '*'.repeat(local.length)
+  } else if (local.length <= 4) {
+    maskedLocal = local[0] + '***'
+  } else {
+    maskedLocal = local.slice(0, 2) + '***' + local.slice(-2)
+  }
+
+  const domainParts = domain.split('.')
+  const tld = domainParts[domainParts.length - 1]
+  return `${maskedLocal}@***.${tld}`
+}
+
+/**
  * 解析后端错误响应，提取用户友好的错误信息
  */
 export interface ParsedError {

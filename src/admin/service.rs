@@ -1384,6 +1384,7 @@ impl AdminService {
             balance_refresh_concurrency: config.balance_refresh_concurrency,
             session_affinity_enabled: config.session_affinity_enabled,
             truncation_recovery_system_notice: config.truncation_recovery_system_notice,
+            privacy_mode: config.privacy_mode,
             compression: CompressionConfigResponse {
                 enabled: c.enabled,
                 whitespace_compression: c.whitespace_compression,
@@ -1511,6 +1512,10 @@ impl AdminService {
 
             if let Some(v) = req.truncation_recovery_system_notice {
                 cfg.truncation_recovery_system_notice = v;
+            }
+
+            if let Some(v) = req.privacy_mode {
+                cfg.privacy_mode = v;
             }
 
             cfg.save()

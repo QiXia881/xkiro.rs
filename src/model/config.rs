@@ -386,6 +386,12 @@ pub struct Config {
     #[serde(default)]
     pub session_affinity_enabled: bool,
 
+    /// admin UI 隐私模式（邮箱等敏感字段脱敏显示）
+    ///
+    /// 仅前端展示开关，后端只做存储 / 跨浏览器同步。默认开启。
+    #[serde(default = "default_true")]
+    pub privacy_mode: bool,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -501,6 +507,7 @@ impl Default for Config {
             balance_refresh_interval_secs: default_balance_refresh_interval_secs(),
             balance_refresh_concurrency: default_balance_refresh_concurrency(),
             session_affinity_enabled: false,
+            privacy_mode: true,
             truncation_recovery_system_notice: true,
             precise_token_counting: false,
             config_path: None,

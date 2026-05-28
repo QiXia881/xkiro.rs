@@ -167,13 +167,25 @@ impl KiroEndpoint for CliEndpoint {
         Ok(self.transform_body(body))
     }
 
-    fn usage_request_parts(&self, ctx: &RequestContext<'_>) -> anyhow::Result<UsageRequestParts> {
+    fn usage_request_parts(
+        &self,
+        ctx: &RequestContext<'_>,
+        need_email: bool,
+    ) -> anyhow::Result<UsageRequestParts> {
         let host = self.host(ctx);
-        let url = format!(
-            "https://{}/getUsageLimits?origin={}&resourceType=AGENTIC_REQUEST",
-            host,
-            self.api_origin()
-        );
+        let url = if need_email {
+            format!(
+                "https://{}/getUsageLimits?isEmailRequired=true&origin={}&resourceType=AGENTIC_REQUEST",
+                host,
+                self.api_origin()
+            )
+        } else {
+            format!(
+                "https://{}/getUsageLimits?origin={}&resourceType=AGENTIC_REQUEST",
+                host,
+                self.api_origin()
+            )
+        };
 
         let mut headers = vec![
             ("Accept", "application/json".to_string()),

@@ -26,6 +26,9 @@ import {
   useSetOverage,
 } from '@/hooks/use-credentials'
 import { getCredentialBalance } from '@/api/credentials'
+import { usePrivacyMode } from '@/hooks/use-privacy-mode'
+import { maskEmail } from '@/lib/utils'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 
 interface CredentialCardProps {
   credential: CredentialStatusItem
@@ -183,6 +186,10 @@ export function CredentialCard({
   loadingBalance,
   onBalanceChange,
 }: CredentialCardProps) {
+  const { privacyMode } = usePrivacyMode()
+  const displayEmail = credential.email ? maskEmail(credential.email, privacyMode) : null
+  const displayTitle = displayEmail || `凭据 #${credential.id}`
+  const tooltipContent = credential.email ? displayEmail : null
   const [editingPriority, setEditingPriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
   const [editingConcurrency, setEditingConcurrency] = useState(false)
@@ -390,9 +397,22 @@ export function CredentialCard({
           />
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-1.5">
-              <span className="truncate text-sm font-semibold tracking-tight" title={credential.email || `#${credential.id}`}>
-                {credential.email || `凭据 #${credential.id}`}
-              </span>
+              {tooltipContent ? (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <span className="truncate text-sm font-semibold tracking-tight cursor-default">
+                      {displayTitle}
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent side="top" align="start">
+                    {tooltipContent}
+                  </TooltipContent>
+                </Tooltip>
+              ) : (
+                <span className="truncate text-sm font-semibold tracking-tight">
+                  {displayTitle}
+                </span>
+              )}
             </div>
             <div className="mt-1 flex flex-wrap items-center gap-1">
               <span className="text-2xs tabular text-muted-foreground">#{credential.id}</span>

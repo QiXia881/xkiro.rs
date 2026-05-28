@@ -1,6 +1,7 @@
 const API_KEY_STORAGE_KEY = 'adminApiKey'
 const THEME_STORAGE_KEY = 'adminTheme'
 const UI_SCALE_STORAGE_KEY = 'adminUiScale'
+const PRIVACY_MODE_STORAGE_KEY = 'adminPrivacyMode'
 
 export type UiScale = 90 | 100 | 115 | 130
 
@@ -18,4 +19,11 @@ export const storage = {
     return [90, 100, 115, 130].includes(n) ? (n as UiScale) : null
   },
   setUiScale: (scale: UiScale) => localStorage.setItem(UI_SCALE_STORAGE_KEY, String(scale)),
+
+  getPrivacyMode: (): boolean => {
+    const raw = localStorage.getItem(PRIVACY_MODE_STORAGE_KEY)
+    if (raw === null) return true
+    return raw === '1' || raw === 'true'
+  },
+  setPrivacyMode: (enabled: boolean) => localStorage.setItem(PRIVACY_MODE_STORAGE_KEY, enabled ? '1' : '0'),
 }
