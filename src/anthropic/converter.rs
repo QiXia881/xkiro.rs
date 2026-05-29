@@ -325,30 +325,28 @@ struct BuildHistoryContext<'a> {
 const MAX_TOTAL_IMAGES: usize = 20;
 
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
-///
-/// 按照用户要求：
-/// - sonnet 4.6/4-6 → claude-sonnet-4.6
-/// - 其他 sonnet → claude-sonnet-4.5
-/// - opus 4.5/4-5 → claude-opus-4.5
-/// - opus 4.7/4-7 → claude-opus-4.7
-/// - 其他 opus → claude-opus-4.6
-/// - 所有 haiku → claude-haiku-4.5
 pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
 
     if model_lower.contains("sonnet") {
         if model_lower.contains("4-6") || model_lower.contains("4.6") {
             Some("claude-sonnet-4.6".to_string())
-        } else {
+        } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
             Some("claude-sonnet-4.5".to_string())
+        } else {
+            None
         }
     } else if model_lower.contains("opus") {
-        if model_lower.contains("4-5") || model_lower.contains("4.5") {
-            Some("claude-opus-4.5".to_string())
+        if model_lower.contains("4-8") || model_lower.contains("4.8") {
+            Some("claude-opus-4.8".to_string())
         } else if model_lower.contains("4-7") || model_lower.contains("4.7") {
             Some("claude-opus-4.7".to_string())
-        } else {
+        } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
+            Some("claude-opus-4.5".to_string())
+        } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
             Some("claude-opus-4.6".to_string())
+        } else {
+            None
         }
     } else if model_lower.contains("haiku") {
         Some("claude-haiku-4.5".to_string())
@@ -361,13 +359,14 @@ pub fn map_model(model: &str) -> Option<String> {
 ///
 /// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
 /// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
-/// Opus 4.7 沿用 1M 上下文。
+/// Opus 4.7 / 4.8 沿用 1M 上下文。
 pub fn get_context_window_size(model: &str) -> i32 {
     match map_model(model) {
         Some(mapped)
             if mapped == "claude-sonnet-4.6"
                 || mapped == "claude-opus-4.6"
-                || mapped == "claude-opus-4.7" =>
+                || mapped == "claude-opus-4.7"
+                || mapped == "claude-opus-4.8" =>
         {
             1_000_000
         }
@@ -495,6 +494,10 @@ fn normalize_message_roles(
     }
 
     let mut converted = 0usize;
+    // 诊断：统计被归一化的 role 种类与数量，便于排查不同客户端/模型的请求差异。
+    // 注意：只记 role 种类直方图，不记 content —— content 含文件路径/工具输入等敏感数据，
+    // INFO 级别打 content 会造成代理日志泄露请求体。
+    let mut role_hist: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     let normalized: Vec<super::types::Message> = messages
         .iter()
         .map(|m| {
@@ -503,6 +506,7 @@ fn normalize_message_roles(
             } else {
                 converted += 1;
                 let original = m.role.clone();
+                *role_hist.entry(original.clone()).or_insert(0) += 1;
                 let mut cloned = m.clone();
                 cloned.role = "user".to_string();
                 tracing::debug!(role = %original, "归一化未知 role 为 user");
@@ -510,7 +514,11 @@ fn normalize_message_roles(
             }
         })
         .collect();
-    tracing::info!(count = converted, "Codex 兼容：未知 role → user");
+    tracing::info!(
+        count = converted,
+        roles = %format!("{:?}", role_hist),
+        "Codex 兼容：未知 role → user"
+    );
     std::borrow::Cow::Owned(normalized)
 }
 
@@ -2113,25 +2121,23 @@ mod tests {
 
     #[test]
     fn test_map_model_sonnet() {
-        assert!(
-            map_model("claude-sonnet-4-20250514")
-                .unwrap()
-                .contains("sonnet")
+        assert_eq!(
+            map_model("claude-sonnet-4-6"),
+            Some("claude-sonnet-4.6".to_string())
         );
-        assert!(
-            map_model("claude-3-5-sonnet-20241022")
-                .unwrap()
-                .contains("sonnet")
+        assert_eq!(
+            map_model("claude-sonnet-4.6"),
+            Some("claude-sonnet-4.6".to_string())
         );
+        // 未知版本 sonnet → None
+        assert_eq!(map_model("claude-sonnet-4-20250514"), None);
+        assert_eq!(map_model("claude-3-5-sonnet-20241022"), None);
     }
 
     #[test]
     fn test_map_model_opus() {
-        assert!(
-            map_model("claude-opus-4-20250514")
-                .unwrap()
-                .contains("opus")
-        );
+        // 未知版本 opus → None
+        assert_eq!(map_model("claude-opus-4-20250514"), None);
         assert_eq!(
             map_model("claude-opus-4-5-20251101"),
             Some("claude-opus-4.5".to_string())
@@ -2324,7 +2330,7 @@ mod tests {
     fn test_determine_chat_trigger_type() {
         // 无工具时返回 MANUAL
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
             max_tokens: 1024,
             messages: vec![],
             stream: false,
@@ -2434,7 +2440,7 @@ mod tests {
         schema.insert("properties".to_string(), serde_json::json!({}));
 
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
             max_tokens: 1024,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
@@ -2488,7 +2494,7 @@ mod tests {
         schema.insert("properties".to_string(), serde_json::json!({}));
 
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
             max_tokens: 1024,
             messages: vec![
                 AnthropicMessage {
@@ -2552,7 +2558,7 @@ mod tests {
 
         // 创建一个请求，历史中有工具使用，但 tools 列表为空
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
             max_tokens: 1024,
             messages: vec![
                 AnthropicMessage {
@@ -2651,7 +2657,7 @@ mod tests {
 
         // 测试带有 metadata 的请求，应该使用 session UUID 作为 conversationId
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
             max_tokens: 1024,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
@@ -2683,7 +2689,7 @@ mod tests {
 
         // 测试没有 metadata 的请求，应该生成新的 UUID
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
             max_tokens: 1024,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
@@ -3096,7 +3102,7 @@ mod tests {
         use super::super::types::Message as AnthropicMessage;
 
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
             max_tokens: 1024,
             messages: vec![
                 AnthropicMessage {
@@ -3250,7 +3256,7 @@ mod tests {
         messages: serde_json::Value,
     ) -> super::super::types::MessagesRequest {
         serde_json::from_value(serde_json::json!({
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-6",
             "max_tokens": 100,
             "messages": messages,
         }))

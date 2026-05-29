@@ -576,7 +576,7 @@ impl Config {
             .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，无法保存配置"))?;
 
         let content = serde_json::to_string_pretty(self).context("序列化配置失败")?;
-        fs::write(path, content)
+        crate::common::io::atomic_write_string(path, &content)
             .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
     }

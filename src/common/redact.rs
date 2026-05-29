@@ -95,3 +95,83 @@ pub fn mask_user_agent_machine_id(value: &str) -> String {
     };
     format!("{}{}", &value[..(pos + 1)], REDACTED)
 }
+
+/// 错误消息文本最大长度，超过则截断防日志洪水。
+const SECRET_TEXT_MAX_LEN: usize = 1024;
+
+static SECRET_JSON_PATTERN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(
+        r#"(?i)"(access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret|api[_-]?key|kiro[_-]?api[_-]?key|password|secret|authorization|bearer)"\s*:\s*"[^"]*""#,
+    )
+    .expect("脱敏 regex 编译失败")
+});
+
+static BEARER_PATTERN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?i)(Bearer\s+)([A-Za-z0-9._\-]{16,})").expect("Bearer regex 编译失败")
+});
+
+/// 对上游响应文本做脱敏处理，防 token reflection 泄入日志/错误响应。
+///
+/// 1. 替换 JSON 中常见敏感字段值为 `<REDACTED>`
+/// 2. 替换 `Bearer xxx` 为 `Bearer <REDACTED>`
+/// 3. 截断到 `SECRET_TEXT_MAX_LEN`
+pub fn redact_secret_text(text: &str) -> String {
+    let step1 = SECRET_JSON_PATTERN.replace_all(text, |caps: &regex::Captures<'_>| {
+        format!(r#""{}": "<REDACTED>""#, &caps[1])
+    });
+    let step2 = BEARER_PATTERN.replace_all(&step1, "${1}<REDACTED>");
+    if step2.len() > SECRET_TEXT_MAX_LEN {
+        let mut cut = SECRET_TEXT_MAX_LEN;
+        while !step2.is_char_boundary(cut) && cut > 0 {
+            cut -= 1;
+        }
+        format!("{}...(truncated)", &step2[..cut])
+    } else {
+        step2.into_owned()
+    }
+}
+
+#[cfg(test)]
+mod redact_secret_text_tests {
+    use super::redact_secret_text;
+
+    #[test]
+    fn redacts_access_token_in_json() {
+        let input = r#"{"error":"x","access_token":"eyJhbGc.someJWT.signature"}"#;
+        let out = redact_secret_text(input);
+        assert!(!out.contains("eyJhbGc"));
+        assert!(out.contains("<REDACTED>"));
+        assert!(out.contains(r#""error":"x""#));
+    }
+
+    #[test]
+    fn redacts_refresh_token_camel_case() {
+        let input = r#"{"refreshToken":"long_refresh_value_here","status":"failed"}"#;
+        let out = redact_secret_text(input);
+        assert!(!out.contains("long_refresh_value_here"));
+        assert!(out.contains("<REDACTED>"));
+        assert!(out.contains(r#""status":"failed""#));
+    }
+
+    #[test]
+    fn redacts_bearer_in_text() {
+        let input = "Authorization: Bearer eyJsupersecretvaluehere1234567890";
+        let out = redact_secret_text(input);
+        assert!(!out.contains("eyJsupersecret"));
+        assert!(out.contains("<REDACTED>"));
+    }
+
+    #[test]
+    fn truncates_long_text() {
+        let input = "x".repeat(2000);
+        let out = redact_secret_text(&input);
+        assert!(out.ends_with("...(truncated)"));
+        assert!(out.len() < input.len());
+    }
+
+    #[test]
+    fn passthrough_when_no_secret() {
+        let input = r#"{"error":"rate limit","retry_after":30}"#;
+        assert_eq!(redact_secret_text(input), input);
+    }
+}

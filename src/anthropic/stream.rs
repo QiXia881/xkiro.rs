@@ -14,6 +14,18 @@ use super::thinking_parser::{
     find_real_thinking_start_tag,
 };
 
+/// thinking 块的 signature 占位字符串
+///
+/// Anthropic Messages API 协议规定 thinking 模式下，assistant 消息的
+/// `{type:"thinking", ...}` 块必须带 `signature` 字段并在下一轮原样回传，
+/// 否则 Claude Code/Anthropic SDK 本地校验会拒绝并报错：
+/// `The content[].thinking in the thinking mode must be passed back to the API`
+///
+/// 上游 Kiro 不下发真实 Anthropic 签名，因此在 thinking 块结束前发一个
+/// `signature_delta` 占位字符串以满足客户端本地校验。该字段不参与转发回 Kiro
+/// 的逻辑（converter 只读 `block.thinking`，不读 signature）。
+pub(super) const THINKING_SIGNATURE_PLACEHOLDER: &str = "xkiro-rs-thinking-signature";
+
 pub(crate) use super::thinking_parser::extract_thinking_from_complete_text;
 
 /// SSE 事件
@@ -640,6 +652,8 @@ impl StreamContext {
                     if let Some(thinking_index) = self.thinking_block_index {
                         // 先发送空的 thinking_delta
                         events.push(self.create_thinking_delta_event(thinking_index, ""));
+                        // signature_delta：满足客户端 thinking 模式下的本地校验
+                        events.push(self.create_signature_delta_event(thinking_index));
                         // 再发送 content_block_stop
                         if let Some(stop_event) =
                             self.state_manager.handle_content_block_stop(thinking_index)
@@ -768,6 +782,26 @@ impl StreamContext {
         )
     }
 
+    /// 创建 signature_delta 事件
+    ///
+    /// thinking 块流式结束前必须发一个 signature_delta，SDK 把它聚合到 thinking 块的
+    /// `signature` 字段。客户端在下一轮把 assistant 消息回传时本地校验 thinking 块必须
+    /// 带非空 signature，否则抛出
+    /// `The content[].thinking in the thinking mode must be passed back to the API`。
+    fn create_signature_delta_event(&self, index: i32) -> SseEvent {
+        SseEvent::new(
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {
+                    "type": "signature_delta",
+                    "signature": THINKING_SIGNATURE_PLACEHOLDER,
+                }
+            }),
+        )
+    }
+
     /// 处理工具使用事件
     fn process_tool_use(
         &mut self,
@@ -799,6 +833,8 @@ impl StreamContext {
                 if let Some(thinking_index) = self.thinking_block_index {
                     // 先发送空的 thinking_delta
                     events.push(self.create_thinking_delta_event(thinking_index, ""));
+                    // signature_delta：满足客户端 thinking 模式下的本地校验
+                    events.push(self.create_signature_delta_event(thinking_index));
                     // 再发送 content_block_stop
                     if let Some(stop_event) =
                         self.state_manager.handle_content_block_stop(thinking_index)
@@ -915,6 +951,8 @@ impl StreamContext {
                     // 关闭 thinking 块：先发送空的 thinking_delta，再发送 content_block_stop
                     if let Some(thinking_index) = self.thinking_block_index {
                         events.push(self.create_thinking_delta_event(thinking_index, ""));
+                        // signature_delta：满足客户端 thinking 模式下的本地校验
+                        events.push(self.create_signature_delta_event(thinking_index));
                         if let Some(stop_event) =
                             self.state_manager.handle_content_block_stop(thinking_index)
                         {
@@ -942,6 +980,8 @@ impl StreamContext {
                     if let Some(thinking_index) = self.thinking_block_index {
                         // 先发送空的 thinking_delta
                         events.push(self.create_thinking_delta_event(thinking_index, ""));
+                        // signature_delta：满足客户端 thinking 模式下的本地校验
+                        events.push(self.create_signature_delta_event(thinking_index));
                         // 再发送 content_block_stop
                         if let Some(stop_event) =
                             self.state_manager.handle_content_block_stop(thinking_index)
@@ -956,6 +996,38 @@ impl StreamContext {
                 events.extend(self.create_text_delta_events(&buffer_content));
             }
             self.thinking_buffer.clear();
+        }
+
+        // 兜底：thinking 开启但全流程未产生任何 thinking 块
+        // （Opus 4.7/4.8 adaptive 在简单任务可能完全跳过 <thinking> 标签）
+        // 注入一对空 thinking start/sig/stop，保证客户端 SSE 含 thinking content_block，
+        // 避免 UI 卡在“思考中…”及客户端校验失败。
+        if self.thinking_enabled
+            && !self.thinking_extracted
+            && self.thinking_block_index.is_none()
+        {
+            let thinking_index = self.state_manager.next_block_index();
+            self.thinking_block_index = Some(thinking_index);
+            let start_events = self.state_manager.handle_content_block_start(
+                thinking_index,
+                "thinking",
+                json!({
+                    "type": "content_block_start",
+                    "index": thinking_index,
+                    "content_block": { "type": "thinking", "thinking": "" }
+                }),
+            );
+            events.extend(start_events);
+            // signature_delta：满足客户端 thinking 模式下的本地校验
+            events.push(self.create_signature_delta_event(thinking_index));
+            if let Some(stop_event) = self.state_manager.handle_content_block_stop(thinking_index)
+            {
+                events.push(stop_event);
+            }
+            self.thinking_extracted = true;
+            tracing::debug!(
+                "thinking 兜底：流结束未见 <thinking> 标签，注入空 thinking block"
+            );
         }
 
         // 如果整个流中只产生了 thinking 块，没有 text 也没有 tool_use，

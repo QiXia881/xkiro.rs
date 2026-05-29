@@ -672,6 +672,30 @@ pub async fn get_models() -> impl IntoResponse {
 
     let models = vec![
         Model {
+            id: "claude-opus-4-8".to_string(),
+            object: "model".to_string(),
+            created: 1779897600, // May 28, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.8".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128_000,
+            context_length: None,
+            max_completion_tokens: None,
+            thinking: None,
+        },
+        Model {
+            id: "claude-opus-4-8-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1779897600, // May 28, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.8 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128_000,
+            context_length: None,
+            max_completion_tokens: None,
+            thinking: None,
+        },
+        Model {
             id: "claude-opus-4-6".to_string(),
             object: "model".to_string(),
             created: 1770163200, // Feb 4, 2026
@@ -1556,9 +1580,12 @@ async fn handle_non_stream_request(
             super::stream::extract_thinking_from_complete_text(&text_content);
 
         if let Some(thinking_text) = thinking {
+            // signature 占位：thinking 模式下客户端要求 thinking 块带非空 signature
+            // 字段，否则下一轮回传时 SDK 本地校验会拒绝（"must be passed back"）
             content.push(json!({
                 "type": "thinking",
-                "thinking": thinking_text
+                "thinking": thinking_text,
+                "signature": super::stream::THINKING_SIGNATURE_PLACEHOLDER,
             }));
         }
 

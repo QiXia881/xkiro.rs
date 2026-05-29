@@ -187,6 +187,8 @@ async fn refresh_social_token(
     let status = response.status();
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
+        // 脱敏上游响应，防 token reflection 泄入日志/错误响应
+        let redacted_body = crate::common::redact::redact_secret_text(&body_text);
 
         // 400 + invalid_grant + Invalid refresh token provided → refreshToken 永久失效
         if status.as_u16() == 400
@@ -194,7 +196,7 @@ async fn refresh_social_token(
             && body_text.contains("Invalid refresh token provided")
         {
             return Err(RefreshTokenInvalidError {
-                message: format!("Social refreshToken 已失效 (invalid_grant): {}", body_text),
+                message: format!("Social refreshToken 已失效 (invalid_grant): {}", redacted_body),
             }
             .into());
         }
@@ -206,7 +208,7 @@ async fn refresh_social_token(
             500..=599 => "服务器错误，AWS OAuth 服务暂时不可用",
             _ => "Token 刷新失败",
         };
-        bail!("{}: {} {}", error_msg, status, body_text);
+        bail!("{}: {} {}", error_msg, status, redacted_body);
     }
 
     let data: RefreshResponse = response.json().await?;
@@ -284,6 +286,7 @@ async fn refresh_idc_token(
     let status = response.status();
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
+        let redacted_body = crate::common::redact::redact_secret_text(&body_text);
 
         // 400 + invalid_grant + Invalid refresh token provided → refreshToken 永久失效
         if status.as_u16() == 400
@@ -291,7 +294,7 @@ async fn refresh_idc_token(
             && body_text.contains("Invalid refresh token provided")
         {
             return Err(RefreshTokenInvalidError {
-                message: format!("IdC refreshToken 已失效 (invalid_grant): {}", body_text),
+                message: format!("IdC refreshToken 已失效 (invalid_grant): {}", redacted_body),
             }
             .into());
         }
@@ -303,7 +306,7 @@ async fn refresh_idc_token(
             500..=599 => "服务器错误，AWS OIDC 服务暂时不可用",
             _ => "IdC Token 刷新失败",
         };
-        bail!("{}: {} {}", error_msg, status, body_text);
+        bail!("{}: {} {}", error_msg, status, redacted_body);
     }
 
     let data: IdcRefreshResponse = response.json().await?;
@@ -381,6 +384,7 @@ pub(crate) async fn get_usage_limits(
     let status = response.status();
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
+        let redacted_body = crate::common::redact::redact_secret_text(&body_text);
         let error_msg = match status.as_u16() {
             401 => "认证失败，Token 无效或已过期",
             403 => "权限不足，无法获取使用额度",
@@ -388,7 +392,7 @@ pub(crate) async fn get_usage_limits(
             500..=599 => "服务器错误，AWS 服务暂时不可用",
             _ => "获取使用额度失败",
         };
-        bail!("{}: {} {}", error_msg, status, body_text);
+        bail!("{}: {} {}", error_msg, status, redacted_body);
     }
 
     let body_text = response.text().await?;
@@ -396,7 +400,7 @@ pub(crate) async fn get_usage_limits(
         tracing::error!(
             "getUsageLimits JSON 解析失败: {}，原始响应: {}",
             e,
-            body_text
+            crate::common::redact::redact_secret_text(&body_text)
         );
         anyhow::anyhow!("JSON 解析失败: {}", e)
     })?;
@@ -434,6 +438,7 @@ pub(crate) async fn set_user_preference(
     let status = response.status();
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
+        let redacted_body = crate::common::redact::redact_secret_text(&body_text);
         let msg = match status.as_u16() {
             401 => "认证失败，Token 无效或已过期",
             403 => "权限不足，无法切换超额开关",
@@ -441,7 +446,7 @@ pub(crate) async fn set_user_preference(
             500..=599 => "服务器错误，AWS 服务暂时不可用",
             _ => "切换超额开关失败",
         };
-        bail!("{}: {} {}", msg, status, body_text);
+        bail!("{}: {} {}", msg, status, redacted_body);
     }
     Ok(())
 }
@@ -2011,35 +2016,14 @@ impl MultiTokenManager {
         // 序列化为 pretty JSON
         let json = serde_json::to_string_pretty(credentials).context("序列化凭据失败")?;
 
-        // 原子写入：先写临时文件，再 rename 替换目标文件
-        // rename 在同一文件系统上是原子操作，避免进程崩溃导致凭据文件损坏
-        // 解析 symlink 以确保 rename 写入真实目标（而非替换 symlink 本身）
+        // 原子写入 + chmod 0o600 (Unix)：rename 在同一文件系统上是原子操作，
+        // 临时文件在 rename 前 set_permissions(0o600)，防同主机其他用户读取凭据。
+        // 解析 symlink 以确保 rename 写入真实目标（而非替换 symlink 本身）。
         let real_path = resolve_symlink_target(path);
-        let tmp_path = real_path.with_extension("json.tmp");
 
         let do_atomic_write = || -> anyhow::Result<()> {
-            // 尝试保留原文件权限（避免 umask 导致权限放宽）
-            let original_perms = std::fs::metadata(&real_path).ok().map(|m| m.permissions());
-
-            std::fs::write(&tmp_path, &json)
-                .with_context(|| format!("写入临时凭据文件失败: {:?}", tmp_path))?;
-
-            if let Some(perms) = original_perms {
-                // best-effort：权限复制失败不阻塞回写
-                let _ = std::fs::set_permissions(&tmp_path, perms);
-            }
-
-            // 跨平台原子替换：Windows 上 rename 无法覆盖已存在文件，需先删除
-            #[cfg(windows)]
-            if real_path.exists() {
-                std::fs::remove_file(&real_path)
-                    .with_context(|| format!("删除旧凭据文件失败: {:?}", real_path))?;
-            }
-
-            std::fs::rename(&tmp_path, &real_path).with_context(|| {
-                format!("原子替换凭据文件失败: {:?} -> {:?}", tmp_path, real_path)
-            })?;
-            Ok(())
+            crate::common::io::atomic_write_string_secure(&real_path, &json)
+                .with_context(|| format!("原子写入凭据文件失败: {:?}", real_path))
         };
 
         // 写入文件（在 Tokio runtime 内使用 block_in_place 避免阻塞 worker）
@@ -2122,7 +2106,7 @@ impl MultiTokenManager {
 
         match serde_json::to_string_pretty(&stats) {
             Ok(json) => {
-                if let Err(e) = std::fs::write(&path, json) {
+                if let Err(e) = crate::common::io::atomic_write_string(&path, &json) {
                     tracing::warn!("保存统计缓存失败: {}", e);
                 } else {
                     *self.last_stats_save_at.lock() = Some(Instant::now());

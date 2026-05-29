@@ -136,7 +136,7 @@ pub fn run_init(path: &Path, force: bool) -> Result<()> {
                 .with_context(|| format!("创建父目录失败: {}", parent.display()))?;
         }
     }
-    std::fs::write(path, content)
+    crate::common::io::atomic_write_string(path, &content)
         .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
 
     println!();
