@@ -208,6 +208,15 @@ export function CredentialCard({
     return () => clearInterval(timer)
   }, [])
 
+  // prop 变化时同步本地编辑 state（未在编辑中才覆盖，避免打断用户输入）
+  useEffect(() => {
+    if (!editingPriority) setPriorityValue(String(credential.priority))
+  }, [credential.priority, editingPriority])
+
+  useEffect(() => {
+    if (!editingConcurrency) setConcurrencyValue(credential.concurrency == null ? '' : String(credential.concurrency))
+  }, [credential.concurrency, editingConcurrency])
+
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
   const setConcurrency = useSetCredentialConcurrency()

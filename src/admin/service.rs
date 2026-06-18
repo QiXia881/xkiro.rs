@@ -1151,18 +1151,23 @@ impl AdminService {
             None => return,
         };
 
-        // 持有锁期间完成序列化和写入，防止并发损坏
-        let cache = self.balance_cache.lock();
-        let map: HashMap<String, &CachedBalance> =
-            cache.iter().map(|(k, v)| (k.to_string(), v)).collect();
-
-        match serde_json::to_string_pretty(&map) {
-            Ok(json) => {
-                if let Err(e) = crate::common::io::atomic_write_string(path, &json) {
-                    tracing::warn!("保存余额缓存失败: {}", e);
+        // 序列化在锁内完成（CPU-only，微秒级），IO 在锁释放后执行，
+        // 避免 rename syscall 在容器/NFS 存储抖动时长时间持有 Mutex
+        let json = {
+            let cache = self.balance_cache.lock();
+            let map: HashMap<String, &CachedBalance> =
+                cache.iter().map(|(k, v)| (k.to_string(), v)).collect();
+            match serde_json::to_string_pretty(&map) {
+                Ok(j) => j,
+                Err(e) => {
+                    tracing::warn!("序列化余额缓存失败: {}", e);
+                    return;
                 }
             }
-            Err(e) => tracing::warn!("序列化余额缓存失败: {}", e),
+        }; // MutexGuard 在此释放
+
+        if let Err(e) = crate::common::io::atomic_write_string(path, &json) {
+            tracing::warn!("保存余额缓存失败: {}", e);
         }
     }
 

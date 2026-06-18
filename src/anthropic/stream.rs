@@ -1168,11 +1168,12 @@ impl BufferedStreamContext {
         estimated_input_tokens: i32,
         thinking_enabled: bool,
         tool_name_map: HashMap<String, String>,
+        cache_usage: Option<CacheUsageBreakdown>,
     ) -> Self {
         let inner = StreamContext::new_with_thinking(
             model,
             estimated_input_tokens,
-            None,
+            cache_usage,
             thinking_enabled,
             tool_name_map,
         );

@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Settings, ZoomIn, FileText, Download } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Settings, ZoomIn, FileText, Download } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -9,8 +9,7 @@ import { Badge } from '@/components/ui/badge'
 import { CredentialCard } from '@/components/credential-card'
 import { BalanceDialog } from '@/components/balance-dialog'
 import { ModelsDialog } from '@/components/models-dialog'
-import { AddCredentialDialog } from '@/components/add-credential-dialog'
-import { BatchImportDialog } from '@/components/batch-import-dialog'
+import { ImportJsonDialog } from '@/components/import-json-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import { SettingsDialog } from '@/components/settings-dialog'
@@ -30,8 +29,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [selectedCredentialId, setSelectedCredentialId] = useState<number | null>(null)
   const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
   const [modelsDialogOpen, setModelsDialogOpen] = useState(false)
-  const [addDialogOpen, setAddDialogOpen] = useState(false)
-  const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false)
+  const [importJsonDialogOpen, setImportJsonDialogOpen] = useState(false)
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [verifyDialogOpen, setVerifyDialogOpen] = useState(false)
@@ -908,13 +906,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
               <FileUp className="h-3.5 w-3.5 mr-1.5" />
               KAM 导入
             </Button>
-            <Button onClick={() => setBatchImportDialogOpen(true)} size="sm" variant="outline" className="h-8">
+            <Button onClick={() => setImportJsonDialogOpen(true)} size="sm" className="h-8">
               <Upload className="h-3.5 w-3.5 mr-1.5" />
-              批量导入
-            </Button>
-            <Button onClick={() => setAddDialogOpen(true)} size="sm" className="h-8">
-              <Plus className="h-3.5 w-3.5 mr-1.5" />
-              添加凭据
+              导入 JSON
             </Button>
           </div>
         </div>
@@ -995,16 +989,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
         onOpenChange={setModelsDialogOpen}
       />
 
-      {/* 添加凭据对话框 */}
-      <AddCredentialDialog
-        open={addDialogOpen}
-        onOpenChange={setAddDialogOpen}
-      />
-
-      {/* 批量导入对话框 */}
-      <BatchImportDialog
-        open={batchImportDialogOpen}
-        onOpenChange={setBatchImportDialogOpen}
+      {/* 导入 JSON 对话框（添加凭据 + 批量导入一体化） */}
+      <ImportJsonDialog
+        open={importJsonDialogOpen}
+        onOpenChange={setImportJsonDialogOpen}
       />
 
       {/* KAM 账号导入对话框 */}

@@ -12,7 +12,7 @@ use super::types::{CacheControl, Message, MessagesRequest};
 
 const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(300);
 const ONE_HOUR_CACHE_TTL: Duration = Duration::from_secs(3600);
-const PREFIX_LOOKBACK_LIMIT: usize = 10;
+const PREFIX_LOOKBACK_LIMIT: usize = 20;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CacheResult {
@@ -491,10 +491,12 @@ fn strip_cache_control(value: &mut serde_json::Value) {
 fn minimum_cacheable_tokens_for_model(model: &str) -> i32 {
     let model_lower = model.to_lowercase();
 
-    if model_lower.contains("opus") {
+    if model_lower.contains("haiku-4") || model_lower.contains("haiku_4") {
         4096
-    } else if model_lower.contains("haiku-3") || model_lower.contains("haiku_3") {
-        2048
+    } else if model_lower.contains("opus") {
+        1024
+    } else if model_lower.contains("fable") || model_lower.contains("mythos") {
+        512
     } else {
         1024
     }
@@ -931,6 +933,72 @@ mod tests {
                 .last_cacheable_breakpoint()
                 .map(|bp| bp.cumulative_tokens)
                 .unwrap_or(0)
+        );
+    }
+
+    #[test]
+    fn minimum_cacheable_tokens_model_matrix() {
+        assert_eq!(minimum_cacheable_tokens_for_model("claude-opus-4-8"), 1024);
+        assert_eq!(minimum_cacheable_tokens_for_model("claude-opus-4-7"), 1024);
+        assert_eq!(minimum_cacheable_tokens_for_model("claude-sonnet-4-6"), 1024);
+        assert_eq!(minimum_cacheable_tokens_for_model("claude-sonnet-4-5-20250929"), 1024);
+        assert_eq!(minimum_cacheable_tokens_for_model("claude-haiku-4-5-20251001"), 4096);
+        assert_eq!(minimum_cacheable_tokens_for_model("claude-haiku-4-5"), 4096);
+        assert_eq!(minimum_cacheable_tokens_for_model("claude-fable-5"), 512);
+        assert_eq!(minimum_cacheable_tokens_for_model("claude-mythos-5"), 512);
+        assert_eq!(minimum_cacheable_tokens_for_model("claude-haiku-3"), 1024);
+    }
+
+    #[test]
+    fn lookback_beyond_ten_finds_cache_hit() {
+        let tracker = CacheTracker::new(Duration::from_secs(3600));
+
+        // Build a request with a cache_control breakpoint on a large system block
+        let long_text = long_cacheable_text();
+        let system_block = SystemMessage {
+            block_type: Some("text".to_string()),
+            text: long_text.clone(),
+            cache_control: Some(CacheControl {
+                cache_type: "ephemeral".to_string(),
+                ttl: None,
+            }),
+        };
+
+        let mut req1 = build_request_with_system(vec![msg("user", cache_text(&long_text))], vec![system_block.clone()]);
+        // Replace tools with 15 distinct tools to push the system breakpoint beyond position 10
+        req1.tools = Some(
+            (0..15)
+                .map(|i| Tool {
+                    tool_type: None,
+                    name: format!("tool_{i}"),
+                    description: format!("tool {i}"),
+                    input_schema: Default::default(),
+                    max_uses: None,
+                    cache_control: None,
+                })
+                .collect(),
+        );
+
+        let total1 = estimate_input_tokens(&req1);
+        let profile1 = tracker.build_profile(&req1, total1);
+        tracker.update(1, &profile1);
+
+        // Second identical request — should hit the system breakpoint even though it's
+        // now past position 10 in the block list (tools come first)
+        let mut req2 = req1.clone();
+        req2.messages = vec![
+            msg("user", cache_text(&long_text)),
+            msg("assistant", serde_json::json!("ok")),
+            msg("user", cache_text(&long_text)),
+        ];
+        let total2 = estimate_input_tokens(&req2);
+        let profile2 = tracker.build_profile(&req2, total2);
+        let result = tracker.compute(1, &profile2);
+
+        assert!(
+            result.cache_read_input_tokens > 0,
+            "expected cache hit with lookback > 10, got read={}",
+            result.cache_read_input_tokens
         );
     }
 }

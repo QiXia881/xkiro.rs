@@ -64,7 +64,6 @@ struct CacheUsageContext {
 }
 
 /// 流式请求上下文（聚合 cache_tracker 相关参数，避免函数签名爆炸）
-#[allow(dead_code)] // 接入主链路前先就位
 struct StreamRequestContext<'a> {
     cache_tracker: Option<&'a std::sync::Arc<crate::anthropic::cache_tracker::CacheTracker>>,
     cache_profile: Option<&'a crate::anthropic::cache_tracker::CacheProfile>,
@@ -77,7 +76,6 @@ struct StreamRequestContext<'a> {
 }
 
 /// 非流式请求上下文（同上）
-#[allow(dead_code)]
 struct NonStreamRequestContext<'a> {
     request_body: &'a str,
     model: &'a str,
@@ -93,7 +91,6 @@ struct NonStreamRequestContext<'a> {
 ///
 /// 内部薄封装，让上层调用 `cache_tracker.build_profile(...)` 时不必直接持有
 /// cache_tracker 模块类型，便于后续替换实现。
-#[allow(dead_code)]
 fn build_cache_profile(
     cache_tracker: &crate::anthropic::cache_tracker::CacheTracker,
     payload: &MessagesRequest,
@@ -847,6 +844,192 @@ pub async fn get_models() -> impl IntoResponse {
     })
 }
 
+/// 请求预处理结果，由 [`prepare_request`] 返回
+struct PreparedRequest {
+    request_body: String,
+    input_tokens: i32,
+    thinking_enabled: bool,
+    tool_name_map: std::collections::HashMap<String, String>,
+    user_id: Option<String>,
+}
+
+/// 公共请求预处理前段：转换→压缩→序列化→大小检查→元数据提取
+///
+/// 调用方需在此函数之前完成：thinking override、系统提示注入、WebSearch 分流。
+fn prepare_request(
+    state: &AppState,
+    payload: &MessagesRequest,
+) -> Result<PreparedRequest, Response> {
+    let compression = state.compression_config.read().clone();
+    let prompt_filter = state.prompt_filter_config.read().clone();
+    let conversion_result = match convert_request(
+        payload,
+        &compression,
+        &prompt_filter,
+        state.truncation_recovery_notice_enabled(),
+    ) {
+        Ok(result) => result,
+        Err(e) => {
+            let (error_type, message) = match &e {
+                ConversionError::UnsupportedModel(model) => {
+                    ("invalid_request_error", format!("模型不支持: {}", model))
+                }
+                ConversionError::EmptyMessages => {
+                    ("invalid_request_error", "消息列表为空".to_string())
+                }
+                ConversionError::EmptyMessageContent => {
+                    ("invalid_request_error", "消息内容为空".to_string())
+                }
+            };
+            tracing::warn!("请求转换失败: {}", e);
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(error_type, message)),
+            )
+                .into_response());
+        }
+    };
+
+    // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
+    let mut conversation_state = conversion_result.conversation_state;
+
+    // 多层压缩
+    if compression.enabled {
+        let stats = super::compressor::compress(&mut conversation_state, &compression);
+        tracing::debug!("压缩统计: {:?}", stats);
+    }
+
+    let mut kiro_request = KiroRequest {
+        conversation_state,
+        profile_arn: None,
+    };
+
+    let mut request_body = match serde_json::to_string(&kiro_request) {
+        Ok(body) => body,
+        Err(e) => {
+            tracing::error!("序列化请求失败: {}", e);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "internal_error",
+                    format!("序列化请求失败: {}", e),
+                )),
+            )
+                .into_response());
+        }
+    };
+
+    // 请求体大小预检（上游存在硬性请求体大小限制；按实际序列化后的总字节数判断）
+    let max_body = compression.max_request_body_bytes;
+    if max_body > 0 && request_body.len() > max_body && compression.enabled {
+        // 自适应二次压缩：按 request_body_bytes 迭代截断，尽量把请求缩到阈值内
+        match adaptive_shrink_request_body(
+            &mut kiro_request,
+            &compression,
+            max_body,
+            &mut request_body,
+        ) {
+            Ok(Some(outcome)) => {
+                tracing::warn!(
+                    conversation_id = kiro_request.conversation_state.conversation_id.as_str(),
+                    initial_bytes = outcome.initial_bytes,
+                    final_bytes = outcome.final_bytes,
+                    threshold = max_body,
+                    iters = outcome.iters,
+                    additional_history_turns_removed = outcome.additional_history_turns_removed,
+                    final_tool_result_max_chars = outcome.final_tool_result_max_chars,
+                    final_tool_use_input_max_chars = outcome.final_tool_use_input_max_chars,
+                    final_message_content_max_chars = outcome.final_message_content_max_chars,
+                    "请求体超过阈值，已执行自适应二次压缩"
+                );
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!("自适应二次压缩序列化失败: {}", e);
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse::new(
+                        "internal_error",
+                        format!("序列化请求失败: {}", e),
+                    )),
+                )
+                    .into_response());
+            }
+        }
+    }
+
+    // 压缩后再次检查（输出 image_bytes/non-image bytes 便于排查）
+    let final_img_bytes = total_image_bytes(&kiro_request);
+    let final_effective_len = request_body.len().saturating_sub(final_img_bytes);
+    if max_body > 0 && request_body.len() > max_body {
+        tracing::warn!(
+            conversation_id = kiro_request.conversation_state.conversation_id.as_str(),
+            request_body_bytes = request_body.len(),
+            image_bytes = final_img_bytes,
+            effective_bytes = final_effective_len,
+            threshold = max_body,
+            "请求体超过安全阈值，拒绝发送"
+        );
+        #[cfg(feature = "sensitive-logs")]
+        tracing::error!(
+            "自适应压缩仍超限，完整请求体（用于诊断）: {}",
+            truncate_base64_in_request_body(&request_body)
+        );
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                format!(
+                    "Request too large ({} bytes total; images {} bytes; non-image {} bytes; limit {}). Reduce conversation history/tool output or number/size of images.",
+                    request_body.len(),
+                    final_img_bytes,
+                    final_effective_len,
+                    max_body
+                ),
+            )),
+        )
+            .into_response());
+    }
+
+    tracing::debug!(
+        kiro_request_body_bytes = request_body.len(),
+        "已构建 Kiro 请求体"
+    );
+    tracing::debug!("Kiro request body: {}", request_body);
+
+    // 估算输入 tokens
+    let input_tokens = token::count_all_tokens(
+        payload.model.clone(),
+        payload.system.clone(),
+        payload.messages.clone(),
+        payload.tools.clone(),
+    ) as i32;
+
+    // 检查是否启用了 thinking
+    let thinking_enabled = payload
+        .thinking
+        .as_ref()
+        .map(|t| t.is_enabled())
+        .unwrap_or(false);
+
+    let tool_name_map = conversion_result.tool_name_map;
+
+    let raw_user_id = payload
+        .metadata
+        .as_ref()
+        .and_then(|m| m.user_id.as_deref());
+    // 提取 session_id 作为亲和 key；裸 user_id 是机器哈希常量，不能作 key
+    let user_id = raw_user_id.and_then(extract_session_id);
+
+    Ok(PreparedRequest {
+        request_body,
+        input_tokens,
+        thinking_enabled,
+        tool_name_map,
+        user_id,
+    })
+}
+
 /// POST /v1/messages
 ///
 /// 创建消息（对话）
@@ -940,173 +1123,16 @@ pub async fn post_messages(
         websearch::strip_web_search_tools(&mut payload);
     }
 
-    // 转换请求
-    let compression = state.compression_config.read().clone();
-    let prompt_filter = state.prompt_filter_config.read().clone();
-    let conversion_result = match convert_request(
-        &payload,
-        &compression,
-        &prompt_filter,
-        state.truncation_recovery_notice_enabled(),
-    ) {
-        Ok(result) => result,
-        Err(e) => {
-            let (error_type, message) = match &e {
-                ConversionError::UnsupportedModel(model) => {
-                    ("invalid_request_error", format!("模型不支持: {}", model))
-                }
-                ConversionError::EmptyMessages => {
-                    ("invalid_request_error", "消息列表为空".to_string())
-                }
-                ConversionError::EmptyMessageContent => {
-                    ("invalid_request_error", "消息内容为空".to_string())
-                }
-            };
-            tracing::warn!("请求转换失败: {}", e);
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(error_type, message)),
-            )
-                .into_response();
-        }
+    let prep = match prepare_request(&state, &payload) {
+        Ok(p) => p,
+        Err(r) => return r,
     };
-
-    // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
-    let mut conversation_state = conversion_result.conversation_state;
-
-    // 多层压缩
-    if compression.enabled {
-        let stats = super::compressor::compress(&mut conversation_state, &compression);
-        tracing::debug!("压缩统计: {:?}", stats);
-    }
-
-    let mut kiro_request = KiroRequest {
-        conversation_state,
-        profile_arn: None,
-    };
-
-    let mut request_body = match serde_json::to_string(&kiro_request) {
-        Ok(body) => body,
-        Err(e) => {
-            tracing::error!("序列化请求失败: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new(
-                    "internal_error",
-                    format!("序列化请求失败: {}", e),
-                )),
-            )
-                .into_response();
-        }
-    };
-
-    // 请求体大小预检（上游存在硬性请求体大小限制；按实际序列化后的总字节数判断）
-    let max_body = compression.max_request_body_bytes;
-    if max_body > 0 && request_body.len() > max_body && compression.enabled {
-        // 自适应二次压缩：按 request_body_bytes 迭代截断，尽量把请求缩到阈值内
-        match adaptive_shrink_request_body(
-            &mut kiro_request,
-            &compression,
-            max_body,
-            &mut request_body,
-        ) {
-            Ok(Some(outcome)) => {
-                tracing::warn!(
-                    conversation_id = kiro_request.conversation_state.conversation_id.as_str(),
-                    initial_bytes = outcome.initial_bytes,
-                    final_bytes = outcome.final_bytes,
-                    threshold = max_body,
-                    iters = outcome.iters,
-                    additional_history_turns_removed = outcome.additional_history_turns_removed,
-                    final_tool_result_max_chars = outcome.final_tool_result_max_chars,
-                    final_tool_use_input_max_chars = outcome.final_tool_use_input_max_chars,
-                    final_message_content_max_chars = outcome.final_message_content_max_chars,
-                    "请求体超过阈值，已执行自适应二次压缩"
-                );
-            }
-            Ok(None) => {}
-            Err(e) => {
-                tracing::error!("自适应二次压缩序列化失败: {}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse::new(
-                        "internal_error",
-                        format!("序列化请求失败: {}", e),
-                    )),
-                )
-                    .into_response();
-            }
-        }
-    }
-
-    // 压缩后再次检查（输出 image_bytes/non-image bytes 便于排查）
-    let final_img_bytes = total_image_bytes(&kiro_request);
-    let final_effective_len = request_body.len().saturating_sub(final_img_bytes);
-    if max_body > 0 && request_body.len() > max_body {
-        tracing::warn!(
-            conversation_id = kiro_request.conversation_state.conversation_id.as_str(),
-            request_body_bytes = request_body.len(),
-            image_bytes = final_img_bytes,
-            effective_bytes = final_effective_len,
-            threshold = max_body,
-            "请求体超过安全阈值，拒绝发送"
-        );
-        #[cfg(feature = "sensitive-logs")]
-        tracing::error!(
-            "自适应压缩仍超限，完整请求体（用于诊断）: {}",
-            truncate_base64_in_request_body(&request_body)
-        );
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "invalid_request_error",
-                format!(
-                    "Request too large ({} bytes total; images {} bytes; non-image {} bytes; limit {}). Reduce conversation history/tool output or number/size of images.",
-                    request_body.len(),
-                    final_img_bytes,
-                    final_effective_len,
-                    max_body
-                ),
-            )),
-        )
-            .into_response();
-    }
-
-    tracing::debug!(
-        kiro_request_body_bytes = request_body.len(),
-        "已构建 Kiro 请求体"
-    );
-    tracing::debug!("Kiro request body: {}", request_body);
-
-    // 估算输入 tokens（贴 BK：clone 让 payload 后续仍可用于 build_cache_profile）
-    let input_tokens = token::count_all_tokens(
-        payload.model.clone(),
-        payload.system.clone(),
-        payload.messages.clone(),
-        payload.tools.clone(),
-    ) as i32;
-
-    // 检查是否启用了thinking
-    let thinking_enabled = payload
-        .thinking
-        .as_ref()
-        .map(|t| t.is_enabled())
-        .unwrap_or(false);
-
-    let tool_name_map = conversion_result.tool_name_map;
-
-    let raw_user_id = payload
-        .metadata
-        .as_ref()
-        .and_then(|m| m.user_id.as_deref());
-    // 提取 session_id 作为亲和 key；裸 user_id 是机器哈希常量，不能作 key
-    let session_id_owned = raw_user_id.and_then(extract_session_id);
-    let user_id = session_id_owned.as_deref();
+    let user_id = prep.user_id.as_deref();
 
     // 读 prompt-cache 快照 + 按 accounting_enabled 构造 cache_profile（BK 模式）
     let prompt_cache = state.prompt_cache_snapshot();
     let cache_profile = prompt_cache.accounting_enabled.then(|| {
-        build_cache_profile(prompt_cache.tracker.as_ref(), &payload, input_tokens)
+        build_cache_profile(prompt_cache.tracker.as_ref(), &payload, prep.input_tokens)
     });
 
     if payload.stream {
@@ -1116,22 +1142,22 @@ pub async fn post_messages(
                 .accounting_enabled
                 .then_some(&prompt_cache.tracker),
             cache_profile: cache_profile.as_ref(),
-            request_body: &request_body,
+            request_body: &prep.request_body,
             model: &payload.model,
-            input_tokens,
-            thinking_enabled,
-            tool_name_map: tool_name_map.clone(),
+            input_tokens: prep.input_tokens,
+            thinking_enabled: prep.thinking_enabled,
+            tool_name_map: prep.tool_name_map.clone(),
             user_id,
         };
         handle_stream_request(provider, stream_request).await
     } else {
         // 非流式响应
         let non_stream_request = NonStreamRequestContext {
-            request_body: &request_body,
+            request_body: &prep.request_body,
             model: &payload.model,
-            input_tokens,
-            thinking_enabled,
-            tool_name_map,
+            input_tokens: prep.input_tokens,
+            thinking_enabled: prep.thinking_enabled,
+            tool_name_map: prep.tool_name_map,
             user_id,
             cache_tracker: prompt_cache
                 .accounting_enabled
@@ -1851,194 +1877,43 @@ pub async fn post_messages_cc(
         websearch::strip_web_search_tools(&mut payload);
     }
 
-    // 转换请求
-    let compression = state.compression_config.read().clone();
-    let prompt_filter = state.prompt_filter_config.read().clone();
-    let conversion_result = match convert_request(
-        &payload,
-        &compression,
-        &prompt_filter,
-        state.truncation_recovery_notice_enabled(),
-    ) {
-        Ok(result) => result,
-        Err(e) => {
-            let (error_type, message) = match &e {
-                ConversionError::UnsupportedModel(model) => {
-                    ("invalid_request_error", format!("模型不支持: {}", model))
-                }
-                ConversionError::EmptyMessages => {
-                    ("invalid_request_error", "消息列表为空".to_string())
-                }
-                ConversionError::EmptyMessageContent => {
-                    ("invalid_request_error", "消息内容为空".to_string())
-                }
-            };
-            tracing::warn!("请求转换失败: {}", e);
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(error_type, message)),
-            )
-                .into_response();
-        }
+    let prep = match prepare_request(&state, &payload) {
+        Ok(p) => p,
+        Err(r) => return r,
     };
+    let user_id = prep.user_id.as_deref();
 
-    // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
-    let mut conversation_state = conversion_result.conversation_state;
-
-    // 多层压缩
-    if compression.enabled {
-        let stats = super::compressor::compress(&mut conversation_state, &compression);
-        tracing::debug!("压缩统计: {:?}", stats);
-    }
-
-    let mut kiro_request = KiroRequest {
-        conversation_state,
-        profile_arn: None,
-    };
-
-    let mut request_body = match serde_json::to_string(&kiro_request) {
-        Ok(body) => body,
-        Err(e) => {
-            tracing::error!("序列化请求失败: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new(
-                    "internal_error",
-                    format!("序列化请求失败: {}", e),
-                )),
-            )
-                .into_response();
-        }
-    };
-
-    // 请求体大小预检（上游存在硬性请求体大小限制；按实际序列化后的总字节数判断）
-    let max_body = compression.max_request_body_bytes;
-    if max_body > 0 && request_body.len() > max_body && compression.enabled {
-        // 自适应二次压缩：按 request_body_bytes 迭代截断，尽量把请求缩到阈值内
-        match adaptive_shrink_request_body(
-            &mut kiro_request,
-            &compression,
-            max_body,
-            &mut request_body,
-        ) {
-            Ok(Some(outcome)) => {
-                tracing::warn!(
-                    conversation_id = kiro_request.conversation_state.conversation_id.as_str(),
-                    initial_bytes = outcome.initial_bytes,
-                    final_bytes = outcome.final_bytes,
-                    threshold = max_body,
-                    iters = outcome.iters,
-                    additional_history_turns_removed = outcome.additional_history_turns_removed,
-                    final_tool_result_max_chars = outcome.final_tool_result_max_chars,
-                    final_tool_use_input_max_chars = outcome.final_tool_use_input_max_chars,
-                    final_message_content_max_chars = outcome.final_message_content_max_chars,
-                    "请求体超过阈值，已执行自适应二次压缩"
-                );
-            }
-            Ok(None) => {}
-            Err(e) => {
-                tracing::error!("自适应二次压缩序列化失败: {}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse::new(
-                        "internal_error",
-                        format!("序列化请求失败: {}", e),
-                    )),
-                )
-                    .into_response();
-            }
-        }
-    }
-
-    // 压缩后再次检查（输出 image_bytes/non-image bytes 便于排查）
-    let final_img_bytes = total_image_bytes(&kiro_request);
-    let final_effective_len = request_body.len().saturating_sub(final_img_bytes);
-    if max_body > 0 && request_body.len() > max_body {
-        tracing::warn!(
-            conversation_id = kiro_request.conversation_state.conversation_id.as_str(),
-            request_body_bytes = request_body.len(),
-            image_bytes = final_img_bytes,
-            effective_bytes = final_effective_len,
-            threshold = max_body,
-            "请求体超过安全阈值，拒绝发送"
-        );
-        #[cfg(feature = "sensitive-logs")]
-        tracing::error!(
-            "自适应压缩仍超限，完整请求体（用于诊断）: {}",
-            truncate_base64_in_request_body(&request_body)
-        );
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "invalid_request_error",
-                format!(
-                    "Request too large ({} bytes total; images {} bytes; non-image {} bytes; limit {}). Reduce conversation history/tool output or number/size of images.",
-                    request_body.len(),
-                    final_img_bytes,
-                    final_effective_len,
-                    max_body
-                ),
-            )),
-        )
-            .into_response();
-    }
-
-    tracing::debug!(
-        kiro_request_body_bytes = request_body.len(),
-        "已构建 Kiro 请求体"
-    );
-    tracing::debug!("Kiro request body: {}", request_body);
-
-    // 估算输入 tokens（贴 BK：clone 让 payload 后续仍可用于 build_cache_profile）
-    let input_tokens = token::count_all_tokens(
-        payload.model.clone(),
-        payload.system.clone(),
-        payload.messages.clone(),
-        payload.tools.clone(),
-    ) as i32;
-
-    // 检查是否启用了thinking
-    let thinking_enabled = payload
-        .thinking
-        .as_ref()
-        .map(|t| t.is_enabled())
-        .unwrap_or(false);
-
-    let tool_name_map = conversion_result.tool_name_map;
-
-    let raw_user_id = payload
-        .metadata
-        .as_ref()
-        .and_then(|m| m.user_id.as_deref());
-    let session_id_owned = raw_user_id.and_then(extract_session_id);
-    let user_id = session_id_owned.as_deref();
+    let prompt_cache = state.prompt_cache_snapshot();
+    let cache_profile = prompt_cache.accounting_enabled.then(|| {
+        build_cache_profile(prompt_cache.tracker.as_ref(), &payload, prep.input_tokens)
+    });
 
     if payload.stream {
         // 流式响应（缓冲模式）
         handle_stream_request_buffered(
             provider,
-            &request_body,
+            &prep.request_body,
             &payload.model,
-            input_tokens,
-            thinking_enabled,
-            tool_name_map,
+            prep.input_tokens,
+            prep.thinking_enabled,
+            prep.tool_name_map,
             user_id,
+            prompt_cache.accounting_enabled.then_some(&prompt_cache.tracker),
+            cache_profile.as_ref(),
         )
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
-        let extract_thinking = state.extract_thinking && thinking_enabled;
-        // 注：post_messages_cc 路径目前不接 cache_tracker（xkiro 独有 Claude Code 端点），
-        //     待后续按需打开缓存计费时再传入 prompt_cache_snapshot
+        let extract_thinking = state.extract_thinking && prep.thinking_enabled;
         let non_stream_request = NonStreamRequestContext {
-            request_body: &request_body,
+            request_body: &prep.request_body,
             model: &payload.model,
-            input_tokens,
+            input_tokens: prep.input_tokens,
             thinking_enabled: extract_thinking,
-            tool_name_map,
+            tool_name_map: prep.tool_name_map,
             user_id,
-            cache_tracker: None,
-            cache_profile: None,
+            cache_tracker: prompt_cache.accounting_enabled.then_some(&prompt_cache.tracker),
+            cache_profile: cache_profile.as_ref(),
         };
         handle_non_stream_request(provider, non_stream_request).await
     }
@@ -2056,12 +1931,36 @@ async fn handle_stream_request_buffered(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     user_id: Option<&str>,
+    cache_tracker: Option<&std::sync::Arc<crate::anthropic::cache_tracker::CacheTracker>>,
+    cache_profile: Option<&crate::anthropic::cache_tracker::CacheProfile>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let mut api_result = match provider.call_api_stream(request_body, user_id).await {
         Ok(resp) => resp,
         Err(e) => return map_kiro_provider_error_to_response(request_body, e),
     };
+
+    // 凭据已选定 → 用 resolved_cache_usage 重算并提交 cache_tracker（BK 模式）
+    let final_cache_usage = match (cache_tracker, cache_profile) {
+        (Some(tracker), Some(profile)) => {
+            let resolved = resolved_cache_usage(tracker, api_result.credential_id, profile);
+            tracing::debug!(
+                credential_id = api_result.credential_id,
+                final_cache_creation_input_tokens = resolved.cache_creation_input_tokens,
+                final_cache_read_input_tokens = resolved.cache_read_input_tokens,
+                "Resolved cache usage for buffered stream request"
+            );
+            tracker.update(api_result.credential_id, profile);
+            Some(CacheUsageBreakdown {
+                cache_creation_input_tokens: resolved.cache_creation_input_tokens,
+                cache_read_input_tokens: resolved.cache_read_input_tokens,
+                cache_creation_5m_input_tokens: resolved.cache_creation_5m_input_tokens,
+                cache_creation_1h_input_tokens: resolved.cache_creation_1h_input_tokens,
+            })
+        }
+        _ => None,
+    };
+
     let _cred_permit = api_result._credential_permit.take();
     let _glb_permit = api_result._global_permit.take();
     let response = api_result.response;
@@ -2073,6 +1972,7 @@ async fn handle_stream_request_buffered(
         estimated_input_tokens,
         thinking_enabled,
         tool_name_map,
+        final_cache_usage,
     );
 
     // 创建缓冲 SSE 流
