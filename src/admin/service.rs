@@ -8,29 +8,46 @@ use chrono::Utc;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 
-use crate::anthropic::middleware::PromptCacheRuntime;
+use crate::anthropic::middleware::{PromptCacheRuntime, SharedApiKeys, ThinkingRuntimeConfig};
 use crate::common::utf8::floor_char_boundary;
 use crate::http_client::ProxyConfig;
+use crate::kiro::auth::{idc, kiro_sso, oauth_callback, social};
+use crate::kiro::endpoint::{CLI_ENDPOINT_NAME, CODEWHISPERER_ENDPOINT_NAME, IDE_ENDPOINT_NAME};
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::provider::KiroProvider;
-use crate::kiro::token_manager::{LOW_BALANCE_THRESHOLD, MultiTokenManager};
-use crate::model::config::{CompressionConfig, SystemPromptPosition, UserPreset};
+use crate::kiro::token_manager::{LOW_BALANCE_THRESHOLD, MultiTokenManager, refresh_token};
+use crate::model::config::{
+    CompressionConfig, PromptFilterConfig, SystemPromptPosition, UserPreset,
+};
 use crate::model::runtime::SharedPromptConfig;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use super::error::AdminServiceError;
 use super::types::{
-    AddCredentialRequest, AddCredentialResponse, BalanceResponse, BatchRefreshBalanceResponse,
-    BatchRefreshBalanceResultItem, BatchRefreshResponse, BatchRefreshResultItem,
-    CachedBalanceItem, CachedBalancesResponse, CompressionConfigResponse, CredentialStatusItem,
-    CredentialsStatusResponse, ExportKamItem, ExportTokenJsonItem, GlobalConfigResponse,
-    ImportAction, ImportItemResult, ImportSummary, ImportTokenJsonRequest, ImportTokenJsonResponse,
-    PresetItem,
-    ProxyConfigResponse, RuntimeBalanceSnapshot, RuntimeStatsItem, RuntimeStatsResponse,
-    SystemPromptResponse, TokenJsonItem, UpdateCompressionConfigRequest,
-    UpdateGlobalConfigRequest, UpdateProxyConfigRequest, UpdateSystemPromptRequest,
-    UpsertUserPresetRequest,
+    AddCredentialRequest, AddCredentialResponse, ApiKeyEntry, ApiKeyListResponse, BalanceResponse,
+    BatchOperationRequest, BatchOperationResponse, BatchOperationResultItem,
+    BatchRefreshBalanceResponse, BatchRefreshBalanceResultItem, BatchRefreshResponse,
+    BatchRefreshResultItem, CachedBalanceItem, CachedBalancesResponse, CompleteIamSsoLoginRequest,
+    CompleteKiroSsoLoginRequest, CompleteKiroSsoLoginResponse, CompleteSocialCallbackRequest,
+    CompleteSocialLoginRequest, CompressionConfigResponse, CreateApiKeyRequest,
+    CreateApiKeyResponse, CredentialStatusItem, CredentialTestResponse, CredentialsStatusResponse,
+    EndpointConfigResponse, ExportKamItem, ExportTokenJsonItem, GenerateMachineIdResponse,
+    GlobalConfigResponse, ImportAction, ImportItemResult, ImportSsoTokenRequest,
+    ImportSsoTokenResponse, ImportSummary, ImportTokenJsonRequest, ImportTokenJsonResponse,
+    KiroGoImportCredentialsRequest, KiroGoProxyConfigResponse, KiroGoUpdateAccountRequest,
+    KiroSsoAccountResponse, PollBuilderIdLoginResponse, PollIdcLoginResponse,
+    PollKiroSsoLoginResponse, PollSocialLoginResponse, PresetItem, PromptFilterConfigResponse,
+    PromptFilterRuleDto, ProxyConfigResponse, RequestLogsResponse, RuntimeBalanceSnapshot,
+    RuntimeStatsItem, RuntimeStatsResponse, SettingsResponse, SsoTokenImportResultItem,
+    StartBuilderIdLoginRequest, StartBuilderIdLoginResponse, StartIamSsoLoginResponse,
+    StartIdcLoginRequest, StartIdcLoginResponse, StartKiroSsoLoginRequest,
+    StartKiroSsoLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse, StatsResponse,
+    SystemPromptResponse, SystemStatusResponse, ThinkingConfigResponse, TokenJsonItem,
+    UpdateApiKeyRequest, UpdateCompressionConfigRequest, UpdateEndpointConfigRequest,
+    UpdateGlobalConfigRequest, UpdatePromptFilterConfigRequest, UpdateProxyConfigRequest,
+    UpdateSettingsRequest, UpdateSystemPromptRequest, UpdateThinkingConfigRequest,
+    UpsertUserPresetRequest, VersionResponse,
 };
 use crate::kiro::token_manager::CachedBalanceInfo;
 
@@ -52,6 +69,77 @@ fn overage_remaining(balance: &BalanceResponse) -> f64 {
     } else {
         0.0
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SocialAuthSessionKind {
+    Manual,
+    Helper,
+}
+
+/// Social OAuth 登录进行中的会话状态
+struct SocialAuthSession {
+    kind: SocialAuthSessionKind,
+    auth_endpoint: String,
+    state: String,
+    code_verifier: String,
+    redirect_uri: String,
+    expires_at: chrono::DateTime<Utc>,
+    cred_template: KiroCredentials,
+    proxy: Option<ProxyConfig>,
+    // helper 模式：complete 投递最终结果，poll 读取。Ok(id)=成功，Err=失败原因
+    helper_result: Option<Result<u64, String>>,
+    // helper 模式：complete 进入异步 add_credential 期间置位，避免 poll 在该窗口因
+    // 过期而清除会话（会丢失结果），也避免重复 complete 互相覆盖结果。
+    helper_completing: bool,
+}
+
+struct IdcAuthSession {
+    region: String,
+    client_id: String,
+    client_secret: String,
+    device_code: String,
+    expires_at: chrono::DateTime<Utc>,
+    poll_interval: i64,
+    cred_template: KiroCredentials,
+    proxy: Option<ProxyConfig>,
+}
+
+struct IamSsoCodeAuthSession {
+    region: String,
+    client_id: String,
+    client_secret: String,
+    code_verifier: String,
+    state: String,
+    redirect_uri: String,
+    expires_at: chrono::DateTime<Utc>,
+    cred_template: KiroCredentials,
+    proxy: Option<ProxyConfig>,
+}
+
+/// Builder ID 设备授权会话
+#[derive(Clone)]
+struct BuilderIdAuthSession {
+    region: String,
+    client_id: String,
+    client_secret: String,
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    verification_uri_complete: Option<String>,
+    expires_at: chrono::DateTime<Utc>,
+    poll_interval: i64,
+    cred_template: KiroCredentials,
+    proxy: Option<ProxyConfig>,
+}
+
+struct KiroSsoAuthSession {
+    callback_rx: tokio::sync::Mutex<tokio::sync::oneshot::Receiver<kiro_sso::KiroSsoCapture>>,
+    manual_callback_tx: tokio::sync::mpsc::Sender<kiro_sso::ManualCallbackRequest>,
+    expires_at: chrono::DateTime<Utc>,
+    cred_template: KiroCredentials,
+    proxy: Option<ProxyConfig>,
+    _server_handle: Option<kiro_sso::ServerHandle>,
 }
 
 /// 缓存的余额条目（含时间戳）
@@ -81,12 +169,20 @@ pub struct AdminService {
     kiro_provider: Option<Arc<KiroProvider>>,
     /// 共享压缩配置，与 AppState 同源（运行时热更新）
     compression_config: Arc<RwLock<CompressionConfig>>,
+    /// 客户端 API Key 运行时状态
+    client_api_key_runtime: Arc<RwLock<String>>,
+    /// 客户端 API Key 强制开关运行时状态
+    require_api_key_runtime: Arc<std::sync::atomic::AtomicBool>,
+    /// Admin 密钥运行时状态
+    admin_api_key_runtime: Arc<RwLock<String>>,
+    /// 共享提示过滤配置，与 AppState 同源（运行时热更新）
+    prompt_filter_config: Arc<RwLock<PromptFilterConfig>>,
+    /// 共享 thinking 配置，与 AppState 同源（运行时热更新）
+    thinking_config: Arc<RwLock<ThinkingRuntimeConfig>>,
     /// Prompt Cache 运行时（共享引用，支持 ttl/accounting 热更新）
     prompt_cache_runtime: Arc<RwLock<PromptCacheRuntime>>,
     /// 系统提示注入运行时（共享引用，支持热更新）
     prompt_runtime: SharedPromptConfig,
-    /// 截断恢复识别开关（与 AppState 共享，admin 写入即热生效）
-    truncation_recovery_notice: Arc<std::sync::atomic::AtomicBool>,
     balance_cache: Mutex<HashMap<u64, CachedBalance>>,
     cache_path: Option<PathBuf>,
     /// 已注册的端点名称集合（用于 add_credential 校验）
@@ -99,6 +195,20 @@ pub struct AdminService {
     balance_semaphore: Arc<Semaphore>,
     /// 模型列表缓存（仅内存，TTL 30 分钟；按 (id, provider) 区分）
     models_cache: Mutex<HashMap<(u64, Option<String>), CachedModels>>,
+    /// 进行中的 Social OAuth 登录会话（session_id → SocialAuthSession）
+    social_sessions: Mutex<HashMap<String, SocialAuthSession>>,
+    /// 进行中的 AWS IdC 设备授权会话（session_id → IdcAuthSession）
+    idc_sessions: Mutex<HashMap<String, IdcAuthSession>>,
+    /// 进行中的 Kiro-Go IAM SSO authorization-code 会话
+    iam_sso_code_sessions: Mutex<HashMap<String, IamSsoCodeAuthSession>>,
+    /// 请求日志和统计
+    request_stats: super::stats::SharedRequestStats,
+    /// 进行中的 Builder ID 登录会话（session_id → BuilderIdAuthSession）
+    builder_id_sessions: Mutex<HashMap<String, BuilderIdAuthSession>>,
+    /// 进行中的 Kiro hosted SSO 登录会话（Microsoft 365 / Entra ID）
+    kiro_sso_sessions: Mutex<HashMap<String, KiroSsoAuthSession>>,
+    /// API Key 列表（多 API Key 系统）
+    api_keys: SharedApiKeys,
 }
 
 impl AdminService {
@@ -106,9 +216,14 @@ impl AdminService {
         token_manager: Arc<MultiTokenManager>,
         kiro_provider: Option<Arc<KiroProvider>>,
         compression_config: Arc<RwLock<CompressionConfig>>,
+        client_api_key_runtime: Arc<RwLock<String>>,
+        require_api_key_runtime: Arc<std::sync::atomic::AtomicBool>,
+        admin_api_key_runtime: Arc<RwLock<String>>,
+        prompt_filter_config: Arc<RwLock<PromptFilterConfig>>,
+        thinking_config: Arc<RwLock<ThinkingRuntimeConfig>>,
         prompt_cache_runtime: Arc<RwLock<PromptCacheRuntime>>,
         prompt_runtime: SharedPromptConfig,
-        truncation_recovery_notice: Arc<std::sync::atomic::AtomicBool>,
+        api_keys: SharedApiKeys,
         known_endpoints: impl IntoIterator<Item = String>,
     ) -> Self {
         let cache_path = token_manager
@@ -121,15 +236,31 @@ impl AdminService {
             token_manager,
             kiro_provider,
             compression_config,
+            client_api_key_runtime,
+            require_api_key_runtime,
+            admin_api_key_runtime,
+            prompt_filter_config,
+            thinking_config,
             prompt_cache_runtime,
             prompt_runtime,
-            truncation_recovery_notice,
             balance_cache: Mutex::new(balance_cache),
             cache_path,
             known_endpoints: known_endpoints.into_iter().collect(),
             balance_semaphore: Arc::new(Semaphore::new(8)),
             models_cache: Mutex::new(HashMap::new()),
+            social_sessions: Mutex::new(HashMap::new()),
+            idc_sessions: Mutex::new(HashMap::new()),
+            iam_sso_code_sessions: Mutex::new(HashMap::new()),
+            request_stats: super::stats::create_shared_stats(),
+            builder_id_sessions: Mutex::new(HashMap::new()),
+            kiro_sso_sessions: Mutex::new(HashMap::new()),
+            api_keys,
         }
+    }
+
+    /// 获取 token_manager 快照（用于批量操作）
+    pub fn token_manager_snapshot(&self) -> crate::kiro::token_manager::ManagerSnapshot {
+        self.token_manager.snapshot()
     }
 
     /// 启动后并行预取所有未禁用凭据的余额，写入 disk-cache
@@ -195,10 +326,11 @@ impl AdminService {
                 self.token_manager.config().balance_refresh_concurrency,
             );
             // 启动后跳过首轮（启动预取已处理），先 sleep 一轮再开始
-            let mut next_sleep =
-                self.token_manager.config().balance_refresh_interval_secs.max(
-                    crate::model::config::MIN_BALANCE_REFRESH_INTERVAL_SECS,
-                );
+            let mut next_sleep = self
+                .token_manager
+                .config()
+                .balance_refresh_interval_secs
+                .max(crate::model::config::MIN_BALANCE_REFRESH_INTERVAL_SECS);
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(next_sleep)).await;
 
@@ -320,17 +452,18 @@ impl AdminService {
                     self.token_manager
                         .update_balance_cache_full(id, remaining, overage_rem);
                     // 真正不可用 = 正式额度耗尽 AND（超额未开启 OR 超额额度耗尽）
-                    let exhausted = remaining < LOW_BALANCE_THRESHOLD
-                        && overage_rem < LOW_BALANCE_THRESHOLD;
+                    let exhausted =
+                        remaining < LOW_BALANCE_THRESHOLD && overage_rem < LOW_BALANCE_THRESHOLD;
                     if exhausted {
-                        self.token_manager.mark_insufficient_balance(id);
-                        stats.low_balance_disabled += 1;
-                        tracing::warn!(
-                            "凭据 #{} 额度耗尽（正式 {:.2}, 超额 remaining={:.2}），已自动禁用",
-                            id,
-                            remaining,
-                            overage_rem
-                        );
+                        if self.token_manager.mark_insufficient_balance(id) {
+                            stats.low_balance_disabled += 1;
+                            tracing::warn!(
+                                "凭据 #{} 额度耗尽（正式 {:.2}, 超额 remaining={:.2}），已自动禁用",
+                                id,
+                                remaining,
+                                overage_rem
+                            );
+                        }
                     } else {
                         tracing::debug!(
                             "凭据 #{} 余额已刷新: 正式 {:.2}, 超额 remaining={:.2}",
@@ -359,7 +492,6 @@ impl AdminService {
         stats
     }
 
-
     /// 获取所有凭据状态
     pub fn get_all_credentials(&self) -> CredentialsStatusResponse {
         let snapshot = self.token_manager.snapshot();
@@ -371,6 +503,7 @@ impl AdminService {
             .map(|entry| CredentialStatusItem {
                 id: entry.id,
                 priority: entry.priority,
+                weight: entry.weight,
                 disabled: entry.disabled,
                 failure_count: entry.failure_count,
                 expires_at: entry.expires_at,
@@ -415,6 +548,28 @@ impl AdminService {
     pub fn set_priority(&self, id: u64, priority: u32) -> Result<(), AdminServiceError> {
         self.token_manager
             .set_priority(id, priority)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    pub fn update_kiro_go_account(
+        &self,
+        id: u64,
+        req: KiroGoUpdateAccountRequest,
+    ) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .update_credential_kiro_go_fields(
+                id,
+                req.enabled,
+                req.weight,
+                req.proxy_url.map(|v| {
+                    let trimmed = v.trim().to_string();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed)
+                    }
+                }),
+            )
             .map_err(|e| self.classify_error(e, id))
     }
 
@@ -576,6 +731,13 @@ impl AdminService {
             .list_available_models_for(id, model_provider)
             .await
             .map_err(|e| self.classify_balance_error(e, id))?;
+        self.token_manager.set_model_list(
+            id,
+            response
+                .available_models
+                .iter()
+                .map(|model| model.model_id.clone()),
+        );
 
         self.models_cache.lock().insert(
             key,
@@ -705,15 +867,27 @@ impl AdminService {
             profile_arn: None,
             expires_at: None,
             auth_method: Some(req.auth_method),
+            provider: None,
+            user_id: None,
             client_id: req.client_id,
             client_secret: req.client_secret,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
+            start_url: None,
+            client_id_hash: None,
+            id_token: None,
+            sso_session_id: None,
             priority: req.priority,
+            weight: req.weight,
             region: req.region,
             auth_region: req.auth_region,
             api_region: req.api_region,
             machine_id: req.machine_id,
             email: req.email,
             subscription_title: None, // 将在首次获取使用额度时自动更新
+            overage_status: None,
+            legacy_allow_overage: false,
             proxy_url: req.proxy_url,
             proxy_username: req.proxy_username,
             proxy_password: req.proxy_password,
@@ -741,6 +915,246 @@ impl AdminService {
             credential_id,
             email,
         })
+    }
+
+    pub async fn import_kiro_go_credential(
+        &self,
+        req: KiroGoImportCredentialsRequest,
+    ) -> Result<AddCredentialResponse, AdminServiceError> {
+        let import_refresh_token =
+            Self::clean_import_string(Some(req.refresh_token)).ok_or_else(|| {
+                AdminServiceError::InvalidRequest("refreshToken is required".to_string())
+            })?;
+        let access_token = Self::clean_import_string(req.access_token);
+        let client_id = Self::clean_import_string(req.client_id);
+        let client_secret = Self::clean_import_string(req.client_secret);
+        let provider = Self::clean_import_string(req.provider);
+        let mut token_endpoint = Self::clean_import_string(req.token_endpoint);
+        let mut issuer_url = Self::clean_import_string(req.issuer_url);
+        let mut scopes = Self::clean_import_string(req.scopes);
+        let start_url = Self::clean_import_string(req.start_url);
+        let client_id_hash = Self::clean_import_string(req.client_id_hash);
+        let id_token = Self::clean_import_string(req.id_token);
+        let sso_session_id = Self::clean_import_string(req.sso_session_id);
+        let region =
+            Self::clean_import_string(req.region).unwrap_or_else(|| "us-east-1".to_string());
+        let auth_region = Self::clean_import_string(req.auth_region);
+        let api_region = Self::clean_import_string(req.api_region);
+        let user_id = Self::clean_import_string(req.user_id);
+        let mut email = Self::clean_import_string(req.email);
+        let profile_arn = Self::clean_import_string(req.profile_arn);
+        let proxy_url = Self::clean_import_string(req.proxy_url);
+        let proxy_username = Self::clean_import_string(req.proxy_username);
+        let proxy_password = Self::clean_import_string(req.proxy_password);
+        let overage_status = Self::clean_import_string(req.overage_status);
+        let endpoint = Self::clean_import_string(req.endpoint);
+        if let Some(ref name) = endpoint {
+            if !self.known_endpoints.contains(name) {
+                let mut known: Vec<&str> =
+                    self.known_endpoints.iter().map(|s| s.as_str()).collect();
+                known.sort();
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "未知端点 \"{}\"，已注册端点: {:?}",
+                    name, known
+                )));
+            }
+        }
+        let preferred_id = Self::parse_kiro_go_import_id(req.id.as_ref());
+        let disabled = Self::kiro_go_import_disabled(req.disabled, req.enabled);
+        let concurrency = req.concurrency.filter(|value| *value > 0);
+
+        let mut auth_method = Self::normalize_kiro_go_import_auth_method(
+            req.auth_method.as_deref(),
+            client_id.as_deref(),
+            client_secret.as_deref(),
+            token_endpoint.as_deref(),
+        );
+
+        let derived = kiro_sso::derive_external_idp_endpoints(
+            user_id.as_deref().unwrap_or_default(),
+            client_id.as_deref().unwrap_or_default(),
+            access_token.as_deref().unwrap_or_default(),
+        );
+        if let Some((derived_endpoint, _, _)) = derived.as_ref()
+            && kiro_sso::validate_external_idp_endpoint(derived_endpoint).is_ok()
+            && auth_method != "external_idp"
+        {
+            auth_method = "external_idp".to_string();
+        }
+
+        if auth_method == "external_idp" {
+            if let Some((derived_endpoint, derived_issuer, derived_scopes)) = derived {
+                if token_endpoint.is_none() {
+                    token_endpoint = Some(derived_endpoint);
+                }
+                if issuer_url.is_none() {
+                    issuer_url = Some(derived_issuer);
+                }
+                if scopes.is_none() {
+                    scopes = Some(derived_scopes);
+                }
+            }
+            if client_id.is_none() || token_endpoint.is_none() {
+                return Err(AdminServiceError::InvalidCredential(
+                    "external_idp requires clientId and tokenEndpoint (or userId/accessToken to derive it)".to_string(),
+                ));
+            }
+            if let Some(endpoint) = token_endpoint.as_deref() {
+                kiro_sso::validate_external_idp_endpoint(endpoint).map_err(|e| {
+                    AdminServiceError::InvalidCredential(format!(
+                        "external IdP endpoint rejected: {}",
+                        e
+                    ))
+                })?;
+            }
+            if let Some(issuer) = issuer_url.as_deref() {
+                kiro_sso::validate_external_idp_endpoint(issuer).map_err(|e| {
+                    AdminServiceError::InvalidCredential(format!(
+                        "external IdP issuer rejected: {}",
+                        e
+                    ))
+                })?;
+            }
+        }
+
+        let mut credential = KiroCredentials {
+            id: preferred_id,
+            access_token: None,
+            refresh_token: Some(import_refresh_token),
+            profile_arn,
+            expires_at: None,
+            auth_method: Some(auth_method.clone()),
+            provider,
+            user_id: user_id.clone(),
+            client_id,
+            client_secret,
+            token_endpoint,
+            issuer_url,
+            scopes,
+            start_url,
+            client_id_hash,
+            id_token,
+            sso_session_id,
+            priority: req.priority,
+            weight: req.weight,
+            concurrency,
+            region: Some(region),
+            auth_region,
+            api_region,
+            machine_id: Self::clean_import_string(req.machine_id),
+            email,
+            subscription_title: None,
+            overage_status,
+            legacy_allow_overage: false,
+            proxy_url,
+            proxy_username,
+            proxy_password,
+            disabled,
+            kiro_api_key: None,
+            endpoint,
+        };
+
+        let mut trusted_on_import = false;
+        if auth_method == "external_idp"
+            && let Some(access_token) = access_token
+            && let Some(exp) = kiro_sso::exp_from_access_token_jwt(&access_token)
+            && exp > 0
+        {
+            credential.access_token = Some(access_token);
+            trusted_on_import = true;
+            if let Some(expires_at) = chrono::DateTime::<Utc>::from_timestamp(exp, 0) {
+                credential.expires_at = Some(expires_at.to_rfc3339());
+            }
+        }
+
+        if credential.access_token.is_none() {
+            let config = self.token_manager.config();
+            let global_proxy = config.proxy_url.as_deref().map(|url| {
+                let proxy = ProxyConfig::new(url);
+                match (&config.proxy_username, &config.proxy_password) {
+                    (Some(username), Some(password)) => proxy.with_auth(username, password),
+                    _ => proxy,
+                }
+            });
+            let effective_proxy = credential.effective_proxy(global_proxy.as_ref());
+            credential = refresh_token(&credential, &config, effective_proxy.as_ref())
+                .await
+                .map_err(|e| {
+                    AdminServiceError::InvalidCredential(format!("Token refresh failed: {}", e))
+                })?;
+        }
+
+        if credential.email.is_none()
+            && let Some(access_token) = credential.access_token.as_deref()
+        {
+            credential.email = kiro_sso::extract_email_from_jwt(access_token);
+        }
+        email = credential.email.clone();
+
+        let credential_id = self
+            .token_manager
+            .add_prevalidated_credential(credential)
+            .map_err(|e| self.classify_add_error(e))?;
+
+        if !disabled
+            && !trusted_on_import
+            && let Err(e) = self.token_manager.get_usage_limits_for(credential_id).await
+        {
+            tracing::warn!(
+                "导入 Kiro-Go 凭据后获取订阅等级失败（不影响凭据添加）: {}",
+                e
+            );
+        }
+
+        Ok(AddCredentialResponse {
+            success: true,
+            message: format!("凭据添加成功，ID: {}", credential_id),
+            credential_id,
+            email,
+        })
+    }
+
+    fn clean_import_string(value: Option<String>) -> Option<String> {
+        value
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    }
+
+    fn normalize_kiro_go_import_auth_method(
+        auth_method: Option<&str>,
+        client_id: Option<&str>,
+        client_secret: Option<&str>,
+        token_endpoint: Option<&str>,
+    ) -> String {
+        let method = auth_method
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        match method.as_str() {
+            "external_idp" | "azuread" | "azure" | "entra" | "entra-id" | "entra_id"
+            | "microsoft" | "m365" | "office365" | "external" => "external_idp".to_string(),
+            _ if token_endpoint.is_some() => "external_idp".to_string(),
+            "social" | "google" | "github" => "social".to_string(),
+            "idc" | "builderid" | "builder-id" | "enterprise" | "iam" => "idc".to_string(),
+            "" if client_id.is_some() => "idc".to_string(),
+            "" => "social".to_string(),
+            _ if client_id.is_some() && client_secret.is_some() => "idc".to_string(),
+            _ => "social".to_string(),
+        }
+    }
+
+    fn parse_kiro_go_import_id(value: Option<&serde_json::Value>) -> Option<u64> {
+        match value {
+            Some(serde_json::Value::Number(number)) => number.as_u64().filter(|id| *id > 0),
+            Some(serde_json::Value::String(value)) => {
+                value.trim().parse::<u64>().ok().filter(|id| *id > 0)
+            }
+            _ => None,
+        }
+    }
+
+    fn kiro_go_import_disabled(disabled: Option<bool>, enabled: Option<bool>) -> bool {
+        disabled.unwrap_or_else(|| enabled.map(|value| !value).unwrap_or(false))
     }
 
     /// 删除凭据
@@ -836,17 +1250,19 @@ impl AdminService {
             .entries
             .into_iter()
             .map(|entry| {
-                let balance = disk_cache.get(&entry.id).map(|cached| RuntimeBalanceSnapshot {
-                    subscription_title: cached.data.subscription_title.clone(),
-                    current_usage: cached.data.current_usage,
-                    usage_limit: cached.data.usage_limit,
-                    remaining: cached.data.remaining,
-                    usage_percentage: cached.data.usage_percentage,
-                    next_reset_at: cached.data.next_reset_at,
-                    overage_cap: cached.data.overage_cap,
-                    overage_capability: cached.data.overage_capability.clone(),
-                    overage_status: cached.data.overage_status.clone(),
-                });
+                let balance = disk_cache
+                    .get(&entry.id)
+                    .map(|cached| RuntimeBalanceSnapshot {
+                        subscription_title: cached.data.subscription_title.clone(),
+                        current_usage: cached.data.current_usage,
+                        usage_limit: cached.data.usage_limit,
+                        remaining: cached.data.remaining,
+                        usage_percentage: cached.data.usage_percentage,
+                        next_reset_at: cached.data.next_reset_at,
+                        overage_cap: cached.data.overage_cap,
+                        overage_capability: cached.data.overage_capability.clone(),
+                        overage_status: cached.data.overage_status.clone(),
+                    });
                 RuntimeStatsItem {
                     id: entry.id,
                     last_used_at: entry.last_used_at.clone(),
@@ -874,9 +1290,8 @@ impl AdminService {
             .filter(|e| e.disabled)
             .map(|e| e.id)
             .collect();
-        let (active_ids, skipped_ids): (Vec<u64>, Vec<u64>) = ids
-            .into_iter()
-            .partition(|id| !disabled_ids.contains(id));
+        let (active_ids, skipped_ids): (Vec<u64>, Vec<u64>) =
+            ids.into_iter().partition(|id| !disabled_ids.contains(id));
 
         let semaphore = Arc::new(Semaphore::new(8));
         let mut tasks: JoinSet<BatchRefreshResultItem> = JoinSet::new();
@@ -958,10 +1373,7 @@ impl AdminService {
     /// 单个失败不影响其他凭据，全部完成后返回 `BatchRefreshBalanceResponse`。
     /// 内部直接调用 `token_manager.get_usage_limits_for(id)` 获取最新值，
     /// 不写入余额缓存（与单条 force-refresh 余额端点不同，避免大批量回写抖动）。
-    pub async fn force_refresh_balances_batch(
-        &self,
-        ids: Vec<u64>,
-    ) -> BatchRefreshBalanceResponse {
+    pub async fn force_refresh_balances_batch(&self, ids: Vec<u64>) -> BatchRefreshBalanceResponse {
         // 源头过滤：禁用的凭据直接跳过查询，不占用并发槽位
         let snapshot = self.token_manager.snapshot();
         let disabled_ids: HashSet<u64> = snapshot
@@ -970,9 +1382,8 @@ impl AdminService {
             .filter(|e| e.disabled)
             .map(|e| e.id)
             .collect();
-        let (active_ids, skipped_ids): (Vec<u64>, Vec<u64>) = ids
-            .into_iter()
-            .partition(|id| !disabled_ids.contains(id));
+        let (active_ids, skipped_ids): (Vec<u64>, Vec<u64>) =
+            ids.into_iter().partition(|id| !disabled_ids.contains(id));
 
         // 与单条 fetch_balance 共享同一个全局余额查询 Semaphore（容量 8），
         // 避免批量刷新与零散查询互相抢占
@@ -1097,8 +1508,11 @@ impl AdminService {
         // 同步调度器运行时余额缓存（rank_candidates 派送依据）
         for item in &results {
             if let (true, Some(balance)) = (item.success, item.balance.as_ref()) {
-                self.token_manager
-                    .update_balance_cache_full(item.id, balance.remaining, overage_remaining(balance));
+                self.token_manager.update_balance_cache_full(
+                    item.id,
+                    balance.remaining,
+                    overage_remaining(balance),
+                );
             }
         }
 
@@ -1255,7 +1669,8 @@ impl AdminService {
         let msg = e.to_string();
         if msg.contains("不存在") {
             AdminServiceError::NotFound { id }
-        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据") {
+        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据")
+        {
             AdminServiceError::InvalidCredential(msg)
         } else {
             AdminServiceError::InternalError(msg)
@@ -1283,11 +1698,7 @@ impl AdminService {
     }
 
     /// 设置凭据 endpoint（凭据级 endpoint 覆盖，须命中已注册端点）
-    pub fn set_endpoint(
-        &self,
-        id: u64,
-        endpoint: Option<String>,
-    ) -> Result<(), AdminServiceError> {
+    pub fn set_endpoint(&self, id: u64, endpoint: Option<String>) -> Result<(), AdminServiceError> {
         let endpoint = endpoint
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
@@ -1313,8 +1724,7 @@ impl AdminService {
         let config = self.token_manager.config();
         ProxyConfigResponse {
             proxy_url: config.proxy_url.clone(),
-            has_credentials: config.proxy_username.is_some()
-                && config.proxy_password.is_some(),
+            has_credentials: config.proxy_username.is_some() && config.proxy_password.is_some(),
         }
     }
 
@@ -1338,9 +1748,7 @@ impl AdminService {
                 // 如果未提供新认证信息，保留现有认证
                 if proxy.username.is_none() {
                     let config = self.token_manager.config();
-                    if let (Some(u), Some(p)) =
-                        (&config.proxy_username, &config.proxy_password)
-                    {
+                    if let (Some(u), Some(p)) = (&config.proxy_username, &config.proxy_password) {
                         proxy = proxy.with_auth(u, p);
                     }
                 }
@@ -1371,6 +1779,257 @@ impl AdminService {
         Ok(())
     }
 
+    pub fn get_settings(&self) -> SettingsResponse {
+        let config = self.token_manager.config();
+        SettingsResponse {
+            api_key: config.api_key.clone(),
+            require_api_key: config.require_api_key,
+            port: config.port,
+            host: config.host.clone(),
+            allow_over_usage: config.allow_over_usage,
+        }
+    }
+
+    pub async fn update_settings(
+        &self,
+        req: UpdateSettingsRequest,
+    ) -> Result<(), AdminServiceError> {
+        let new_api_key = req.api_key.clone();
+        let new_require_api_key = req.require_api_key;
+        let new_password = req
+            .password
+            .as_deref()
+            .map(str::trim)
+            .filter(|password| !password.is_empty())
+            .map(str::to_string);
+
+        self.token_manager.with_config_mut(|cfg| {
+            if let Some(api_key) = &req.api_key {
+                cfg.api_key = Some(api_key.trim().to_string()).filter(|s| !s.is_empty());
+            }
+            if let Some(require_api_key) = req.require_api_key {
+                cfg.require_api_key = require_api_key;
+            }
+            if let Some(password) = &new_password {
+                cfg.admin_api_key = Some(password.clone());
+            }
+            if let Some(allow_over_usage) = req.allow_over_usage {
+                cfg.allow_over_usage = allow_over_usage;
+            }
+            cfg.save()
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))
+        })?;
+
+        if let Some(api_key) = new_api_key {
+            *self.client_api_key_runtime.write() = api_key.trim().to_string();
+        }
+        if let Some(require_api_key) = new_require_api_key {
+            self.require_api_key_runtime
+                .store(require_api_key, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(password) = new_password {
+            *self.admin_api_key_runtime.write() = password;
+        }
+
+        Ok(())
+    }
+
+    pub fn get_thinking_config(&self) -> ThinkingConfigResponse {
+        let config = self.token_manager.config();
+        ThinkingConfigResponse {
+            suffix: config.thinking_suffix.clone(),
+            openai_format: config.openai_thinking_format.clone(),
+            claude_format: config.claude_thinking_format.clone(),
+        }
+    }
+
+    pub async fn update_thinking_config(
+        &self,
+        req: UpdateThinkingConfigRequest,
+    ) -> Result<(), AdminServiceError> {
+        fn validate_format(value: &str, field: &str) -> Result<(), AdminServiceError> {
+            if matches!(value, "reasoning_content" | "thinking" | "think") {
+                Ok(())
+            } else {
+                Err(AdminServiceError::InvalidRequest(format!(
+                    "{} 必须是 reasoning_content、thinking 或 think",
+                    field
+                )))
+            }
+        }
+
+        validate_format(&req.openai_format, "openaiFormat")?;
+        validate_format(&req.claude_format, "claudeFormat")?;
+        let suffix = if req.suffix.trim().is_empty() {
+            "-thinking".to_string()
+        } else {
+            req.suffix.trim().to_string()
+        };
+        let openai_format = req.openai_format;
+        let claude_format = req.claude_format;
+
+        self.token_manager.with_config_mut(|cfg| {
+            cfg.thinking_suffix = suffix.clone();
+            cfg.openai_thinking_format = openai_format.clone();
+            cfg.claude_thinking_format = claude_format.clone();
+            cfg.save()
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))
+        })?;
+
+        *self.thinking_config.write() = ThinkingRuntimeConfig {
+            suffix,
+            openai_format,
+            claude_format,
+        };
+
+        Ok(())
+    }
+
+    pub fn get_endpoint_config(&self) -> EndpointConfigResponse {
+        let config = self.token_manager.config();
+        EndpointConfigResponse {
+            preferred_endpoint: config.preferred_endpoint.clone(),
+            endpoint_fallback: config.endpoint_fallback,
+        }
+    }
+
+    pub async fn update_endpoint_config(
+        &self,
+        req: UpdateEndpointConfigRequest,
+    ) -> Result<(), AdminServiceError> {
+        let internal_endpoint = Self::kiro_go_endpoint_to_internal(&req.preferred_endpoint)?;
+        let endpoint_fallback = req.endpoint_fallback;
+
+        self.token_manager.with_config_mut(|cfg| {
+            cfg.preferred_endpoint = req.preferred_endpoint.clone();
+            cfg.default_endpoint = internal_endpoint.to_string();
+            if let Some(value) = endpoint_fallback {
+                cfg.endpoint_fallback = value;
+            }
+            cfg.save()
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))
+        })?;
+
+        let config = self.token_manager.config();
+        self.token_manager
+            .update_default_endpoint(config.default_endpoint.clone());
+        if let Some(provider) = &self.kiro_provider {
+            if let Err(e) = provider.update_default_endpoint(config.default_endpoint.clone()) {
+                tracing::warn!("provider.update_default_endpoint 失败（已持久化）: {}", e);
+            }
+            provider.update_endpoint_fallback(config.endpoint_fallback);
+        }
+
+        Ok(())
+    }
+
+    pub fn get_kiro_go_proxy_config(&self) -> KiroGoProxyConfigResponse {
+        let config = self.token_manager.config();
+        KiroGoProxyConfigResponse {
+            proxy_url: config.proxy_url.unwrap_or_default(),
+        }
+    }
+
+    pub async fn update_kiro_go_proxy_config(
+        &self,
+        req: UpdateProxyConfigRequest,
+    ) -> Result<(), AdminServiceError> {
+        if let Some(proxy_url) = &req.proxy_url {
+            Self::validate_kiro_go_proxy_url(proxy_url)?;
+        }
+        self.update_proxy_config(req).await
+    }
+
+    pub fn get_prompt_filter_config(&self) -> PromptFilterConfigResponse {
+        let config = self.token_manager.config();
+        PromptFilterConfigResponse {
+            filter_claude_code: config.prompt_filter.filter_claude_code,
+            filter_env_noise: config.prompt_filter.filter_env_noise,
+            filter_strip_boundaries: config.prompt_filter.filter_strip_boundaries,
+            rules: config
+                .prompt_filter
+                .rules
+                .iter()
+                .map(Self::prompt_filter_rule_to_dto)
+                .collect(),
+        }
+    }
+
+    pub async fn update_prompt_filter_config(
+        &self,
+        req: UpdatePromptFilterConfigRequest,
+    ) -> Result<(), AdminServiceError> {
+        self.token_manager.with_config_mut(|cfg| {
+            cfg.prompt_filter.filter_claude_code = req.filter_claude_code;
+            cfg.prompt_filter.filter_env_noise = req.filter_env_noise;
+            cfg.prompt_filter.filter_strip_boundaries = req.filter_strip_boundaries;
+            cfg.prompt_filter.rules = req
+                .rules
+                .iter()
+                .map(Self::prompt_filter_rule_from_dto)
+                .collect();
+            cfg.save()
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))
+        })?;
+
+        let config = self.token_manager.config();
+        *self.prompt_filter_config.write() = config.prompt_filter.clone();
+        Ok(())
+    }
+
+    fn kiro_go_endpoint_to_internal(value: &str) -> Result<&'static str, AdminServiceError> {
+        match value {
+            "auto" | "kiro" => Ok(IDE_ENDPOINT_NAME),
+            "codewhisperer" => Ok(CODEWHISPERER_ENDPOINT_NAME),
+            "amazonq" => Ok(CLI_ENDPOINT_NAME),
+            _ => Err(AdminServiceError::InvalidRequest(
+                "preferredEndpoint 必须是 auto、kiro、codewhisperer 或 amazonq".to_string(),
+            )),
+        }
+    }
+
+    fn validate_kiro_go_proxy_url(value: &str) -> Result<(), AdminServiceError> {
+        let value = value.trim();
+        if value.is_empty()
+            || value.starts_with("http://")
+            || value.starts_with("https://")
+            || value.starts_with("socks5://")
+            || value.starts_with("socks5h://")
+        {
+            Ok(())
+        } else {
+            Err(AdminServiceError::InvalidRequest(
+                "proxyURL must start with http://, https://, socks5://, or socks5h://".to_string(),
+            ))
+        }
+    }
+
+    fn prompt_filter_rule_to_dto(
+        rule: &crate::model::config::PromptFilterRule,
+    ) -> PromptFilterRuleDto {
+        PromptFilterRuleDto {
+            id: rule.id.clone(),
+            name: rule.name.clone(),
+            rule_type: rule.rule_type.clone(),
+            match_pattern: rule.match_pattern.clone(),
+            replace: rule.replace.clone(),
+            enabled: rule.enabled,
+        }
+    }
+
+    fn prompt_filter_rule_from_dto(
+        rule: &PromptFilterRuleDto,
+    ) -> crate::model::config::PromptFilterRule {
+        crate::model::config::PromptFilterRule {
+            id: rule.id.clone(),
+            name: rule.name.clone(),
+            enabled: rule.enabled,
+            rule_type: rule.rule_type.clone(),
+            match_pattern: rule.match_pattern.clone(),
+            replace: rule.replace.clone(),
+        }
+    }
+
     /// 获取全局配置
     pub fn get_global_config(&self) -> GlobalConfigResponse {
         let config = self.token_manager.config();
@@ -1388,24 +2047,8 @@ impl AdminService {
             balance_refresh_interval_secs: config.balance_refresh_interval_secs,
             balance_refresh_concurrency: config.balance_refresh_concurrency,
             session_affinity_enabled: config.session_affinity_enabled,
-            truncation_recovery_system_notice: config.truncation_recovery_system_notice,
             privacy_mode: config.privacy_mode,
             compression: CompressionConfigResponse {
-                enabled: c.enabled,
-                whitespace_compression: c.whitespace_compression,
-                thinking_strategy: c.thinking_strategy.clone(),
-                tool_result_max_chars: c.tool_result_max_chars,
-                tool_result_head_lines: c.tool_result_head_lines,
-                tool_result_tail_lines: c.tool_result_tail_lines,
-                tool_use_input_max_chars: c.tool_use_input_max_chars,
-                tool_description_max_chars: c.tool_description_max_chars,
-                max_history_turns: c.max_history_turns,
-                max_history_chars: c.max_history_chars,
-                image_max_long_edge: c.image_max_long_edge,
-                image_max_pixels_single: c.image_max_pixels_single,
-                image_max_pixels_multi: c.image_max_pixels_multi,
-                image_multi_threshold: c.image_multi_threshold,
-                image_compression_enabled: c.image_compression_enabled,
                 max_request_body_bytes: c.max_request_body_bytes,
             },
         }
@@ -1515,10 +2158,6 @@ impl AdminService {
                 cfg.session_affinity_enabled = v;
             }
 
-            if let Some(v) = req.truncation_recovery_system_notice {
-                cfg.truncation_recovery_system_notice = v;
-            }
-
             if let Some(v) = req.privacy_mode {
                 cfg.privacy_mode = v;
             }
@@ -1535,12 +2174,6 @@ impl AdminService {
             self.token_manager.clear_session_affinity();
         }
 
-        // 截断恢复识别开关：直接同步到共享 atomic（converter 下次调用即生效）
-        if let Some(v) = req.truncation_recovery_system_notice {
-            self.truncation_recovery_notice
-                .store(v, std::sync::atomic::Ordering::Relaxed);
-        }
-
         // 热更新 region（注：xkiro 已剔除 credential_rpm，故不存在 update_credential_rpm 同步）
         if req.region.is_some() {
             self.token_manager.update_region(config.region.clone());
@@ -1552,20 +2185,14 @@ impl AdminService {
             self.token_manager
                 .update_default_endpoint(config.default_endpoint.clone());
             if let Some(provider) = &self.kiro_provider {
-                if let Err(e) =
-                    provider.update_default_endpoint(config.default_endpoint.clone())
-                {
-                    tracing::warn!(
-                        "provider.update_default_endpoint 失败（已持久化）: {}",
-                        e
-                    );
+                if let Err(e) = provider.update_default_endpoint(config.default_endpoint.clone()) {
+                    tracing::warn!("provider.update_default_endpoint 失败（已持久化）: {}", e);
                 }
             }
         }
 
         // 热更新 Prompt Cache 运行时配置
-        if req.prompt_cache_ttl_seconds.is_some() || req.prompt_cache_accounting_enabled.is_some()
-        {
+        if req.prompt_cache_ttl_seconds.is_some() || req.prompt_cache_accounting_enabled.is_some() {
             self.prompt_cache_runtime.write().update(
                 req.prompt_cache_ttl_seconds,
                 req.prompt_cache_accounting_enabled,
@@ -1676,28 +2303,23 @@ impl AdminService {
             }
         }
 
-        self.token_manager
-            .with_config_mut(|cfg| {
-                if let Some(v) = req.enabled {
-                    cfg.system_prompt_enabled = v;
-                }
-                if let Some(p) = position {
-                    cfg.system_prompt_position = p;
-                }
-                if let Some(c) = req.custom_content.clone() {
-                    let trimmed = c.trim();
-                    cfg.system_prompt = if trimmed.is_empty() {
-                        None
-                    } else {
-                        Some(c)
-                    };
-                }
-                if let Some(ids) = req.enabled_presets.clone() {
-                    cfg.enabled_presets = ids;
-                }
-                cfg.save()
-                    .map_err(|e| AdminServiceError::InternalError(e.to_string()))
-            })?;
+        self.token_manager.with_config_mut(|cfg| {
+            if let Some(v) = req.enabled {
+                cfg.system_prompt_enabled = v;
+            }
+            if let Some(p) = position {
+                cfg.system_prompt_position = p;
+            }
+            if let Some(c) = req.custom_content.clone() {
+                let trimmed = c.trim();
+                cfg.system_prompt = if trimmed.is_empty() { None } else { Some(c) };
+            }
+            if let Some(ids) = req.enabled_presets.clone() {
+                cfg.enabled_presets = ids;
+            }
+            cfg.save()
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))
+        })?;
 
         // 持久化成功 → 同步运行时
         {
@@ -1710,11 +2332,7 @@ impl AdminService {
             }
             if let Some(c) = req.custom_content {
                 let trimmed = c.trim();
-                rt.custom_content = if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(c)
-                };
+                rt.custom_content = if trimmed.is_empty() { None } else { Some(c) };
             }
             if let Some(ids) = req.enabled_presets {
                 rt.enabled_presets = ids;
@@ -1781,10 +2399,7 @@ impl AdminService {
     }
 
     /// 删除用户预设；同时从 enabled_presets 移除
-    pub fn delete_user_preset(
-        &self,
-        id: &str,
-    ) -> Result<SystemPromptResponse, AdminServiceError> {
+    pub fn delete_user_preset(&self, id: &str) -> Result<SystemPromptResponse, AdminServiceError> {
         let id_owned = id.to_string();
 
         let existed = self
@@ -1818,57 +2433,10 @@ impl AdminService {
 
     /// 将更新请求中的压缩字段应用到目标 CompressionConfig
     ///
-    /// 兼容 BK 11 字段 + xkiro 独有 5 字段（image_*  + max_request_body_bytes）。
     fn apply_compression_fields(
         target: &mut CompressionConfig,
         src: &UpdateCompressionConfigRequest,
     ) {
-        if let Some(v) = src.enabled {
-            target.enabled = v;
-        }
-        if let Some(v) = src.whitespace_compression {
-            target.whitespace_compression = v;
-        }
-        if let Some(ref v) = src.thinking_strategy {
-            target.thinking_strategy = v.clone();
-        }
-        if let Some(v) = src.tool_result_max_chars {
-            target.tool_result_max_chars = v;
-        }
-        if let Some(v) = src.tool_result_head_lines {
-            target.tool_result_head_lines = v;
-        }
-        if let Some(v) = src.tool_result_tail_lines {
-            target.tool_result_tail_lines = v;
-        }
-        if let Some(v) = src.tool_use_input_max_chars {
-            target.tool_use_input_max_chars = v;
-        }
-        if let Some(v) = src.tool_description_max_chars {
-            target.tool_description_max_chars = v;
-        }
-        if let Some(v) = src.max_history_turns {
-            target.max_history_turns = v;
-        }
-        if let Some(v) = src.max_history_chars {
-            target.max_history_chars = v;
-        }
-        // xkiro 独有 5 字段
-        if let Some(v) = src.image_max_long_edge {
-            target.image_max_long_edge = v;
-        }
-        if let Some(v) = src.image_max_pixels_single {
-            target.image_max_pixels_single = v;
-        }
-        if let Some(v) = src.image_max_pixels_multi {
-            target.image_max_pixels_multi = v;
-        }
-        if let Some(v) = src.image_multi_threshold {
-            target.image_multi_threshold = v;
-        }
-        if let Some(v) = src.image_compression_enabled {
-            target.image_compression_enabled = v;
-        }
         if let Some(v) = src.max_request_body_bytes {
             target.max_request_body_bytes = v;
         }
@@ -1901,10 +2469,13 @@ impl AdminService {
                     }
                     None => "social".to_string(),
                 };
-                let provider = match auth_method.as_str() {
-                    "idc" => "BuilderId".to_string(),
-                    _ => "Social".to_string(),
-                };
+                let provider = c
+                    .provider
+                    .clone()
+                    .unwrap_or_else(|| match auth_method.as_str() {
+                        "idc" => "BuilderId".to_string(),
+                        _ => "Social".to_string(),
+                    });
                 Some(ExportTokenJsonItem {
                     provider,
                     refresh_token,
@@ -1912,6 +2483,7 @@ impl AdminService {
                     client_secret: c.client_secret,
                     auth_method,
                     priority: c.priority,
+                    weight: c.weight,
                     region: c.region,
                     api_region: c.api_region,
                     machine_id: c.machine_id,
@@ -1934,9 +2506,7 @@ impl AdminService {
     /// - `authMethod` 取大写 `IdC` / 小写 `social`（KAM 约定）
     /// - `addedAt` 用 RFC3339 当前时间（xkiro 不存添加时间）
     pub fn export_credentials_to_kam(&self, ids: &[u64]) -> Vec<ExportKamItem> {
-        let creds = self
-            .token_manager
-            .export_credentials_with_state_by_ids(ids);
+        let creds = self.token_manager.export_credentials_with_state_by_ids(ids);
         let now = chrono::Local::now().to_rfc3339();
         creds
             .into_iter()
@@ -1962,38 +2532,46 @@ impl AdminService {
                 } else {
                     "social".to_string()
                 };
-                let provider = if is_idc {
-                    if c.client_secret
-                        .as_deref()
-                        .map(|s| s.contains("awsapps.com") || s.contains("initiateLoginUri"))
-                        .unwrap_or(false)
-                    {
-                        "Enterprise".to_string()
+                let provider = c.provider.clone().unwrap_or_else(|| {
+                    if is_idc {
+                        if c.start_url
+                            .as_deref()
+                            .map(|s| {
+                                let url = s.trim().trim_end_matches('/');
+                                !url.is_empty() && url != "https://view.awsapps.com/start"
+                            })
+                            .unwrap_or(false)
+                            || c.client_secret
+                                .as_deref()
+                                .map(|s| {
+                                    s.contains("awsapps.com") || s.contains("initiateLoginUri")
+                                })
+                                .unwrap_or(false)
+                        {
+                            "Enterprise".to_string()
+                        } else {
+                            "BuilderId".to_string()
+                        }
+                    } else if let Some(email) = c.email.as_deref() {
+                        if email.contains("gmail") {
+                            "Google".to_string()
+                        } else if email.contains("github") {
+                            "Github".to_string()
+                        } else {
+                            "Google".to_string()
+                        }
                     } else {
-                        "BuilderId".to_string()
-                    }
-                } else if let Some(email) = c.email.as_deref() {
-                    if email.contains("gmail") {
-                        "Google".to_string()
-                    } else if email.contains("github") {
-                        "Github".to_string()
-                    } else {
                         "Google".to_string()
                     }
-                } else {
-                    "Google".to_string()
-                };
-                let id_str = c
-                    .id
-                    .map(|n| format!("xkiro-{}", n))
-                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                let label = c
-                    .email
-                    .clone()
-                    .unwrap_or_else(|| match c.id {
-                        Some(n) => format!("Kiro #{}", n),
-                        None => "Kiro Account".to_string(),
-                    });
+                });
+                let user_id = c.user_id.clone().or_else(|| c.email.clone());
+                let id_str =
+                    c.id.map(|n| format!("xkiro-{}", n))
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                let label = c.email.clone().unwrap_or_else(|| match c.id {
+                    Some(n) => format!("Kiro #{}", n),
+                    None => "Kiro Account".to_string(),
+                });
                 let status = if enabled { "active" } else { "disabled" };
                 Some(ExportKamItem {
                     id: id_str,
@@ -2005,12 +2583,15 @@ impl AdminService {
                     refresh_token: Some(refresh_token),
                     expires_at: c.expires_at,
                     provider: Some(provider),
-                    user_id: c.email.clone(),
+                    user_id,
                     auth_method: Some(auth_method),
                     client_id: c.client_id,
                     client_secret: c.client_secret,
                     region: c.region,
-                    start_url: None,
+                    client_id_hash: c.client_id_hash,
+                    sso_session_id: c.sso_session_id,
+                    id_token: c.id_token,
+                    start_url: c.start_url,
                     profile_arn: c.profile_arn,
                     machine_id: c.machine_id,
                     enabled,
@@ -2133,9 +2714,19 @@ impl AdminService {
             profile_arn: None,
             expires_at: None,
             auth_method: Some(auth_method),
+            provider: item.provider,
+            user_id: None,
             client_id: item.client_id,
             client_secret: item.client_secret,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
+            start_url: None,
+            client_id_hash: None,
+            id_token: None,
+            sso_session_id: None,
             priority: item.priority,
+            weight: item.weight,
             region,
             auth_region: None,
             api_region,
@@ -2143,6 +2734,8 @@ impl AdminService {
             endpoint: None,
             email: None,
             subscription_title: None,
+            overage_status: None,
+            legacy_allow_overage: false,
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
@@ -2255,5 +2848,2533 @@ impl CreditUsageObserver for AdminService {
         if mutated {
             self.save_balance_cache();
         }
+    }
+}
+
+impl AdminService {
+    // ── Social OAuth 登录 ────────────────────────────────────────────────────
+
+    pub async fn start_social_login(
+        &self,
+        req: StartSocialLoginRequest,
+    ) -> Result<StartSocialLoginResponse, AdminServiceError> {
+        let provider = match req.provider.trim() {
+            "Google" => "Google",
+            "Github" => "Github",
+            other => {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "不支持的 Social 提供方: {}",
+                    other
+                )));
+            }
+        };
+
+        let global_proxy = {
+            let config = self.token_manager.config();
+            config.proxy_url.as_deref().map(ProxyConfig::new)
+        };
+        let proxy = req
+            .proxy_url
+            .as_deref()
+            .map(ProxyConfig::new)
+            .or(global_proxy);
+
+        let auth_endpoint = req
+            .auth_endpoint
+            .unwrap_or_else(|| social::KIRO_AUTH_ENDPOINT.to_string());
+
+        let is_helper = req.mode.as_deref() == Some("helper");
+
+        let expires_at = Utc::now() + chrono::Duration::minutes(10);
+        let session_id = uuid::Uuid::new_v4().to_string();
+
+        let machine_id = if is_helper {
+            None
+        } else {
+            Some(self.generate_machine_id().machine_id)
+        };
+
+        let cred_template = KiroCredentials {
+            auth_method: Some("social".to_string()),
+            priority: req.priority,
+            email: req.email,
+            proxy_url: req.proxy_url,
+            machine_id,
+            ..Default::default()
+        };
+
+        let (mode, portal_url, session) = if is_helper {
+            let session = SocialAuthSession {
+                kind: SocialAuthSessionKind::Helper,
+                auth_endpoint,
+                state: String::new(),
+                code_verifier: String::new(),
+                redirect_uri: String::new(),
+                expires_at,
+                cred_template,
+                proxy,
+                helper_result: None,
+                helper_completing: false,
+            };
+            ("helper".to_string(), None, session)
+        } else {
+            let (code_verifier, code_challenge) = social::generate_pkce();
+            let state = uuid::Uuid::new_v4().to_string();
+            let redirect_uri = social::manual_redirect_uri();
+            let portal_url = social::build_login_url(
+                &auth_endpoint,
+                provider,
+                &state,
+                &code_challenge,
+                &redirect_uri,
+            );
+            let session = SocialAuthSession {
+                kind: SocialAuthSessionKind::Manual,
+                auth_endpoint,
+                state,
+                code_verifier,
+                redirect_uri,
+                expires_at,
+                cred_template,
+                proxy,
+                helper_result: None,
+                helper_completing: false,
+            };
+            ("manual".to_string(), Some(portal_url), session)
+        };
+
+        self.social_sessions
+            .lock()
+            .insert(session_id.clone(), session);
+
+        Ok(StartSocialLoginResponse {
+            session_id,
+            mode,
+            portal_url,
+            expires_at: expires_at.to_rfc3339(),
+        })
+    }
+
+    pub async fn poll_social_login(
+        &self,
+        session_id: &str,
+    ) -> Result<PollSocialLoginResponse, AdminServiceError> {
+        enum PollOutcome {
+            Waiting,
+            Expired,
+            HelperSucceeded(u64),
+            HelperFailed(String),
+        }
+
+        let outcome = {
+            let mut sessions = self.social_sessions.lock();
+            let s = match sessions.get_mut(session_id) {
+                Some(s) => s,
+                None => return Ok(PollSocialLoginResponse::Expired),
+            };
+            match s.kind {
+                SocialAuthSessionKind::Helper => match s.helper_result.take() {
+                    Some(Ok(id)) => PollOutcome::HelperSucceeded(id),
+                    Some(Err(msg)) => PollOutcome::HelperFailed(msg),
+                    None if s.helper_completing => PollOutcome::Waiting,
+                    None if Utc::now() >= s.expires_at => PollOutcome::Expired,
+                    None => PollOutcome::Waiting,
+                },
+                SocialAuthSessionKind::Manual if Utc::now() >= s.expires_at => PollOutcome::Expired,
+                SocialAuthSessionKind::Manual => PollOutcome::Waiting,
+            }
+        };
+
+        match outcome {
+            PollOutcome::Waiting => Ok(PollSocialLoginResponse::Waiting),
+            PollOutcome::Expired => {
+                self.social_sessions.lock().remove(session_id);
+                Ok(PollSocialLoginResponse::Expired)
+            }
+            PollOutcome::HelperSucceeded(credential_id) => {
+                self.social_sessions.lock().remove(session_id);
+                Ok(PollSocialLoginResponse::Success { credential_id })
+            }
+            PollOutcome::HelperFailed(message) => {
+                self.social_sessions.lock().remove(session_id);
+                Ok(PollSocialLoginResponse::Error { message })
+            }
+        }
+    }
+
+    pub async fn complete_social_login_callback(
+        &self,
+        session_id: &str,
+        req: CompleteSocialCallbackRequest,
+    ) -> Result<PollSocialLoginResponse, AdminServiceError> {
+        if req.callback_url.trim().is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "callbackUrl 不能为空".to_string(),
+            ));
+        }
+        let callback = social::callback_from_input(&req.callback_url)
+            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+        self.do_complete_social_login(session_id, callback).await
+    }
+
+    async fn do_complete_social_login(
+        &self,
+        session_id: &str,
+        callback: social::OAuthCallbackData,
+    ) -> Result<PollSocialLoginResponse, AdminServiceError> {
+        {
+            let sessions = self.social_sessions.lock();
+            let session = sessions
+                .get(session_id)
+                .ok_or(AdminServiceError::NotFound { id: 0 })?;
+            if session.kind == SocialAuthSessionKind::Helper {
+                return Ok(PollSocialLoginResponse::Error {
+                    message: "该会话是 helper 模式，不能提交浏览器回调 URL".to_string(),
+                });
+            }
+            if Utc::now() >= session.expires_at {
+                drop(sessions);
+                self.social_sessions.lock().remove(session_id);
+                return Ok(PollSocialLoginResponse::Expired);
+            }
+            if callback.state != session.state {
+                return Ok(PollSocialLoginResponse::Error {
+                    message: "OAuth state 不匹配，请重新发起登录".to_string(),
+                });
+            }
+        }
+
+        let session = self
+            .social_sessions
+            .lock()
+            .remove(session_id)
+            .ok_or(AdminServiceError::NotFound { id: 0 })?;
+        let machine_id = session
+            .cred_template
+            .machine_id
+            .clone()
+            .unwrap_or_else(|| self.generate_machine_id().machine_id);
+
+        let config = self.token_manager.config();
+        let token_resp = social::exchange_code_for_token(
+            &session.auth_endpoint,
+            &callback.code,
+            &session.code_verifier,
+            &session.redirect_uri,
+            &machine_id,
+            &config,
+            session.proxy.as_ref(),
+        )
+        .await
+        .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        let mut new_cred = session.cred_template;
+        if new_cred.machine_id.is_none() {
+            new_cred.machine_id = Some(machine_id);
+        }
+        new_cred.access_token = Some(token_resp.access_token);
+        new_cred.refresh_token = token_resp.refresh_token;
+        new_cred.profile_arn = token_resp.profile_arn;
+
+        if let Some(expires_at) = token_resp.expires_at {
+            new_cred.expires_at = Some(expires_at);
+        } else if let Some(expires_in) = token_resp.expires_in {
+            let ea = Utc::now() + chrono::Duration::seconds(expires_in);
+            new_cred.expires_at = Some(ea.to_rfc3339());
+        }
+
+        let credential_id = self
+            .token_manager
+            .add_credential(new_cred)
+            .await
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        tracing::info!("Social 登录成功，已添加凭据 #{}", credential_id);
+        Ok(PollSocialLoginResponse::Success { credential_id })
+    }
+
+    pub async fn complete_social_login(
+        &self,
+        session_id: &str,
+        req: CompleteSocialLoginRequest,
+    ) -> Result<(), AdminServiceError> {
+        let cred_template = {
+            let mut sessions = self.social_sessions.lock();
+            let session = sessions
+                .get_mut(session_id)
+                .ok_or(AdminServiceError::NotFound { id: 0 })?;
+            if session.kind != SocialAuthSessionKind::Helper {
+                return Err(AdminServiceError::InvalidCredential(
+                    "该会话不是 helper 模式，无法接收回传".to_string(),
+                ));
+            }
+            if session.helper_completing || session.helper_result.is_some() {
+                return Err(AdminServiceError::InvalidCredential(
+                    "该会话已在处理回传，请勿重复提交".to_string(),
+                ));
+            }
+            if Utc::now() >= session.expires_at {
+                return Err(AdminServiceError::InvalidCredential(
+                    "登录会话已过期".to_string(),
+                ));
+            }
+            session.helper_completing = true;
+            session.cred_template.clone()
+        };
+
+        let mut new_cred = cred_template;
+        new_cred.access_token = Some(req.access_token);
+        new_cred.refresh_token = req.refresh_token;
+        new_cred.profile_arn = req.profile_arn;
+        if req.machine_id.is_some() {
+            new_cred.machine_id = req.machine_id;
+        }
+        if let Some(expires_at) = req.expires_at {
+            new_cred.expires_at = Some(expires_at);
+        } else if let Some(expires_in) = req.expires_in {
+            // 来自请求体的 i64，需防溢出：chrono::Duration::seconds 与日期加法都会 panic
+            if let Some(ea) = chrono::Duration::try_seconds(expires_in)
+                .and_then(|d| Utc::now().checked_add_signed(d))
+            {
+                new_cred.expires_at = Some(ea.to_rfc3339());
+            }
+        }
+
+        let result = self
+            .token_manager
+            .add_credential(new_cred)
+            .await
+            .map_err(|e| e.to_string());
+
+        // 写回结果并释放占用；会话此时必然仍在（helper_completing 阻止了 poll 清除）
+        if let Some(session) = self.social_sessions.lock().get_mut(session_id) {
+            session.helper_completing = false;
+            session.helper_result = Some(result.clone());
+        }
+
+        match result {
+            Ok(credential_id) => {
+                tracing::info!("Social helper 回传成功，已添加凭据 #{}", credential_id);
+                Ok(())
+            }
+            Err(e) => Err(AdminServiceError::InternalError(e)),
+        }
+    }
+
+    pub async fn start_idc_login(
+        &self,
+        req: StartIdcLoginRequest,
+    ) -> Result<StartIdcLoginResponse, AdminServiceError> {
+        let global_proxy = {
+            let config = self.token_manager.config();
+            config.proxy_url.as_deref().map(ProxyConfig::new)
+        };
+        let proxy = req
+            .proxy_url
+            .as_deref()
+            .map(ProxyConfig::new)
+            .or(global_proxy);
+
+        let region = req.region.trim().to_string();
+        if region.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "region 不能为空".to_string(),
+            ));
+        }
+
+        let start_url = req
+            .start_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(idc::BUILDER_ID_START_URL);
+
+        let config = self.token_manager.config();
+        let registered = idc::register_client(&region, start_url, &config, proxy.as_ref())
+            .await
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        let device = idc::start_device_authorization(
+            &region,
+            start_url,
+            &registered.client_id,
+            &registered.client_secret,
+            &config,
+            proxy.as_ref(),
+        )
+        .await
+        .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        drop(config);
+
+        let expires_at = Utc::now() + chrono::Duration::seconds(device.expires_in);
+        let session_id = uuid::Uuid::new_v4().to_string();
+
+        let cred_template = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            client_id: Some(registered.client_id.clone()),
+            client_secret: Some(registered.client_secret.clone()),
+            region: Some(region.clone()),
+            priority: req.priority,
+            email: req.email,
+            proxy_url: req.proxy_url,
+            ..Default::default()
+        };
+
+        let session = IdcAuthSession {
+            region,
+            client_id: registered.client_id,
+            client_secret: registered.client_secret,
+            device_code: device.device_code,
+            expires_at,
+            poll_interval: device.interval.max(5),
+            cred_template,
+            proxy,
+        };
+
+        let poll_interval = session.poll_interval;
+        self.idc_sessions.lock().insert(session_id.clone(), session);
+
+        Ok(StartIdcLoginResponse {
+            session_id,
+            user_code: device.user_code,
+            verification_uri: device.verification_uri,
+            verification_uri_complete: device.verification_uri_complete,
+            expires_at: expires_at.to_rfc3339(),
+            poll_interval,
+        })
+    }
+
+    pub async fn start_iam_sso_login(
+        &self,
+        req: StartIdcLoginRequest,
+    ) -> Result<StartIamSsoLoginResponse, AdminServiceError> {
+        let global_proxy = {
+            let config = self.token_manager.config();
+            config.proxy_url.as_deref().map(ProxyConfig::new)
+        };
+        let proxy = req
+            .proxy_url
+            .as_deref()
+            .map(ProxyConfig::new)
+            .or(global_proxy);
+
+        let region = req.region.trim().to_string();
+        if region.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "region 不能为空".to_string(),
+            ));
+        }
+        let start_url = req
+            .start_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                AdminServiceError::InvalidCredential("startUrl is required".to_string())
+            })?;
+
+        let config = self.token_manager.config();
+        let started =
+            idc::start_iam_sso_code_authorization(&region, start_url, &config, proxy.as_ref())
+                .await
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        drop(config);
+        let authorize_url = started.authorize_url.trim().to_string();
+        if authorize_url.is_empty() {
+            return Err(AdminServiceError::InternalError(
+                "IAM SSO 授权链接为空".to_string(),
+            ));
+        }
+
+        let expires_at = Utc::now() + chrono::Duration::seconds(started.expires_in);
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let cred_template = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            client_id: Some(started.client_id.clone()),
+            client_secret: Some(started.client_secret.clone()),
+            region: Some(region.clone()),
+            priority: req.priority,
+            email: req.email,
+            proxy_url: req.proxy_url,
+            ..Default::default()
+        };
+
+        self.iam_sso_code_sessions.lock().insert(
+            session_id.clone(),
+            IamSsoCodeAuthSession {
+                region,
+                client_id: started.client_id,
+                client_secret: started.client_secret,
+                code_verifier: started.code_verifier,
+                state: started.state,
+                redirect_uri: started.redirect_uri,
+                expires_at,
+                cred_template,
+                proxy,
+            },
+        );
+
+        Ok(StartIamSsoLoginResponse {
+            session_id,
+            authorize_url,
+            expires_in: started.expires_in,
+        })
+    }
+
+    pub async fn complete_iam_sso_login(
+        &self,
+        req: CompleteIamSsoLoginRequest,
+    ) -> Result<serde_json::Value, AdminServiceError> {
+        enum SessionState {
+            Missing,
+            Expired,
+            Active {
+                region: String,
+                client_id: String,
+                client_secret: String,
+                code_verifier: String,
+                state: String,
+                redirect_uri: String,
+                proxy: Option<ProxyConfig>,
+                cred_template: KiroCredentials,
+            },
+        }
+
+        let session_state = {
+            let sessions = self.iam_sso_code_sessions.lock();
+            match sessions.get(&req.session_id) {
+                None => SessionState::Missing,
+                Some(session) if Utc::now() >= session.expires_at => SessionState::Expired,
+                Some(session) => SessionState::Active {
+                    region: session.region.clone(),
+                    client_id: session.client_id.clone(),
+                    client_secret: session.client_secret.clone(),
+                    code_verifier: session.code_verifier.clone(),
+                    state: session.state.clone(),
+                    redirect_uri: session.redirect_uri.clone(),
+                    proxy: session.proxy.clone(),
+                    cred_template: session.cred_template.clone(),
+                },
+            }
+        };
+
+        let (
+            region,
+            client_id,
+            client_secret,
+            code_verifier,
+            expected_state,
+            redirect_uri,
+            proxy,
+            cred_template,
+        ) = match session_state {
+            SessionState::Missing => {
+                return Err(AdminServiceError::NotFound { id: 0 });
+            }
+            SessionState::Expired => {
+                self.iam_sso_code_sessions.lock().remove(&req.session_id);
+                return Err(AdminServiceError::InvalidCredential(
+                    "会话已过期".to_string(),
+                ));
+            }
+            SessionState::Active {
+                region,
+                client_id,
+                client_secret,
+                code_verifier,
+                state,
+                redirect_uri,
+                proxy,
+                cred_template,
+            } => (
+                region,
+                client_id,
+                client_secret,
+                code_verifier,
+                state,
+                redirect_uri,
+                proxy,
+                cred_template,
+            ),
+        };
+
+        let params = parse_aws_sso_callback_params(&req.callback_url)?;
+        if let Some(error) = params.get("error").filter(|v| !v.is_empty()) {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "授权失败: {}",
+                error
+            )));
+        }
+        let state = params.get("state").cloned().unwrap_or_default();
+        if state != expected_state {
+            return Err(AdminServiceError::InvalidCredential(
+                "状态不匹配，可能存在安全风险".to_string(),
+            ));
+        }
+        let code = params
+            .get("code")
+            .filter(|v| !v.trim().is_empty())
+            .cloned()
+            .ok_or_else(|| AdminServiceError::InvalidCredential("未收到授权码".to_string()))?;
+
+        let config = self.token_manager.config();
+        let token = idc::exchange_iam_sso_code(
+            &region,
+            &client_id,
+            &client_secret,
+            &code,
+            &code_verifier,
+            &redirect_uri,
+            &config,
+            proxy.as_ref(),
+        )
+        .await
+        .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        drop(config);
+        self.iam_sso_code_sessions.lock().remove(&req.session_id);
+
+        let mut new_cred = cred_template;
+        new_cred.access_token = Some(token.access_token);
+        new_cred.refresh_token = token.refresh_token;
+        if let Some(expires_in) = token.expires_in {
+            let expires_at = Utc::now() + chrono::Duration::seconds(expires_in);
+            new_cred.expires_at = Some(expires_at.to_rfc3339());
+        }
+        if let Some(email) = crate::kiro::auth::kiro_sso::extract_email_from_jwt(
+            new_cred.access_token.as_deref().unwrap_or_default(),
+        ) {
+            new_cred.email = Some(email);
+        }
+
+        let email = new_cred.email.clone();
+        let credential_id = self
+            .token_manager
+            .add_credential(new_cred)
+            .await
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        Ok(serde_json::json!({
+            "success": true,
+            "account": {
+                "id": credential_id,
+                "email": email,
+            },
+        }))
+    }
+
+    pub async fn poll_idc_login(
+        &self,
+        session_id: &str,
+    ) -> Result<PollIdcLoginResponse, AdminServiceError> {
+        enum SessionState {
+            Missing,
+            Expired,
+            Active {
+                region: String,
+                client_id: String,
+                client_secret: String,
+                device_code: String,
+                proxy: Option<ProxyConfig>,
+                cred_template: KiroCredentials,
+            },
+        }
+
+        let session_state = {
+            let sessions = self.idc_sessions.lock();
+            match sessions.get(session_id) {
+                None => SessionState::Missing,
+                Some(session) if Utc::now() >= session.expires_at => SessionState::Expired,
+                Some(session) => SessionState::Active {
+                    region: session.region.clone(),
+                    client_id: session.client_id.clone(),
+                    client_secret: session.client_secret.clone(),
+                    device_code: session.device_code.clone(),
+                    proxy: session.proxy.clone(),
+                    cred_template: session.cred_template.clone(),
+                },
+            }
+        };
+
+        let (region, client_id, client_secret, device_code, proxy, cred_template) =
+            match session_state {
+                SessionState::Missing => return Ok(PollIdcLoginResponse::Expired),
+                SessionState::Expired => {
+                    self.idc_sessions.lock().remove(session_id);
+                    return Ok(PollIdcLoginResponse::Expired);
+                }
+                SessionState::Active {
+                    region,
+                    client_id,
+                    client_secret,
+                    device_code,
+                    proxy,
+                    cred_template,
+                } => (
+                    region,
+                    client_id,
+                    client_secret,
+                    device_code,
+                    proxy,
+                    cred_template,
+                ),
+            };
+
+        let config = self.token_manager.config();
+        let outcome = idc::poll_token(
+            &region,
+            &client_id,
+            &client_secret,
+            &device_code,
+            &config,
+            proxy.as_ref(),
+        )
+        .await;
+        drop(config);
+
+        match outcome {
+            idc::PollResult::Pending => Ok(PollIdcLoginResponse::Pending),
+            idc::PollResult::SlowDown => Ok(PollIdcLoginResponse::Pending),
+            idc::PollResult::Expired => {
+                self.idc_sessions.lock().remove(session_id);
+                Ok(PollIdcLoginResponse::Expired)
+            }
+            idc::PollResult::Error(error) => {
+                self.idc_sessions.lock().remove(session_id);
+                Err(AdminServiceError::InternalError(error.to_string()))
+            }
+            idc::PollResult::Success(token) => {
+                self.idc_sessions.lock().remove(session_id);
+
+                let mut new_cred = cred_template;
+                new_cred.access_token = Some(token.access_token);
+                new_cred.refresh_token = token.refresh_token;
+                if let Some(expires_in) = token.expires_in {
+                    let expires_at = Utc::now() + chrono::Duration::seconds(expires_in);
+                    new_cred.expires_at = Some(expires_at.to_rfc3339());
+                }
+
+                let credential_id = self
+                    .token_manager
+                    .add_credential(new_cred)
+                    .await
+                    .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+                tracing::info!("IdC 登录成功，已添加凭据 #{}", credential_id);
+                Ok(PollIdcLoginResponse::Success { credential_id })
+            }
+        }
+    }
+
+    // ========================================================================
+    // 请求日志和统计
+    // ========================================================================
+
+    /// 获取请求统计引用（用于外部记录）
+    pub fn request_stats(&self) -> super::stats::SharedRequestStats {
+        self.request_stats.clone()
+    }
+
+    /// 获取请求日志（最新在前）
+    pub fn get_request_logs(&self) -> super::types::RequestLogsResponse {
+        let logs = self.request_stats.get_logs();
+        let total = logs.len();
+        super::types::RequestLogsResponse { logs, total }
+    }
+
+    /// 清空请求日志
+    pub fn clear_request_logs(&self) {
+        self.request_stats.clear_logs();
+    }
+
+    /// 获取系统状态
+    pub fn get_system_status(&self) -> super::types::SystemStatusResponse {
+        let snapshot = self.token_manager.snapshot();
+        let available = snapshot.entries.iter().filter(|e| !e.disabled).count();
+
+        super::types::SystemStatusResponse {
+            status: "ok".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            uptime: self.request_stats.uptime(),
+            total_requests: self.request_stats.total_requests(),
+            success_requests: self.request_stats.success_requests(),
+            failed_requests: self.request_stats.failed_requests(),
+            total_tokens: self.request_stats.total_tokens(),
+            total_credits: self.request_stats.total_credits(),
+            credentials_total: snapshot.entries.len(),
+            credentials_available: available,
+        }
+    }
+
+    /// 获取详细统计
+    pub fn get_stats(&self) -> super::types::StatsResponse {
+        let snapshot = self.token_manager.snapshot();
+        let available = snapshot.entries.iter().filter(|e| !e.disabled).count();
+
+        super::types::StatsResponse {
+            total_requests: self.request_stats.total_requests(),
+            success_requests: self.request_stats.success_requests(),
+            failed_requests: self.request_stats.failed_requests(),
+            total_tokens: self.request_stats.total_tokens(),
+            total_credits: self.request_stats.total_credits(),
+            uptime: self.request_stats.uptime(),
+            credentials_total: snapshot.entries.len(),
+            credentials_available: available,
+        }
+    }
+
+    /// 重置统计
+    pub fn reset_stats(&self) {
+        self.request_stats.reset();
+    }
+
+    /// 获取版本信息
+    pub fn get_version(&self) -> super::types::VersionResponse {
+        super::types::VersionResponse {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            name: "xkiro.rs".to_string(),
+        }
+    }
+
+    /// 生成 Machine ID
+    pub fn generate_machine_id(&self) -> super::types::GenerateMachineIdResponse {
+        let uuid = uuid::Uuid::new_v4().to_string();
+        // 格式化为 64 位十六进制字符串（与 Kiro IDE 一致）
+        let machine_id = format!("{:0>64}", uuid.replace('-', ""));
+        super::types::GenerateMachineIdResponse { machine_id }
+    }
+
+    // ========================================================================
+    // 凭据连通性测试
+    // ========================================================================
+
+    /// 测试凭据连通性
+    pub async fn test_credential(
+        &self,
+        id: u64,
+    ) -> Result<super::types::CredentialTestResponse, AdminServiceError> {
+        let snapshot = self.token_manager.snapshot();
+        let entry = snapshot
+            .entries
+            .iter()
+            .find(|e| e.id == id)
+            .ok_or_else(|| AdminServiceError::NotFound { id })?;
+
+        if entry.disabled {
+            return Ok(super::types::CredentialTestResponse {
+                success: false,
+                message: "凭据已禁用".to_string(),
+                error: Some("credential_disabled".to_string()),
+            });
+        }
+
+        // 尝试获取 usage limits 作为连通性测试
+        match self.token_manager.get_usage_limits_for(id).await {
+            Ok(_) => Ok(super::types::CredentialTestResponse {
+                success: true,
+                message: "连通性测试成功".to_string(),
+                error: None,
+            }),
+            Err(e) => Ok(super::types::CredentialTestResponse {
+                success: false,
+                message: "连通性测试失败".to_string(),
+                error: Some(e.to_string()),
+            }),
+        }
+    }
+
+    // ========================================================================
+    // 批量操作
+    // ========================================================================
+
+    /// 批量操作凭据
+    pub async fn batch_operation(
+        &self,
+        request: super::types::BatchOperationRequest,
+    ) -> Result<super::types::BatchOperationResponse, AdminServiceError> {
+        let mut results = Vec::new();
+        let mut success_count = 0;
+        let mut failure_count = 0;
+
+        for id in request.ids {
+            let result = match request.action.as_str() {
+                "enable" => match self.set_disabled(id, false) {
+                    Ok(_) => {
+                        success_count += 1;
+                        super::types::BatchOperationResultItem {
+                            id,
+                            success: true,
+                            error: None,
+                        }
+                    }
+                    Err(e) => {
+                        failure_count += 1;
+                        super::types::BatchOperationResultItem {
+                            id,
+                            success: false,
+                            error: Some(e.to_string()),
+                        }
+                    }
+                },
+                "disable" => match self.set_disabled(id, true) {
+                    Ok(_) => {
+                        success_count += 1;
+                        super::types::BatchOperationResultItem {
+                            id,
+                            success: true,
+                            error: None,
+                        }
+                    }
+                    Err(e) => {
+                        failure_count += 1;
+                        super::types::BatchOperationResultItem {
+                            id,
+                            success: false,
+                            error: Some(e.to_string()),
+                        }
+                    }
+                },
+                "refresh" => match self.force_refresh_token(id).await {
+                    Ok(_) => {
+                        success_count += 1;
+                        super::types::BatchOperationResultItem {
+                            id,
+                            success: true,
+                            error: None,
+                        }
+                    }
+                    Err(e) => {
+                        failure_count += 1;
+                        super::types::BatchOperationResultItem {
+                            id,
+                            success: false,
+                            error: Some(e.to_string()),
+                        }
+                    }
+                },
+                _ => {
+                    failure_count += 1;
+                    super::types::BatchOperationResultItem {
+                        id,
+                        success: false,
+                        error: Some(format!("未知操作: {}", request.action)),
+                    }
+                }
+            };
+            results.push(result);
+        }
+
+        Ok(super::types::BatchOperationResponse {
+            results,
+            success_count,
+            failure_count,
+        })
+    }
+
+    // ========================================================================
+    // SSO Token 导入
+    // ========================================================================
+
+    /// 从 SSO Token 导入凭据
+    pub async fn import_sso_token(
+        &self,
+        request: super::types::ImportSsoTokenRequest,
+    ) -> Result<super::types::ImportSsoTokenResponse, AdminServiceError> {
+        let tokens: Vec<&str> = request
+            .token
+            .split('\n')
+            .map(|t| t.trim())
+            .filter(|t| !t.is_empty())
+            .collect();
+
+        if tokens.is_empty() {
+            return Err(AdminServiceError::InvalidRequest(
+                "未提供有效的 SSO Token".to_string(),
+            ));
+        }
+
+        let mut results = Vec::new();
+        let mut success_count = 0;
+        let mut failure_count = 0;
+
+        for (index, token) in tokens.iter().enumerate() {
+            match self
+                .import_single_sso_token(
+                    token,
+                    &request.region,
+                    request.priority,
+                    request.email.as_deref(),
+                    request.proxy_url.as_deref(),
+                )
+                .await
+            {
+                Ok(credential_id) => {
+                    success_count += 1;
+                    results.push(super::types::SsoTokenImportResultItem {
+                        index,
+                        success: true,
+                        credential_id: Some(credential_id),
+                        email: None,
+                        error: None,
+                    });
+                }
+                Err(e) => {
+                    failure_count += 1;
+                    results.push(super::types::SsoTokenImportResultItem {
+                        index,
+                        success: false,
+                        credential_id: None,
+                        email: None,
+                        error: Some(e.to_string()),
+                    });
+                }
+            }
+        }
+
+        Ok(super::types::ImportSsoTokenResponse {
+            results,
+            success_count,
+            failure_count,
+        })
+    }
+
+    /// 导入单个 SSO Token
+    async fn import_single_sso_token(
+        &self,
+        bearer_token: &str,
+        region: &str,
+        priority: u32,
+        email: Option<&str>,
+        proxy_url: Option<&str>,
+    ) -> Result<u64, AdminServiceError> {
+        let proxy_config = proxy_url.map(|url| {
+            let proxy = crate::http_client::ProxyConfig::new(url);
+            proxy
+        });
+
+        // 使用完整的 7 步 SSO Token 导入流程
+        let token = crate::kiro::auth::idc::import_sso_token(
+            bearer_token,
+            region,
+            &self.token_manager.config(),
+            proxy_config.as_ref(),
+        )
+        .await
+        .map_err(|e| AdminServiceError::InternalError(format!("SSO Token 导入失败: {}", e)))?;
+
+        let new_cred = Self::sso_token_credential_from_import(token, region, priority, email);
+
+        let credential_id = self
+            .token_manager
+            .add_credential(new_cred)
+            .await
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        tracing::info!("SSO Token 导入成功，已添加凭据 #{}", credential_id);
+        Ok(credential_id)
+    }
+
+    fn sso_token_credential_from_import(
+        token: idc::ImportedSsoToken,
+        region: &str,
+        priority: u32,
+        email: Option<&str>,
+    ) -> KiroCredentials {
+        let mut new_cred = KiroCredentials {
+            access_token: Some(token.access_token),
+            refresh_token: token.refresh_token,
+            auth_method: Some("idc".to_string()),
+            client_id: Some(token.client_id),
+            client_secret: Some(token.client_secret),
+            priority,
+            region: Some(region.to_string()),
+            ..Default::default()
+        };
+
+        if let Some(expires_in) = token.expires_in {
+            let expires_at = Utc::now() + chrono::Duration::seconds(expires_in);
+            new_cred.expires_at = Some(expires_at.to_rfc3339());
+        }
+
+        if let Some(email) = email {
+            new_cred.email = Some(email.to_string());
+        }
+
+        new_cred
+    }
+
+    // ========================================================================
+    // Builder ID 登录
+    // ========================================================================
+
+    fn builder_id_credential_template(
+        client_id: String,
+        client_secret: String,
+        region: String,
+        priority: u32,
+        email: Option<String>,
+        proxy_url: Option<String>,
+    ) -> KiroCredentials {
+        KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            client_id: Some(client_id),
+            client_secret: Some(client_secret),
+            priority,
+            region: Some(region),
+            email,
+            proxy_url,
+            ..Default::default()
+        }
+    }
+
+    fn builder_id_expires_in(expires_in: i64) -> i64 {
+        if expires_in > 0 { expires_in } else { 600 }
+    }
+
+    /// 启动 Builder ID 登录
+    pub async fn start_builder_id_login(
+        &self,
+        request: super::types::StartBuilderIdLoginRequest,
+    ) -> Result<super::types::StartBuilderIdLoginResponse, AdminServiceError> {
+        let region = request.region.trim();
+        let region = if region.is_empty() {
+            "us-east-1".to_string()
+        } else {
+            region.to_string()
+        };
+        let proxy_config = request.proxy_url.as_ref().map(|url| {
+            let proxy = crate::http_client::ProxyConfig::new(url);
+            proxy
+        });
+
+        let config = self.token_manager.config();
+        let registered = crate::kiro::auth::idc::register_client(
+            &region,
+            crate::kiro::auth::idc::BUILDER_ID_START_URL,
+            &config,
+            proxy_config.as_ref(),
+        )
+        .await
+        .map_err(|e| {
+            AdminServiceError::InternalError(format!("注册 Builder ID 客户端失败: {}", e))
+        })?;
+        let device = crate::kiro::auth::idc::start_device_authorization(
+            &region,
+            crate::kiro::auth::idc::BUILDER_ID_START_URL,
+            &registered.client_id,
+            &registered.client_secret,
+            &config,
+            proxy_config.as_ref(),
+        )
+        .await
+        .map_err(|e| {
+            AdminServiceError::InternalError(format!("启动 Builder ID 设备授权失败: {}", e))
+        })?;
+        drop(config);
+
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let expires_in = Self::builder_id_expires_in(device.expires_in);
+        let expires_at = Utc::now() + chrono::Duration::seconds(expires_in);
+        let verification_uri = device
+            .verification_uri_complete
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| device.verification_uri.clone());
+
+        let cred_template = Self::builder_id_credential_template(
+            registered.client_id.clone(),
+            registered.client_secret.clone(),
+            region.clone(),
+            request.priority,
+            request.email,
+            request.proxy_url,
+        );
+
+        self.builder_id_sessions.lock().insert(
+            session_id.clone(),
+            BuilderIdAuthSession {
+                region: region.clone(),
+                client_id: registered.client_id,
+                client_secret: registered.client_secret,
+                device_code: device.device_code,
+                user_code: device.user_code.clone(),
+                verification_uri: verification_uri.clone(),
+                verification_uri_complete: device.verification_uri_complete.clone(),
+                expires_at,
+                poll_interval: device.interval.max(5),
+                cred_template,
+                proxy: proxy_config,
+            },
+        );
+
+        Ok(super::types::StartBuilderIdLoginResponse {
+            session_id,
+            user_code: device.user_code,
+            verification_uri,
+            verification_uri_complete: device.verification_uri_complete,
+            poll_interval: device.interval.max(5),
+            expires_in,
+        })
+    }
+
+    pub async fn complete_builder_id_login(
+        &self,
+        _req: CompleteIamSsoLoginRequest,
+    ) -> Result<serde_json::Value, AdminServiceError> {
+        Err(AdminServiceError::InvalidRequest(
+            "Builder ID 使用设备码轮询流程，请调用 /auth/builderid/poll".to_string(),
+        ))
+    }
+
+    /// 轮询 Builder ID 登录状态
+    pub async fn poll_builder_id_login(
+        &self,
+        session_id: &str,
+    ) -> Result<super::types::PollBuilderIdLoginResponse, AdminServiceError> {
+        let session = {
+            let sessions = self.builder_id_sessions.lock();
+            sessions.get(session_id).cloned().ok_or_else(|| {
+                AdminServiceError::InvalidRequest(format!("Builder ID 会话 {} 不存在", session_id))
+            })?
+        };
+
+        if Utc::now() > session.expires_at {
+            self.builder_id_sessions.lock().remove(session_id);
+            return Ok(super::types::PollBuilderIdLoginResponse::Expired);
+        }
+
+        match crate::kiro::auth::idc::poll_token(
+            &session.region,
+            &session.client_id,
+            &session.client_secret,
+            &session.device_code,
+            &self.token_manager.config(),
+            session.proxy.as_ref(),
+        )
+        .await
+        {
+            crate::kiro::auth::idc::PollResult::Success(token) => {
+                self.builder_id_sessions.lock().remove(session_id);
+
+                let mut new_cred = session.cred_template;
+                new_cred.access_token = Some(token.access_token);
+                new_cred.refresh_token = token.refresh_token;
+                if let Some(expires_in) = token.expires_in {
+                    let expires_at = Utc::now() + chrono::Duration::seconds(expires_in);
+                    new_cred.expires_at = Some(expires_at.to_rfc3339());
+                }
+                if let Some(email) = crate::kiro::auth::kiro_sso::extract_email_from_jwt(
+                    new_cred.access_token.as_deref().unwrap_or_default(),
+                ) {
+                    new_cred.email = Some(email);
+                }
+                let email = new_cred.email.clone();
+
+                let credential_id = self
+                    .token_manager
+                    .add_credential(new_cred)
+                    .await
+                    .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+                tracing::info!("Builder ID 登录成功，已添加凭据 #{}", credential_id);
+                Ok(super::types::PollBuilderIdLoginResponse::Success {
+                    credential_id,
+                    email,
+                })
+            }
+            crate::kiro::auth::idc::PollResult::Pending => {
+                Ok(super::types::PollBuilderIdLoginResponse::Pending {
+                    interval: session.poll_interval,
+                })
+            }
+            crate::kiro::auth::idc::PollResult::SlowDown => {
+                let mut interval = session.poll_interval + 5;
+                if let Some(session) = self.builder_id_sessions.lock().get_mut(session_id) {
+                    session.poll_interval = interval;
+                } else {
+                    interval = 5;
+                }
+                Ok(super::types::PollBuilderIdLoginResponse::Pending { interval })
+            }
+            crate::kiro::auth::idc::PollResult::Expired => {
+                self.builder_id_sessions.lock().remove(session_id);
+                Ok(super::types::PollBuilderIdLoginResponse::Expired)
+            }
+            crate::kiro::auth::idc::PollResult::Error(e) => {
+                self.builder_id_sessions.lock().remove(session_id);
+                Ok(super::types::PollBuilderIdLoginResponse::Error {
+                    message: e.to_string(),
+                })
+            }
+        }
+    }
+
+    // ========================================================================
+    // Kiro hosted SSO（Microsoft 365 / Entra ID）
+    // ========================================================================
+
+    pub async fn start_kiro_sso_login(
+        &self,
+        request: StartKiroSsoLoginRequest,
+    ) -> Result<StartKiroSsoLoginResponse, AdminServiceError> {
+        let global_proxy = {
+            let config = self.token_manager.config();
+            config.proxy_url.as_deref().map(ProxyConfig::new)
+        };
+        let config = self.token_manager.config();
+        let started = kiro_sso::start_login_manual(&config, global_proxy.clone())
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        drop(config);
+        let sign_in_url = started.sign_in_url.trim().to_string();
+        if sign_in_url.is_empty() {
+            return Err(AdminServiceError::InternalError(
+                "Microsoft SSO 登录链接为空".to_string(),
+            ));
+        }
+
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let expires_at = Utc::now() + chrono::Duration::minutes(10);
+        let region = request
+            .region
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .unwrap_or("us-east-1")
+            .to_string();
+
+        let session = KiroSsoAuthSession {
+            callback_rx: tokio::sync::Mutex::new(started.callback_rx),
+            manual_callback_tx: started.manual_callback_tx,
+            expires_at,
+            cred_template: KiroCredentials {
+                region: Some(region),
+                machine_id: Some(self.generate_machine_id().machine_id),
+                ..Default::default()
+            },
+            proxy: global_proxy,
+            _server_handle: started.server_handle,
+        };
+        self.kiro_sso_sessions
+            .lock()
+            .insert(session_id.clone(), session);
+
+        Ok(StartKiroSsoLoginResponse {
+            session_id,
+            sign_in_url,
+            interval: 2,
+        })
+    }
+
+    pub async fn cancel_kiro_sso_login(&self, session_id: &str) {
+        self.kiro_sso_sessions.lock().remove(session_id);
+    }
+
+    pub async fn complete_kiro_sso_login_callback(
+        &self,
+        request: CompleteKiroSsoLoginRequest,
+    ) -> Result<CompleteKiroSsoLoginResponse, AdminServiceError> {
+        if request.callback_url.trim().is_empty() {
+            return Err(AdminServiceError::InvalidRequest(
+                "callbackUrl 不能为空".to_string(),
+            ));
+        }
+
+        let manual_callback_tx = {
+            let sessions = self.kiro_sso_sessions.lock();
+            let Some(session) = sessions.get(&request.session_id) else {
+                return Err(AdminServiceError::InvalidRequest(
+                    "Kiro SSO 会话不存在".to_string(),
+                ));
+            };
+            if Utc::now() >= session.expires_at {
+                drop(sessions);
+                self.kiro_sso_sessions.lock().remove(&request.session_id);
+                return Ok(CompleteKiroSsoLoginResponse {
+                    success: false,
+                    status: "expired".to_string(),
+                    redirect_url: None,
+                    error: Some("SSO login timed out".to_string()),
+                });
+            }
+            session.manual_callback_tx.clone()
+        };
+
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        manual_callback_tx
+            .send(kiro_sso::ManualCallbackRequest {
+                callback_url: request.callback_url,
+                response_tx,
+            })
+            .await
+            .map_err(|_| AdminServiceError::InvalidRequest("Kiro SSO 会话已结束".to_string()))?;
+
+        let result = response_rx.await.map_err(|_| {
+            AdminServiceError::InvalidRequest("Kiro SSO 回调处理已结束".to_string())
+        })?;
+
+        Ok(match result {
+            kiro_sso::ManualCallbackResult::Pending => CompleteKiroSsoLoginResponse {
+                success: true,
+                status: "pending".to_string(),
+                redirect_url: None,
+                error: None,
+            },
+            kiro_sso::ManualCallbackResult::Redirect(url) => {
+                let redirect_url = url.trim().to_string();
+                if redirect_url.is_empty() {
+                    return Err(AdminServiceError::InternalError(
+                        "Microsoft SSO 下一步登录链接为空".to_string(),
+                    ));
+                }
+                CompleteKiroSsoLoginResponse {
+                    success: true,
+                    status: "redirect".to_string(),
+                    redirect_url: Some(redirect_url),
+                    error: None,
+                }
+            }
+            kiro_sso::ManualCallbackResult::Submitted => CompleteKiroSsoLoginResponse {
+                success: true,
+                status: "submitted".to_string(),
+                redirect_url: None,
+                error: None,
+            },
+            kiro_sso::ManualCallbackResult::Failed(error) => CompleteKiroSsoLoginResponse {
+                success: false,
+                status: "error".to_string(),
+                redirect_url: None,
+                error: Some(error),
+            },
+        })
+    }
+
+    pub async fn poll_kiro_sso_login(
+        &self,
+        session_id: &str,
+    ) -> Result<PollKiroSsoLoginResponse, AdminServiceError> {
+        use tokio::sync::oneshot::error::TryRecvError;
+
+        enum Outcome {
+            Waiting,
+            Expired,
+            Cancelled,
+            Received(kiro_sso::KiroSsoCapture),
+        }
+
+        let outcome = {
+            let sessions = self.kiro_sso_sessions.lock();
+            let Some(session) = sessions.get(session_id) else {
+                return Ok(PollKiroSsoLoginResponse {
+                    success: false,
+                    completed: false,
+                    status: None,
+                    error: Some("session not found or expired".to_string()),
+                    account: None,
+                });
+            };
+            if Utc::now() >= session.expires_at {
+                Outcome::Expired
+            } else {
+                match session.callback_rx.try_lock() {
+                    Err(_) => Outcome::Waiting,
+                    Ok(mut rx) => match rx.try_recv() {
+                        Err(TryRecvError::Empty) => Outcome::Waiting,
+                        Err(TryRecvError::Closed) => Outcome::Cancelled,
+                        Ok(capture) => Outcome::Received(capture),
+                    },
+                }
+            }
+        };
+
+        match outcome {
+            Outcome::Waiting => Ok(PollKiroSsoLoginResponse {
+                success: true,
+                completed: false,
+                status: Some("pending".to_string()),
+                error: None,
+                account: None,
+            }),
+            Outcome::Expired => {
+                self.kiro_sso_sessions.lock().remove(session_id);
+                Ok(PollKiroSsoLoginResponse {
+                    success: false,
+                    completed: false,
+                    status: None,
+                    error: Some("SSO login timed out".to_string()),
+                    account: None,
+                })
+            }
+            Outcome::Cancelled => {
+                self.kiro_sso_sessions.lock().remove(session_id);
+                Ok(PollKiroSsoLoginResponse {
+                    success: false,
+                    completed: false,
+                    status: None,
+                    error: Some("登录已被取消".to_string()),
+                    account: None,
+                })
+            }
+            Outcome::Received(capture) => self.complete_kiro_sso_login(session_id, capture).await,
+        }
+    }
+
+    async fn complete_kiro_sso_login(
+        &self,
+        session_id: &str,
+        capture: kiro_sso::KiroSsoCapture,
+    ) -> Result<PollKiroSsoLoginResponse, AdminServiceError> {
+        let session = self
+            .kiro_sso_sessions
+            .lock()
+            .remove(session_id)
+            .ok_or_else(|| AdminServiceError::InvalidRequest("Kiro SSO 会话不存在".to_string()))?;
+
+        let config = self.token_manager.config();
+        let mut new_cred = session.cred_template;
+        match capture.kind {
+            kiro_sso::KiroSsoCaptureKind::Social => {
+                let machine_id = new_cred
+                    .machine_id
+                    .clone()
+                    .unwrap_or_else(|| self.generate_machine_id().machine_id);
+                new_cred.machine_id = Some(machine_id.clone());
+                let token = kiro_sso::exchange_social_code(
+                    &capture.code,
+                    &capture.code_verifier,
+                    &capture.redirect_uri,
+                    &machine_id,
+                    &config,
+                    session.proxy.as_ref(),
+                )
+                .await
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+                let email = kiro_sso::extract_email_from_jwt(&token.access_token);
+                new_cred.access_token = Some(token.access_token);
+                new_cred.refresh_token = token.refresh_token;
+                new_cred.profile_arn = token.profile_arn;
+                new_cred.auth_method = Some("social".to_string());
+                new_cred.email = email;
+                if let Some(expires_at) = token.expires_at {
+                    new_cred.expires_at = Some(expires_at);
+                } else if let Some(expires_in) = token.expires_in {
+                    new_cred.expires_at =
+                        Some((Utc::now() + chrono::Duration::seconds(expires_in)).to_rfc3339());
+                }
+            }
+            kiro_sso::KiroSsoCaptureKind::ExternalIdp => {
+                let token_endpoint = capture.token_endpoint.as_deref().ok_or_else(|| {
+                    AdminServiceError::InvalidRequest("缺少 tokenEndpoint".to_string())
+                })?;
+                let client_id = capture.client_id.as_deref().ok_or_else(|| {
+                    AdminServiceError::InvalidRequest("缺少 clientId".to_string())
+                })?;
+                let token = kiro_sso::exchange_external_idp_code(
+                    token_endpoint,
+                    client_id,
+                    &capture.code,
+                    &capture.code_verifier,
+                    &capture.redirect_uri,
+                    capture.scopes.as_deref(),
+                    &config,
+                    session.proxy.as_ref(),
+                )
+                .await
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+                let email = kiro_sso::extract_email_from_jwt(&token.access_token);
+                new_cred.access_token = Some(token.access_token);
+                new_cred.refresh_token = token.refresh_token;
+                new_cred.auth_method = Some("external_idp".to_string());
+                new_cred.client_id = Some(client_id.to_string());
+                new_cred.token_endpoint = capture.token_endpoint;
+                new_cred.issuer_url = capture.issuer_url;
+                new_cred.scopes = capture.scopes;
+                new_cred.email = email;
+                if let Some(expires_in) = token.expires_in {
+                    new_cred.expires_at =
+                        Some((Utc::now() + chrono::Duration::seconds(expires_in)).to_rfc3339());
+                }
+            }
+        }
+        drop(config);
+
+        let email = new_cred.email.clone();
+        let auth_method = new_cred.auth_method.clone();
+        let credential_id = self
+            .token_manager
+            .add_credential(new_cred)
+            .await
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        Ok(PollKiroSsoLoginResponse {
+            success: true,
+            completed: true,
+            status: None,
+            error: None,
+            account: Some(KiroSsoAccountResponse {
+                id: credential_id,
+                email,
+                auth_method,
+            }),
+        })
+    }
+
+    // ========================================================================
+    // API Key 管理
+    // ========================================================================
+
+    /// 从磁盘加载 API Keys
+    fn load_api_keys_from(path: &Option<PathBuf>) -> Vec<super::types::ApiKeyEntry> {
+        if let Some(path) = path {
+            if path.exists() {
+                match std::fs::read_to_string(path) {
+                    Ok(data) => match serde_json::from_str(&data) {
+                        Ok(keys) => return keys,
+                        Err(e) => {
+                            tracing::warn!("解析 API Keys 文件失败: {}", e);
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!("读取 API Keys 文件失败: {}", e);
+                    }
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    pub fn load_api_keys_runtime(cache_dir: Option<&std::path::Path>) -> SharedApiKeys {
+        let path = cache_dir.map(|d| d.join("kiro_api_keys.json"));
+        Arc::new(RwLock::new(Self::load_api_keys_from(&path)))
+    }
+
+    pub fn load_api_keys_runtime_with_legacy(
+        cache_dir: Option<&std::path::Path>,
+        legacy_api_key: Option<&str>,
+        require_api_key: bool,
+    ) -> SharedApiKeys {
+        let path = cache_dir.map(|d| d.join("kiro_api_keys.json"));
+        let mut keys = Self::load_api_keys_from(&path);
+        let legacy_api_key = legacy_api_key.map(str::trim).filter(|key| !key.is_empty());
+
+        if keys.is_empty() {
+            if let Some(legacy_api_key) = legacy_api_key {
+                keys.push(super::types::ApiKeyEntry {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    name: Some("legacy-api-key".to_string()),
+                    key: legacy_api_key.to_string(),
+                    enabled: require_api_key,
+                    created_at: Utc::now().timestamp(),
+                    last_used_at: None,
+                    token_limit: 0,
+                    credit_limit: 0.0,
+                    tokens_used: 0,
+                    credits_used: 0.0,
+                    requests_count: 0,
+                });
+
+                if let Some(path) = &path {
+                    match serde_json::to_string_pretty(&keys) {
+                        Ok(data) => {
+                            if let Err(e) = std::fs::write(path, data) {
+                                tracing::warn!(error = %e, "持久化迁移 API Key 失败");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "序列化迁移 API Key 失败");
+                        }
+                    }
+                }
+            }
+        }
+
+        Arc::new(RwLock::new(keys))
+    }
+
+    /// 保存 API Keys 到磁盘
+    fn save_api_keys(&self) -> Result<(), AdminServiceError> {
+        let path = self
+            .token_manager
+            .cache_dir()
+            .map(|d| d.join("kiro_api_keys.json"));
+        if let Some(path) = path {
+            let keys = self.api_keys.read();
+            let data = serde_json::to_string_pretty(&*keys)
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+            std::fs::write(&path, data)
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// 获取所有 API Keys（脱敏）
+    pub fn get_api_keys(&self) -> super::types::ApiKeyListResponse {
+        let keys = self.api_keys.read();
+        let api_keys = keys.iter().map(to_api_key_view).collect();
+        super::types::ApiKeyListResponse { api_keys }
+    }
+
+    /// 创建 API Key
+    pub fn create_api_key(
+        &self,
+        request: super::types::CreateApiKeyRequest,
+    ) -> Result<super::types::CreateApiKeyResponse, AdminServiceError> {
+        let key_value = request
+            .key
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(generate_api_key_value);
+        let id = uuid::Uuid::new_v4().to_string();
+        if self.api_keys.read().iter().any(|k| k.key == key_value) {
+            return Err(AdminServiceError::InvalidRequest(
+                "api key already exists".to_string(),
+            ));
+        }
+
+        let entry = super::types::ApiKeyEntry {
+            id: id.clone(),
+            name: request.name,
+            key: key_value.clone(),
+            enabled: request.enabled.unwrap_or(true),
+            created_at: Utc::now().timestamp(),
+            last_used_at: None,
+            token_limit: request.token_limit,
+            credit_limit: request.credit_limit,
+            tokens_used: 0,
+            credits_used: 0.0,
+            requests_count: 0,
+        };
+
+        self.api_keys.write().push(entry.clone());
+        if let Err(e) = self.save_api_keys() {
+            self.api_keys.write().retain(|k| k.id != id);
+            return Err(e);
+        }
+
+        Ok(super::types::CreateApiKeyResponse {
+            success: true,
+            id,
+            key: key_value,
+            api_key: to_api_key_view(&entry),
+        })
+    }
+
+    /// 获取单个 API Key
+    pub fn get_api_key(&self, id: &str) -> Result<super::types::ApiKeyView, AdminServiceError> {
+        let keys = self.api_keys.read();
+        keys.iter()
+            .find(|k| k.id == id)
+            .map(to_api_key_view)
+            .ok_or_else(|| AdminServiceError::ResourceNotFound("API key not found".to_string()))
+    }
+
+    /// 更新 API Key
+    pub fn update_api_key(
+        &self,
+        id: &str,
+        request: super::types::UpdateApiKeyRequest,
+    ) -> Result<super::types::ApiKeyView, AdminServiceError> {
+        let mut keys = self.api_keys.write();
+        let index = keys
+            .iter()
+            .position(|k| k.id == id)
+            .ok_or_else(|| AdminServiceError::ResourceNotFound("API key not found".to_string()))?;
+
+        if let Some(name) = request.name {
+            keys[index].name = name;
+        }
+        if let Some(key) = request.key {
+            let key = key.trim().to_string();
+            if !key.is_empty() {
+                if keys
+                    .iter()
+                    .enumerate()
+                    .any(|(i, entry)| i != index && entry.key == key)
+                {
+                    return Err(AdminServiceError::InvalidRequest(
+                        "api key value collides with existing entry".to_string(),
+                    ));
+                }
+                keys[index].key = key;
+            }
+        }
+        if let Some(enabled) = request.enabled {
+            keys[index].enabled = enabled;
+        }
+        if let Some(token_limit) = request.token_limit {
+            keys[index].token_limit = token_limit;
+        }
+        if let Some(credit_limit) = request.credit_limit {
+            keys[index].credit_limit = credit_limit;
+        }
+
+        let view = to_api_key_view(&keys[index]);
+        drop(keys);
+        self.save_api_keys()?;
+        Ok(view)
+    }
+
+    /// 删除 API Key
+    pub fn delete_api_key(&self, id: &str) -> Result<(), AdminServiceError> {
+        let mut keys = self.api_keys.write();
+        if let Some(index) = keys.iter().position(|k| k.id == id) {
+            keys.remove(index);
+            drop(keys);
+            self.save_api_keys()?;
+        }
+        Ok(())
+    }
+
+    /// 重置 API Key 使用量
+    pub fn reset_api_key_usage(
+        &self,
+        id: &str,
+    ) -> Result<super::types::ApiKeyView, AdminServiceError> {
+        let mut keys = self.api_keys.write();
+        let entry = keys
+            .iter_mut()
+            .find(|k| k.id == id)
+            .ok_or_else(|| AdminServiceError::ResourceNotFound("API key not found".to_string()))?;
+
+        entry.tokens_used = 0;
+        entry.credits_used = 0.0;
+        entry.requests_count = 0;
+        let view = to_api_key_view(entry);
+
+        drop(keys);
+        self.save_api_keys()?;
+        Ok(view)
+    }
+
+    /// 验证 API Key（用于认证中间件）
+    pub fn validate_api_key(&self, key: &str) -> Option<super::types::ApiKeyEntry> {
+        let keys = self.api_keys.read();
+        keys.iter().find(|k| k.key == key && k.enabled).cloned()
+    }
+
+    /// 记录 API Key 使用量
+    pub fn record_api_key_usage(&self, key_id: &str, tokens: i64, credits: f64) {
+        let mut keys = self.api_keys.write();
+        if let Some(entry) = keys.iter_mut().find(|k| k.id == key_id) {
+            if tokens > 0 {
+                entry.tokens_used += tokens;
+            }
+            if credits > 0.0 {
+                entry.credits_used += credits;
+            }
+            entry.requests_count += 1;
+            entry.last_used_at = Some(Utc::now().timestamp());
+        }
+        drop(keys);
+        if let Err(e) = self.save_api_keys() {
+            tracing::warn!(error = %e, "保存 API Key 使用量失败");
+        }
+    }
+}
+
+fn to_api_key_view(entry: &super::types::ApiKeyEntry) -> super::types::ApiKeyView {
+    super::types::ApiKeyView {
+        id: entry.id.clone(),
+        name: entry.name.clone(),
+        key_masked: mask_api_key(&entry.key),
+        enabled: entry.enabled,
+        created_at: entry.created_at,
+        last_used_at: entry.last_used_at,
+        token_limit: entry.token_limit,
+        credit_limit: entry.credit_limit,
+        tokens_used: entry.tokens_used,
+        credits_used: entry.credits_used,
+        requests_count: entry.requests_count,
+    }
+}
+
+/// 生成 API Key 值
+fn generate_api_key_value() -> String {
+    let bytes: Vec<u8> = (0..32).map(|_| fastrand::u8(..)).collect();
+    format!("sk-{}", hex::encode(bytes))
+}
+
+/// 脱敏 API Key
+fn mask_api_key(key: &str) -> String {
+    if key.is_empty() {
+        return String::new();
+    }
+    if key.len() <= 10 {
+        return key.to_string();
+    }
+    format!("{}****{}", &key[..6], &key[key.len() - 4..])
+}
+
+fn parse_aws_sso_callback_params(
+    callback_url: &str,
+) -> Result<HashMap<String, String>, AdminServiceError> {
+    oauth_callback::parse_input(callback_url)
+        .map(|callback| callback.params)
+        .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))
+}
+
+#[cfg(test)]
+mod builder_id_login_tests {
+    use super::*;
+
+    #[test]
+    fn builder_id_template_preserves_oidc_registration_for_refresh() {
+        let cred = AdminService::builder_id_credential_template(
+            "client-id".to_string(),
+            "client-secret".to_string(),
+            "us-east-1".to_string(),
+            3,
+            Some("user@example.com".to_string()),
+            Some("direct".to_string()),
+        );
+
+        assert_eq!(cred.auth_method.as_deref(), Some("idc"));
+        assert_eq!(cred.client_id.as_deref(), Some("client-id"));
+        assert_eq!(cred.client_secret.as_deref(), Some("client-secret"));
+        assert_eq!(cred.region.as_deref(), Some("us-east-1"));
+        assert_eq!(cred.priority, 3);
+        assert_eq!(cred.email.as_deref(), Some("user@example.com"));
+        assert_eq!(cred.proxy_url.as_deref(), Some("direct"));
+    }
+
+    #[test]
+    fn builder_id_expires_in_falls_back_like_kiro_go() {
+        assert_eq!(AdminService::builder_id_expires_in(0), 600);
+        assert_eq!(AdminService::builder_id_expires_in(-1), 600);
+        assert_eq!(AdminService::builder_id_expires_in(900), 900);
+    }
+}
+
+#[cfg(test)]
+mod sso_token_import_tests {
+    use super::*;
+
+    #[test]
+    fn sso_token_import_preserves_oidc_registration_for_refresh() {
+        let cred = AdminService::sso_token_credential_from_import(
+            idc::ImportedSsoToken {
+                access_token: "access-token".to_string(),
+                refresh_token: Some("refresh-token".to_string()),
+                expires_in: Some(3600),
+                client_id: "client-id".to_string(),
+                client_secret: "client-secret".to_string(),
+            },
+            "us-east-1",
+            7,
+            Some("user@example.com"),
+        );
+
+        assert_eq!(cred.auth_method.as_deref(), Some("idc"));
+        assert_eq!(cred.access_token.as_deref(), Some("access-token"));
+        assert_eq!(cred.refresh_token.as_deref(), Some("refresh-token"));
+        assert_eq!(cred.client_id.as_deref(), Some("client-id"));
+        assert_eq!(cred.client_secret.as_deref(), Some("client-secret"));
+        assert_eq!(cred.region.as_deref(), Some("us-east-1"));
+        assert_eq!(cred.priority, 7);
+        assert_eq!(cred.email.as_deref(), Some("user@example.com"));
+        assert!(cred.expires_at.is_some());
+    }
+}
+
+#[cfg(test)]
+mod kiro_go_import_tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_external_idp_before_social_or_idc_fallbacks() {
+        assert_eq!(
+            AdminService::normalize_kiro_go_import_auth_method(
+                Some("AzureAD"),
+                Some("client"),
+                None,
+                None,
+            ),
+            "external_idp"
+        );
+        assert_eq!(
+            AdminService::normalize_kiro_go_import_auth_method(
+                None,
+                Some("client"),
+                None,
+                Some("https://login.microsoftonline.com/t/oauth2/v2.0/token"),
+            ),
+            "external_idp"
+        );
+        assert_eq!(
+            AdminService::normalize_kiro_go_import_auth_method(
+                Some("enterprise"),
+                Some("client"),
+                Some("secret"),
+                None,
+            ),
+            "idc"
+        );
+        assert_eq!(
+            AdminService::normalize_kiro_go_import_auth_method(None, Some("client"), None, None),
+            "idc"
+        );
+        assert_eq!(
+            AdminService::normalize_kiro_go_import_auth_method(
+                Some("weird"),
+                Some("client"),
+                None,
+                None,
+            ),
+            "social"
+        );
+    }
+
+    #[test]
+    fn parses_numeric_kiro_go_import_id_only() {
+        assert_eq!(
+            AdminService::parse_kiro_go_import_id(Some(&serde_json::json!(42))),
+            Some(42)
+        );
+        assert_eq!(
+            AdminService::parse_kiro_go_import_id(Some(&serde_json::json!("43"))),
+            Some(43)
+        );
+        assert_eq!(
+            AdminService::parse_kiro_go_import_id(Some(&serde_json::json!("account-1"))),
+            None
+        );
+    }
+
+    #[test]
+    fn maps_kiro_go_import_enabled_and_disabled_flags() {
+        assert!(!AdminService::kiro_go_import_disabled(None, None));
+        assert!(AdminService::kiro_go_import_disabled(
+            Some(true),
+            Some(true)
+        ));
+        assert!(!AdminService::kiro_go_import_disabled(
+            Some(false),
+            Some(false)
+        ));
+        assert!(AdminService::kiro_go_import_disabled(None, Some(false)));
+        assert!(!AdminService::kiro_go_import_disabled(None, Some(true)));
+    }
+
+    #[test]
+    fn kiro_go_import_request_accepts_reference_metadata_fields() {
+        let req: KiroGoImportCredentialsRequest = serde_json::from_value(serde_json::json!({
+            "refreshToken": "r",
+            "provider": "Enterprise",
+            "userId": "user-1",
+            "startUrl": "https://d-123.awsapps.com/start",
+            "clientIdHash": "hash-1",
+            "idToken": "id-token-1",
+            "ssoSessionId": "session-1",
+            "weight": 5
+        }))
+        .unwrap();
+
+        assert_eq!(req.provider.as_deref(), Some("Enterprise"));
+        assert_eq!(req.user_id.as_deref(), Some("user-1"));
+        assert_eq!(
+            req.start_url.as_deref(),
+            Some("https://d-123.awsapps.com/start")
+        );
+        assert_eq!(req.client_id_hash.as_deref(), Some("hash-1"));
+        assert_eq!(req.id_token.as_deref(), Some("id-token-1"));
+        assert_eq!(req.sso_session_id.as_deref(), Some("session-1"));
+        assert_eq!(req.weight, 5);
+    }
+
+    #[test]
+    fn token_json_item_accepts_kiro_go_weight_field() {
+        let item: TokenJsonItem = serde_json::from_value(serde_json::json!({
+            "provider": "Social",
+            "refreshToken": "r",
+            "authMethod": "social",
+            "weight": 4
+        }))
+        .unwrap();
+
+        assert_eq!(item.weight, 4);
+    }
+}
+
+#[cfg(test)]
+mod aws_sso_callback_tests {
+    use super::*;
+
+    #[test]
+    fn parses_full_callback_url() {
+        let params =
+            parse_aws_sso_callback_params("http://127.0.0.1/oauth/callback?code=abc&state=xyz")
+                .unwrap();
+
+        assert_eq!(params.get("code").map(String::as_str), Some("abc"));
+        assert_eq!(params.get("state").map(String::as_str), Some("xyz"));
+    }
+
+    #[test]
+    fn parses_path_and_query_callback_like_kiro_account_manager() {
+        let params =
+            parse_aws_sso_callback_params("/oauth/callback?code=abc%2Fdef&state=xyz").unwrap();
+
+        assert_eq!(params.get("code").map(String::as_str), Some("abc/def"));
+        assert_eq!(params.get("state").map(String::as_str), Some("xyz"));
+    }
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn temp_test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "xkiro-admin-settings-{name}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn test_service(
+        config: crate::model::config::Config,
+        credentials_path: PathBuf,
+    ) -> (
+        AdminService,
+        Arc<RwLock<String>>,
+        Arc<AtomicBool>,
+        Arc<RwLock<String>>,
+    ) {
+        let token_manager = Arc::new(
+            MultiTokenManager::new(
+                config.clone(),
+                Vec::new(),
+                None,
+                Some(credentials_path),
+                true,
+            )
+            .unwrap(),
+        );
+        let client_api_key_runtime =
+            Arc::new(RwLock::new(config.api_key.clone().unwrap_or_default()));
+        let require_api_key_runtime = Arc::new(AtomicBool::new(config.require_api_key));
+        let admin_api_key_runtime = Arc::new(RwLock::new(
+            config.admin_api_key.clone().unwrap_or_default(),
+        ));
+
+        let service = AdminService::new(
+            token_manager,
+            None,
+            Arc::new(RwLock::new(config.compression.clone())),
+            client_api_key_runtime.clone(),
+            require_api_key_runtime.clone(),
+            admin_api_key_runtime.clone(),
+            Arc::new(RwLock::new(config.prompt_filter.clone())),
+            Arc::new(RwLock::new(ThinkingRuntimeConfig {
+                suffix: config.thinking_suffix.clone(),
+                openai_format: config.openai_thinking_format.clone(),
+                claude_format: config.claude_thinking_format.clone(),
+            })),
+            Arc::new(RwLock::new(PromptCacheRuntime::new(
+                config.prompt_cache_ttl_seconds,
+                config.prompt_cache_accounting_enabled,
+            ))),
+            crate::model::runtime::shared_from_config(&config),
+            Arc::new(RwLock::new(Vec::new())),
+            Vec::<String>::new(),
+        );
+
+        (
+            service,
+            client_api_key_runtime,
+            require_api_key_runtime,
+            admin_api_key_runtime,
+        )
+    }
+
+    fn jwt_with_exp(exp: i64) -> String {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+        let payload = URL_SAFE_NO_PAD.encode(format!(r#"{{"exp":{exp}}}"#));
+        format!("header.{payload}.sig")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn import_kiro_go_credential_persists_weight_without_refresh_network() {
+        let dir = temp_test_dir("kiro-go-weight-import");
+        let config = crate::model::config::Config::default();
+        let credentials_path = dir.join("credentials.json");
+        let (service, _, _, _) = test_service(config, credentials_path);
+        let access_token = jwt_with_exp((Utc::now() + chrono::Duration::hours(1)).timestamp());
+
+        let req: KiroGoImportCredentialsRequest = serde_json::from_value(serde_json::json!({
+            "refreshToken": "r".repeat(150),
+            "accessToken": access_token,
+            "authMethod": "external_idp",
+            "clientId": "client-1",
+            "tokenEndpoint": "https://login.microsoftonline.com/tenant/oauth2/v2.0/token",
+            "issuerUrl": "https://login.microsoftonline.com/tenant/v2.0",
+            "priority": 2,
+            "weight": 7,
+            "concurrency": 3,
+            "disabled": true
+        }))
+        .unwrap();
+
+        let added = service.import_kiro_go_credential(req).await.unwrap();
+        let snapshot = service.token_manager.snapshot();
+        let entry = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.id == added.credential_id)
+            .unwrap();
+
+        assert_eq!(entry.priority, 2);
+        assert_eq!(entry.weight, 7);
+        assert_eq!(entry.concurrency, Some(3));
+        assert!(entry.disabled);
+    }
+
+    #[test]
+    fn update_kiro_go_account_weight_does_not_change_priority() {
+        let dir = temp_test_dir("kiro-go-weight-update");
+        let config = crate::model::config::Config::default();
+        let credentials_path = dir.join("credentials.json");
+        let (service, _, _, _) = test_service(config, credentials_path);
+
+        let mut cred = KiroCredentials::default();
+        cred.refresh_token = Some("r".repeat(150));
+        cred.access_token = Some("access-token".to_string());
+        cred.priority = 9;
+        cred.weight = 1;
+        let id = service
+            .token_manager
+            .add_prevalidated_credential(cred)
+            .unwrap();
+
+        service
+            .update_kiro_go_account(
+                id,
+                KiroGoUpdateAccountRequest {
+                    enabled: None,
+                    weight: Some(6),
+                    proxy_url: None,
+                },
+            )
+            .unwrap();
+
+        let snapshot = service.token_manager.snapshot();
+        let entry = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .unwrap();
+        assert_eq!(entry.priority, 9);
+        assert_eq!(entry.weight, 6);
+    }
+
+    #[test]
+    fn export_token_json_preserves_weight() {
+        let dir = temp_test_dir("token-json-weight-export");
+        let config = crate::model::config::Config::default();
+        let credentials_path = dir.join("credentials.json");
+        let (service, _, _, _) = test_service(config, credentials_path);
+
+        let mut cred = KiroCredentials::default();
+        cred.refresh_token = Some("r".repeat(150));
+        cred.access_token = Some("access-token".to_string());
+        cred.auth_method = Some("social".to_string());
+        cred.priority = 2;
+        cred.weight = 5;
+        let id = service
+            .token_manager
+            .add_prevalidated_credential(cred)
+            .unwrap();
+
+        let exported = service.export_credentials_to_token_json(&[id]);
+
+        assert_eq!(exported.len(), 1);
+        assert_eq!(exported[0].priority, 2);
+        assert_eq!(exported[0].weight, 5);
+    }
+
+    #[test]
+    fn export_kam_preserves_reference_account_metadata() {
+        let dir = temp_test_dir("kam-metadata-export");
+        let config = crate::model::config::Config::default();
+        let credentials_path = dir.join("credentials.json");
+        let (service, _, _, _) = test_service(config, credentials_path);
+
+        let mut cred = KiroCredentials::default();
+        cred.access_token = Some("access-token".to_string());
+        cred.refresh_token = Some("r".repeat(150));
+        cred.auth_method = Some("idc".to_string());
+        cred.provider = Some("Enterprise".to_string());
+        cred.user_id = Some("user-1".to_string());
+        cred.client_id = Some("client-1".to_string());
+        cred.client_secret = Some("secret-1".to_string());
+        cred.region = Some("us-east-1".to_string());
+        cred.start_url = Some("https://d-123.awsapps.com/start".to_string());
+        cred.client_id_hash = Some("hash-1".to_string());
+        cred.id_token = Some("id-token-1".to_string());
+        cred.sso_session_id = Some("session-1".to_string());
+
+        let id = service
+            .token_manager
+            .add_prevalidated_credential(cred)
+            .unwrap();
+        let exported = service.export_credentials_to_kam(&[id]);
+
+        assert_eq!(exported.len(), 1);
+        let item = &exported[0];
+        assert_eq!(item.provider.as_deref(), Some("Enterprise"));
+        assert_eq!(item.user_id.as_deref(), Some("user-1"));
+        assert_eq!(
+            item.start_url.as_deref(),
+            Some("https://d-123.awsapps.com/start")
+        );
+        assert_eq!(item.client_id_hash.as_deref(), Some("hash-1"));
+        assert_eq!(item.id_token.as_deref(), Some("id-token-1"));
+        assert_eq!(item.sso_session_id.as_deref(), Some("session-1"));
+    }
+
+    #[tokio::test]
+    async fn update_settings_patch_empty_password_preserves_admin_key_like_kiro_go() {
+        let dir = temp_test_dir("empty-password");
+        let config_path = dir.join("config.json");
+        let credentials_path = dir.join("credentials.json");
+        let mut config = crate::model::config::Config::load(&config_path).unwrap();
+        config.api_key = Some("proxy-api-key".to_string());
+        config.require_api_key = true;
+        config.admin_api_key = Some("admin-password".to_string());
+        config.save().unwrap();
+
+        let (service, client_runtime, require_runtime, admin_runtime) =
+            test_service(config, credentials_path);
+
+        service
+            .update_settings(UpdateSettingsRequest {
+                api_key: Some(String::new()),
+                require_api_key: Some(false),
+                password: Some("   ".to_string()),
+                allow_over_usage: None,
+            })
+            .await
+            .unwrap();
+
+        let reloaded = crate::model::config::Config::load(&config_path).unwrap();
+        assert_eq!(reloaded.api_key, None);
+        assert!(!reloaded.require_api_key);
+        assert_eq!(reloaded.admin_api_key.as_deref(), Some("admin-password"));
+        assert_eq!(client_runtime.read().as_str(), "");
+        assert!(!require_runtime.load(Ordering::Relaxed));
+        assert_eq!(admin_runtime.read().as_str(), "admin-password");
+
+        service
+            .update_settings(UpdateSettingsRequest {
+                api_key: None,
+                require_api_key: None,
+                password: Some(" new-admin-password ".to_string()),
+                allow_over_usage: None,
+            })
+            .await
+            .unwrap();
+
+        let reloaded = crate::model::config::Config::load(&config_path).unwrap();
+        assert_eq!(reloaded.api_key, None);
+        assert!(!reloaded.require_api_key);
+        assert_eq!(
+            reloaded.admin_api_key.as_deref(),
+            Some("new-admin-password")
+        );
+        assert_eq!(admin_runtime.read().as_str(), "new-admin-password");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn update_api_key_empty_key_preserves_existing_value_like_kiro_go() {
+        let dir = temp_test_dir("api-key-empty-patch");
+        let config_path = dir.join("config.json");
+        let credentials_path = dir.join("credentials.json");
+        let config = crate::model::config::Config::load(&config_path).unwrap();
+        config.save().unwrap();
+        let (service, _, _, _) = test_service(config, credentials_path);
+
+        let first = service
+            .create_api_key(CreateApiKeyRequest {
+                name: Some("alpha".to_string()),
+                key: Some("sk-alpha".to_string()),
+                enabled: Some(true),
+                token_limit: 1000,
+                credit_limit: 1.0,
+            })
+            .unwrap();
+        let second = service
+            .create_api_key(CreateApiKeyRequest {
+                name: Some("beta".to_string()),
+                key: Some("sk-beta".to_string()),
+                enabled: Some(true),
+                token_limit: 0,
+                credit_limit: 0.0,
+            })
+            .unwrap();
+
+        let updated = service
+            .update_api_key(
+                &first.id,
+                UpdateApiKeyRequest {
+                    name: Some(Some("alpha-renamed".to_string())),
+                    key: Some("   ".to_string()),
+                    enabled: Some(false),
+                    token_limit: Some(2000),
+                    credit_limit: Some(5.5),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(updated.name.as_deref(), Some("alpha-renamed"));
+        assert!(!updated.enabled);
+        assert_eq!(updated.token_limit, 2000);
+        assert_eq!(updated.credit_limit, 5.5);
+        assert_eq!(updated.key_masked, mask_api_key("sk-alpha"));
+        let first_entry = service
+            .api_keys
+            .read()
+            .iter()
+            .find(|entry| entry.id == first.id)
+            .cloned()
+            .unwrap();
+        assert_eq!(first_entry.key, "sk-alpha");
+        assert!(!first_entry.enabled);
+
+        let err = service
+            .update_api_key(
+                &first.id,
+                UpdateApiKeyRequest {
+                    name: None,
+                    key: Some("sk-beta".to_string()),
+                    enabled: None,
+                    token_limit: None,
+                    credit_limit: None,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, AdminServiceError::InvalidRequest(_)));
+        let first_entry = service
+            .api_keys
+            .read()
+            .iter()
+            .find(|entry| entry.id == first.id)
+            .cloned()
+            .unwrap();
+        assert_eq!(first_entry.key, "sk-alpha");
+        assert_eq!(service.validate_api_key("sk-beta").unwrap().id, second.id);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_api_keys_migrates_legacy_api_key_like_kiro_go() {
+        let dir = temp_test_dir("api-key-legacy-migration");
+
+        let keys = AdminService::load_api_keys_runtime_with_legacy(
+            Some(&dir),
+            Some(" legacy-secret "),
+            true,
+        );
+        let snapshot = keys.read().clone();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].key, "legacy-secret");
+        assert!(snapshot[0].enabled);
+        assert_eq!(snapshot[0].name.as_deref(), Some("legacy-api-key"));
+
+        let persisted: Vec<ApiKeyEntry> =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("kiro_api_keys.json")).unwrap())
+                .unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].key, "legacy-secret");
+
+        let reloaded = AdminService::load_api_keys_runtime_with_legacy(
+            Some(&dir),
+            Some("legacy-secret"),
+            true,
+        );
+        assert_eq!(reloaded.read().len(), 1);
+        assert_eq!(reloaded.read()[0].id, snapshot[0].id);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_api_keys_migrates_public_legacy_api_key_disabled_like_kiro_go() {
+        let dir = temp_test_dir("api-key-public-migration");
+
+        let keys = AdminService::load_api_keys_runtime_with_legacy(
+            Some(&dir),
+            Some("legacy-secret"),
+            false,
+        );
+        let snapshot = keys.read().clone();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].key, "legacy-secret");
+        assert!(!snapshot[0].enabled);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod api_key_tests {
+    use super::*;
+
+    #[test]
+    fn mask_api_key_matches_kiro_go() {
+        assert_eq!(mask_api_key(""), "");
+        assert_eq!(mask_api_key("short"), "short");
+        assert_eq!(mask_api_key("sk-1234567890abcdef"), "sk-123****cdef");
+    }
+
+    #[test]
+    fn api_key_view_exposes_masked_key_only() {
+        let view = to_api_key_view(&super::super::types::ApiKeyEntry {
+            id: "id-1".to_string(),
+            name: Some("main".to_string()),
+            key: "sk-1234567890abcdef".to_string(),
+            enabled: true,
+            created_at: 100,
+            last_used_at: Some(200),
+            token_limit: 10,
+            credit_limit: 1.5,
+            tokens_used: 3,
+            credits_used: 0.5,
+            requests_count: 2,
+        });
+
+        let value = serde_json::to_value(view).expect("view should serialize");
+        assert_eq!(value["keyMasked"], "sk-123****cdef");
+        assert!(value.get("key").is_none());
+        assert_eq!(value["lastUsedAt"], 200);
+    }
+
+    #[test]
+    fn prompt_filter_dto_matches_kiro_go_fields() {
+        let response = PromptFilterConfigResponse {
+            filter_claude_code: false,
+            filter_env_noise: false,
+            filter_strip_boundaries: false,
+            rules: Vec::new(),
+        };
+
+        let value = serde_json::to_value(response).expect("response should serialize");
+        assert!(value.get("filterStripRestrictions").is_none());
+
+        let request: UpdatePromptFilterConfigRequest = serde_json::from_value(serde_json::json!({
+            "filterClaudeCode": false,
+            "filterEnvNoise": false,
+            "filterStripBoundaries": false,
+            "rules": []
+        }))
+        .expect("Kiro-Go-shaped prompt filter request should parse");
+        assert!(!request.filter_strip_boundaries);
     }
 }

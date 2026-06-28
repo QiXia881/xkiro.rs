@@ -12,9 +12,11 @@ use crate::kiro::model::credentials::KiroCredentials;
 use crate::model::config::Config;
 
 pub mod cli;
+pub mod codewhisperer;
 pub mod ide;
 
 pub use cli::{CLI_ENDPOINT_NAME, CliEndpoint};
+pub use codewhisperer::{CODEWHISPERER_ENDPOINT_NAME, CodewhispererEndpoint};
 pub use ide::{IDE_ENDPOINT_NAME, IdeEndpoint};
 
 /// 单次使用额度查询请求所需的 URL + headers

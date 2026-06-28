@@ -9,6 +9,7 @@ export interface CredentialsStatusResponse {
 export interface CredentialStatusItem {
   id: number
   priority: number
+  weight: number
   disabled: boolean
   failureCount: number
   expiresAt: string | null
@@ -54,8 +55,6 @@ export interface GlobalConfigResponse {
   balanceRefreshConcurrency: number
   /** session 亲和：true=同会话黏住同凭据；false=每条消息独立平摊 */
   sessionAffinityEnabled: boolean
-  /** 是否在 system prompt 末尾注入截断恢复识别说明 */
-  truncationRecoverySystemNotice: boolean
   /** admin UI 隐私模式（邮箱脱敏展示） */
   privacyMode: boolean
   compression: CompressionConfigPayload
@@ -63,21 +62,6 @@ export interface GlobalConfigResponse {
 
 // 全局配置内嵌的压缩配置（与后端 CompressionConfigResponse 对齐）
 export interface CompressionConfigPayload {
-  enabled: boolean
-  whitespaceCompression: boolean
-  thinkingStrategy: string
-  toolResultMaxChars: number
-  toolResultHeadLines: number
-  toolResultTailLines: number
-  toolUseInputMaxChars: number
-  toolDescriptionMaxChars: number
-  maxHistoryTurns: number
-  maxHistoryChars: number
-  imageMaxLongEdge: number
-  imageMaxPixelsSingle: number
-  imageMaxPixelsMulti: number
-  imageMultiThreshold: number
-  imageCompressionEnabled: boolean
   maxRequestBodyBytes: number
 }
 
@@ -95,7 +79,6 @@ export interface UpdateGlobalConfigRequest {
   balanceRefreshIntervalSecs?: number
   balanceRefreshConcurrency?: number
   sessionAffinityEnabled?: boolean
-  truncationRecoverySystemNotice?: boolean
   privacyMode?: boolean
   compression?: Partial<CompressionConfigPayload>
 }
@@ -149,10 +132,11 @@ export interface SetConcurrencyRequest {
 // 添加凭据请求
 export interface AddCredentialRequest {
   refreshToken?: string
-  authMethod?: 'social' | 'idc' | 'api_key'
+  authMethod?: 'social' | 'idc' | 'external_idp' | 'api_key'
   clientId?: string
   clientSecret?: string
   priority?: number
+  weight?: number
   authRegion?: string
   apiRegion?: string
   machineId?: string
@@ -163,6 +147,41 @@ export interface AddCredentialRequest {
   endpoint?: string
   /** 自定义并发上限（null/省略 = 跟随全局） */
   concurrency?: number | null
+}
+
+export interface ImportKiroGoCredentialRequest {
+  accessToken?: string
+  refreshToken: string
+  clientId?: string
+  clientSecret?: string
+  authMethod?: string
+  provider?: string
+  region?: string
+  authRegion?: string
+  apiRegion?: string
+  tokenEndpoint?: string
+  issuerUrl?: string
+  scopes?: string
+  startUrl?: string
+  clientIdHash?: string
+  idToken?: string
+  ssoSessionId?: string
+  priority?: number
+  weight?: number
+  concurrency?: number | null
+  id?: string | number
+  email?: string
+  profileArn?: string
+  userId?: string | null
+  machineId?: string
+  proxyURL?: string
+  proxyUrl?: string
+  proxyUsername?: string
+  proxyPassword?: string
+  overageStatus?: string
+  endpoint?: string
+  enabled?: boolean
+  disabled?: boolean
 }
 
 // 添加凭据响应
@@ -308,4 +327,110 @@ export interface UpsertUserPresetRequest {
   name: string
   description?: string
   content: string
+}
+
+// ============ Social OAuth 登录 ============
+
+export interface StartSocialLoginRequest {
+  priority?: number
+  email?: string
+  proxyUrl?: string
+  authEndpoint?: string
+  provider: 'Google' | 'Github'
+  mode?: 'manual' | 'helper'
+}
+
+export interface StartSocialLoginResponse {
+  sessionId: string
+  mode: 'manual' | 'helper'
+  portalUrl?: string
+  expiresAt: string
+}
+
+export type PollSocialLoginResponse =
+  | { status: 'waiting' }
+  | { status: 'success'; credentialId: number }
+  | { status: 'expired' }
+  | { status: 'error'; message: string }
+
+export interface StartIdcLoginRequest {
+  region: string
+  startUrl?: string
+  priority?: number
+  email?: string
+  proxyUrl?: string
+}
+
+export interface StartIdcLoginResponse {
+  sessionId: string
+  userCode: string
+  verificationUri: string
+  verificationUriComplete?: string
+  expiresAt: string
+  pollInterval: number
+}
+
+export interface StartIamSsoLoginResponse {
+  sessionId: string
+  authorizeUrl: string
+  expiresIn: number
+}
+
+export interface CompleteIamSsoLoginResponse {
+  success: boolean
+  account?: {
+    id: number
+    email?: string
+  }
+}
+
+export type PollIdcLoginResponse =
+  | { status: 'pending' }
+  | { status: 'success'; credentialId: number }
+  | { status: 'expired' }
+
+export interface StartBuilderIdLoginRequest {
+  region?: string
+  priority?: number
+  email?: string
+}
+
+export interface StartBuilderIdLoginResponse {
+  sessionId: string
+  userCode: string
+  verificationUri: string
+  verificationUriComplete?: string
+  pollInterval: number
+  expiresIn: number
+}
+
+export type PollBuilderIdLoginResponse =
+  | { status: 'pending'; pollInterval?: number }
+  | { status: 'success'; credentialId: number; email?: string }
+  | { status: 'expired' }
+  | { status: 'error'; message: string }
+
+export interface StartKiroSsoLoginResponse {
+  sessionId: string
+  signInUrl: string
+  interval: number
+}
+
+export interface PollKiroSsoLoginResponse {
+  success: boolean
+  completed: boolean
+  status?: 'pending'
+  error?: string
+  account?: {
+    id: number
+    email?: string
+    authMethod?: string
+  }
+}
+
+export interface CompleteKiroSsoLoginResponse {
+  success: boolean
+  status: 'pending' | 'redirect' | 'submitted' | 'expired' | 'error'
+  redirectUrl?: string
+  error?: string
 }

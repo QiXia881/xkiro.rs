@@ -843,6 +843,8 @@ mod tests {
         let payload = MessagesRequest {
             model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 1024,
+            temperature: None,
+            top_p: None,
             messages: vec![Message {
                 role: "user".to_string(),
                 content: serde_json::json!("Perform a web search for the query: rust cache"),
@@ -1004,6 +1006,8 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4".to_string(),
             max_tokens: 1024,
+            temperature: None,
+            top_p: None,
             messages: vec![Message {
                 role: "user".to_string(),
                 content: serde_json::json!("test"),
@@ -1034,6 +1038,8 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4".to_string(),
             max_tokens: 1024,
+            temperature: None,
+            top_p: None,
             messages: vec![Message {
                 role: "user".to_string(),
                 content: serde_json::json!("test"),
@@ -1074,6 +1080,8 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4".to_string(),
             max_tokens: 1024,
+            temperature: None,
+            top_p: None,
             messages: vec![Message {
                 role: "user".to_string(),
                 content: serde_json::json!("test"),
@@ -1104,6 +1112,8 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4".to_string(),
             max_tokens: 1024,
+            temperature: None,
+            top_p: None,
             messages: vec![Message {
                 role: "user".to_string(),
                 content: serde_json::json!([{
@@ -1132,6 +1142,8 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4".to_string(),
             max_tokens: 1024,
+            temperature: None,
+            top_p: None,
             messages: vec![Message {
                 role: "user".to_string(),
                 content: serde_json::json!("What is the weather today?"),
@@ -1156,6 +1168,8 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4".to_string(),
             max_tokens: 1024,
+            temperature: None,
+            top_p: None,
             messages: vec![
                 Message {
                     role: "user".to_string(),

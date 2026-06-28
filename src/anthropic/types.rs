@@ -11,7 +11,7 @@ pub struct CacheControl {
     #[serde(rename = "type")]
     pub cache_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ttl: Option<String>,
+    pub ttl: Option<serde_json::Value>,
 }
 
 // === 错误响应 ===
@@ -43,29 +43,103 @@ impl ErrorResponse {
 
     /// 创建认证错误响应
     pub fn authentication_error() -> Self {
-        Self::new("authentication_error", "Invalid API key")
+        Self::new("authentication_error", "Invalid or missing API key")
+    }
+
+    /// 创建速率限制错误响应
+    pub fn rate_limit_error(message: impl Into<String>) -> Self {
+        Self::new("rate_limit_error", message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authentication_error_message_matches_kiro_go_claude_route() {
+        let response = ErrorResponse::authentication_error();
+
+        assert_eq!(response.error.error_type, "authentication_error");
+        assert_eq!(response.error.message, "Invalid or missing API key");
+    }
+
+    #[test]
+    fn tool_input_schema_accepts_non_object_like_kiro_go() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-4.5",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{
+                "name": "bad_schema_tool",
+                "description": "desc",
+                "input_schema": "not an object"
+            }]
+        }))
+        .expect("non-object input_schema should parse");
+
+        let tools = req.tools.expect("tools should be present");
+        assert!(tools[0].input_schema.is_empty());
     }
 }
 
 // === Models 端点类型 ===
 
 /// 模型信息
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Model {
     pub id: String,
     pub object: String,
-    pub created: i64,
     pub owned_by: String,
-    pub display_name: String,
+    pub supports_image: bool,
+    pub input_modalities: Vec<String>,
+    pub modalities: ModelModalities,
+    pub capabilities: ModelCapabilities,
+    pub info: ModelInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     #[serde(rename = "type")]
-    pub model_type: String,
-    pub max_tokens: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_length: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_completion_tokens: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelModalities {
+    pub input: Vec<String>,
+    pub output: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelCapabilities {
+    pub vision: bool,
+    pub image: bool,
+    pub image_vision: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelInfo {
+    pub meta: ModelInfoMeta,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelInfoMeta {
+    pub capabilities: ModelInfoCapabilities,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelInfoCapabilities {
+    pub vision: bool,
+    pub image_vision: bool,
 }
 
 /// 模型列表响应
@@ -77,21 +151,14 @@ pub struct ModelsResponse {
 
 // === Messages 端点类型 ===
 
-/// 最大思考预算 tokens
-const MAX_BUDGET_TOKENS: i32 = 128_000;
-
 /// Thinking 配置
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Thinking {
     #[serde(rename = "type")]
     pub thinking_type: String,
-    #[serde(
-        default = "default_budget_tokens",
-        deserialize_with = "deserialize_budget_tokens"
-    )]
-    pub budget_tokens: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget_tokens: Option<i32>,
     /// `summarized` / `omitted`，未提供时由后端按模型默认填入。
-    /// 无效值会在反序列化阶段被规范化为 `None`（防客户端把脏值原样传给上游）。
     #[serde(
         default,
         deserialize_with = "deserialize_display",
@@ -112,38 +179,16 @@ impl Thinking {
     }
 }
 
-/// 反序列化 `display` 字段，只接受 `summarized` / `omitted`，其他值降级为 `None`。
+/// 保留客户端原始 `display` 值，边界校验层负责按 Kiro-Go 语义返回 400。
 fn deserialize_display<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let opt = Option::<String>::deserialize(deserializer)?;
-    match opt.as_deref() {
-        None => Ok(None),
-        Some("summarized") | Some("omitted") => Ok(opt),
-        Some(other) => {
-            tracing::warn!(
-                value = %other,
-                "thinking.display 收到无效值（仅接受 summarized / omitted），已忽略"
-            );
-            Ok(None)
-        }
-    }
-}
-
-fn default_budget_tokens() -> i32 {
-    20000
-}
-fn deserialize_budget_tokens<'de, D>(deserializer: D) -> Result<i32, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = i32::deserialize(deserializer)?;
-    Ok(value.min(MAX_BUDGET_TOKENS))
+    Option::<String>::deserialize(deserializer)
 }
 
 /// OutputConfig 配置
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct OutputConfig {
     #[serde(default = "default_effort")]
     pub effort: String,
@@ -158,6 +203,8 @@ fn default_effort() -> String {
 pub struct Metadata {
     /// 用户 ID，格式如: user_xxx_account__session_0b4445e1-f5be-49e1-87ce-62bbc28ad705
     pub user_id: Option<String>,
+    #[serde(skip)]
+    pub preserve_tool_names: bool,
 }
 
 /// Messages 请求体
@@ -165,8 +212,11 @@ pub struct Metadata {
 #[allow(dead_code)]
 pub struct MessagesRequest {
     pub model: String,
-    /// 为 Anthropic API 兼容保留，实际不透传给 Kiro 上游
     pub max_tokens: i32,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub top_p: Option<f32>,
     pub messages: Vec<Message>,
     #[serde(default)]
     pub stream: bool,
@@ -274,7 +324,7 @@ pub struct Tool {
     #[serde(default)]
     pub description: String,
     /// 输入参数 schema（普通工具必需，WebSearch 工具无此字段）
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_input_schema")]
     pub input_schema: HashMap<String, serde_json::Value>,
     /// 最大使用次数（仅 WebSearch 工具）
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -282,6 +332,19 @@ pub struct Tool {
     /// 缓存控制
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<CacheControl>,
+}
+
+fn deserialize_input_schema<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<String, serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let Some(serde_json::Value::Object(obj)) = value else {
+        return Ok(HashMap::new());
+    };
+    Ok(obj.into_iter().collect())
 }
 
 impl Tool {
@@ -336,6 +399,8 @@ pub struct ImageSource {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CountTokensRequest {
     pub model: String,
+    #[serde(default)]
+    pub max_tokens: i32,
     pub messages: Vec<Message>,
     #[serde(
         default,
@@ -345,6 +410,10 @@ pub struct CountTokensRequest {
     pub system: Option<Vec<SystemMessage>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<Tool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<Thinking>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<OutputConfig>,
 }
 
 /// Token 计数响应

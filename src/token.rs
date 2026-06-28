@@ -2,10 +2,7 @@
 //!
 //! 提供文本 token 数量计算功能。
 //!
-//! # 计算规则
-//! - 非西文字符：每个计 4.5 个字符单位
-//! - 西文字符：每个计 1 个字符单位
-//! - 4 个字符单位 = 1 token（四舍五入）
+//! 默认本地估算与 Kiro-Go 的 estimateApproxTokens 保持一致。
 
 use crate::anthropic::types::{
     CountTokensRequest, CountTokensResponse, Message, SystemMessage, Tool,
@@ -30,9 +27,7 @@ fn precise_counting_enabled() -> bool {
 /// 全局共享的 cl100k_base BPE 实例
 fn cl100k_bpe() -> &'static tiktoken_rs::CoreBPE {
     static BPE: OnceLock<tiktoken_rs::CoreBPE> = OnceLock::new();
-    BPE.get_or_init(|| {
-        tiktoken_rs::cl100k_base().expect("cl100k_base BPE 加载失败")
-    })
+    BPE.get_or_init(|| tiktoken_rs::cl100k_base().expect("cl100k_base BPE 加载失败"))
 }
 
 /// Count Tokens API 配置
@@ -65,64 +60,48 @@ fn get_config() -> Option<&'static CountTokensConfig> {
     COUNT_TOKENS_CONFIG.get()
 }
 
-/// 判断字符是否为非西文字符
-///
-/// 西文字符包括：
-/// - ASCII 字符 (U+0000..U+007F)
-/// - 拉丁字母扩展 (U+0080..U+024F)
-/// - 拉丁字母扩展附加 (U+1E00..U+1EFF)
-///
-/// 返回 true 表示该字符是非西文字符（如中文、日文、韩文、阿拉伯文等）
-fn is_non_western_char(c: char) -> bool {
-    !matches!(c,
-        // 基本 ASCII
-        '\u{0000}'..='\u{007F}' |
-        // 拉丁字母扩展-A (Latin Extended-A)
-        '\u{0080}'..='\u{00FF}' |
-        // 拉丁字母扩展-B (Latin Extended-B)
-        '\u{0100}'..='\u{024F}' |
-        // 拉丁字母扩展附加 (Latin Extended Additional)
-        '\u{1E00}'..='\u{1EFF}' |
-        // 拉丁字母扩展-C/D/E
-        '\u{2C60}'..='\u{2C7F}' |
-        '\u{A720}'..='\u{A7FF}' |
-        '\u{AB30}'..='\u{AB6F}'
-    )
-}
-
 /// 计算文本的 token 数量
-///
-/// # 计算规则
-/// - 非西文字符：每个计 4.5 个字符单位
-/// - 西文字符：每个计 1 个字符单位
-/// - 4 个字符单位 = 1 token（四舍五入）
-/// ```
 pub fn count_tokens(text: &str) -> u64 {
     if precise_counting_enabled() {
         return cl100k_bpe().encode_with_special_tokens(text).len() as u64;
     }
 
-    let char_units: f64 = text
-        .chars()
-        .map(|c| if is_non_western_char(c) { 4.0 } else { 1.0 })
-        .sum();
+    estimate_approx_tokens(text)
+}
 
-    let tokens = char_units / 4.0;
+fn estimate_approx_tokens(text: &str) -> u64 {
+    if text.is_empty() {
+        return 0;
+    }
 
-    let acc_token = if tokens < 100.0 {
-        tokens * 1.5
-    } else if tokens < 200.0 {
-        tokens * 1.3
-    } else if tokens < 300.0 {
-        tokens * 1.25
-    } else if tokens < 800.0 {
-        tokens * 1.2
-    } else {
-        tokens * 1.0
-    } as u64;
+    let length = text.chars().count();
+    if length == 0 {
+        return 0;
+    }
+    if length < 5 {
+        return ((length as f64) / 3.0).ceil().max(1.0) as u64;
+    }
 
-    // println!("tokens: {}, acc_tokens: {}", tokens, acc_token);
-    acc_token
+    let mut regular_ascii = 0usize;
+    let mut digits = 0usize;
+    let mut symbols = 0usize;
+    let mut non_ascii = 0usize;
+
+    for ch in text.chars() {
+        match ch {
+            '\u{80}'.. => non_ascii += 1,
+            '0'..='9' => digits += 1,
+            '!'..='/' | ':'..='@' | '['..='`' | '{'..='~' => symbols += 1,
+            _ => regular_ascii += 1,
+        }
+    }
+
+    ((regular_ascii as f64) / 4.5
+        + (digits as f64) / 2.0
+        + (symbols as f64) / 1.5
+        + (non_ascii as f64) / 1.5)
+        .ceil()
+        .max(1.0) as u64
 }
 
 /// 估算请求的输入 tokens
@@ -174,9 +153,12 @@ async fn call_remote_count_tokens(
     // 构建请求体
     let request = CountTokensRequest {
         model: model, // 模型名称用于 token 计算
+        max_tokens: 0,
         messages: messages.clone(),
         system: system.clone(),
         tools: tools.clone(),
+        thinking: None,
+        output_config: None,
     };
 
     // 构建请求
@@ -221,17 +203,9 @@ fn count_all_tokens_local(
         }
     }
 
-    // 用户消息
+    // 消息内容按 Kiro-Go estimateClaudeValueTokens 语义递归估算。
     for msg in &messages {
-        if let serde_json::Value::String(s) = &msg.content {
-            total += count_tokens(s);
-        } else if let serde_json::Value::Array(arr) = &msg.content {
-            for item in arr {
-                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                    total += count_tokens(text);
-                }
-            }
-        }
+        total += count_message_content_tokens(&msg.content);
     }
 
     // 工具定义
@@ -244,7 +218,7 @@ fn count_all_tokens_local(
         }
     }
 
-    total.max(1)
+    total
 }
 
 /// 估算输出 tokens
@@ -252,19 +226,33 @@ pub(crate) fn estimate_output_tokens(content: &[serde_json::Value]) -> i32 {
     let mut total = 0;
 
     for block in content {
-        if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
-            total += count_tokens(text) as i32;
-        }
-        if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
-            // 工具调用开销
-            if let Some(input) = block.get("input") {
-                let input_str = serde_json::to_string(input).unwrap_or_default();
-                total += count_tokens(&input_str) as i32;
+        match block.get("type").and_then(|v| v.as_str()) {
+            Some("text") => {
+                if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                    total += count_tokens(text) as i32;
+                }
+            }
+            Some("thinking") => {
+                if let Some(thinking) = block.get("thinking").and_then(|v| v.as_str()) {
+                    total += count_tokens(thinking) as i32;
+                }
+            }
+            Some("tool_use") => {
+                if let Some(name) = block.get("name").and_then(|v| v.as_str()) {
+                    total += count_tokens(name) as i32;
+                }
+                if let Some(input) = block.get("input") {
+                    let input_str = serde_json::to_string(input).unwrap_or_default();
+                    total += count_tokens(&input_str) as i32;
+                }
+            }
+            _ => {
+                total += count_message_content_tokens(block) as i32;
             }
         }
     }
 
-    total.max(1)
+    total
 }
 
 /// 计算系统消息的 tokens（cache_tracker 使用）
@@ -290,22 +278,59 @@ pub fn count_message_content_tokens(value: &serde_json::Value) -> u64 {
         serde_json::Value::String(s) => count_tokens(s),
         serde_json::Value::Array(arr) => arr.iter().map(count_message_content_tokens).sum(),
         serde_json::Value::Object(obj) => {
+            match obj.get("type").and_then(|v| v.as_str()) {
+                Some("text") => {
+                    if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
+                        return count_tokens(text);
+                    }
+                }
+                Some("thinking") => {
+                    if let Some(thinking) = obj.get("thinking").and_then(|v| v.as_str()) {
+                        return count_tokens(thinking);
+                    }
+                }
+                Some("tool_use") => {
+                    let mut total = 0;
+                    if let Some(name) = obj.get("name").and_then(|v| v.as_str()) {
+                        total += count_tokens(name);
+                    }
+                    if let Some(input) = obj.get("input") {
+                        let json = serde_json::to_string(input).unwrap_or_default();
+                        total += count_tokens(&json);
+                    }
+                    if total > 0 {
+                        return total;
+                    }
+                }
+                Some("tool_result") => {
+                    if let Some(content) = obj.get("content") {
+                        return count_message_content_tokens(content);
+                    }
+                }
+                _ => {}
+            }
+
+            let mut total = 0;
             if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
-                return count_tokens(text);
+                total += count_tokens(text);
             }
             if let Some(thinking) = obj.get("thinking").and_then(|v| v.as_str()) {
-                return count_tokens(thinking);
-            }
-            if let Some(input) = obj.get("input") {
-                let json = serde_json::to_string(input).unwrap_or_default();
-                return count_tokens(&json);
+                total += count_tokens(thinking);
             }
             if let Some(content) = obj.get("content") {
-                return count_message_content_tokens(content);
+                total += count_message_content_tokens(content);
             }
-            0
+            if total > 0 {
+                return total;
+            }
+
+            serde_json::to_string(value)
+                .map(|json| count_tokens(&json))
+                .unwrap_or(0)
         }
-        _ => 0,
+        _ => serde_json::to_string(value)
+            .map(|json| count_tokens(&json))
+            .unwrap_or(0),
     }
 }
 
@@ -327,9 +352,143 @@ mod tests {
     }
 
     #[test]
-    fn heuristic_counting_default_path() {
+    fn heuristic_counting_matches_kiro_go_estimator() {
         let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
         set_precise_counting(false);
-        assert!(count_tokens("hello world") > 0);
+        assert_eq!(count_tokens(""), 0);
+        assert_eq!(count_tokens("abc"), 1);
+        assert_eq!(count_tokens("1234"), 2);
+        assert_eq!(count_tokens("hello world"), 3);
+        assert_eq!(count_tokens("!!!!!!"), 4);
+        assert_eq!(count_tokens("你好世界"), 2);
+        assert_eq!(count_tokens("你好世界啊"), 4);
+    }
+
+    #[test]
+    fn message_content_tokens_falls_back_to_json_like_kiro_go() {
+        let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        set_precise_counting(false);
+        let value = serde_json::json!({
+            "type": "custom_block",
+            "payload": {"answer": 42}
+        });
+        let expected = count_tokens(&serde_json::to_string(&value).unwrap());
+
+        assert_eq!(count_message_content_tokens(&value), expected);
+        assert!(count_message_content_tokens(&value) > 0);
+    }
+
+    #[test]
+    fn local_request_tokens_count_tool_use_and_tool_result_like_kiro_go() {
+        let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        set_precise_counting(false);
+
+        let tool_use_block = serde_json::json!({
+            "type": "tool_use",
+            "id": "toolu_1",
+            "name": "exec_command",
+            "input": {"cmd": "pwd"}
+        });
+        let tool_use_expected = count_tokens("exec_command")
+            + count_tokens(&serde_json::to_string(&tool_use_block["input"]).unwrap());
+        assert_eq!(
+            count_message_content_tokens(&tool_use_block),
+            tool_use_expected
+        );
+
+        let text_only = vec![Message {
+            role: "user".to_string(),
+            content: serde_json::json!([{
+                "type": "text",
+                "text": "hello"
+            }]),
+        }];
+        let with_tools = vec![
+            Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!([{
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "exec_command",
+                    "input": {"cmd": "pwd"}
+                }]),
+            },
+            Message {
+                role: "user".to_string(),
+                content: serde_json::json!([{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": [{"type": "text", "text": "workspace path"}]
+                }]),
+            },
+        ];
+
+        let base = count_all_tokens_local(None, text_only, None);
+        let counted = count_all_tokens_local(None, with_tools, None);
+
+        assert!(counted > base);
+        assert!(counted >= count_tokens("exec_command"));
+        assert!(counted >= count_tokens("workspace path"));
+    }
+
+    #[test]
+    fn local_request_tokens_allow_zero_like_kiro_go() {
+        let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        set_precise_counting(false);
+
+        assert_eq!(count_all_tokens_local(None, Vec::new(), None), 0);
+    }
+
+    #[test]
+    fn output_tokens_allow_zero_like_kiro_go() {
+        let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        set_precise_counting(false);
+
+        assert_eq!(estimate_output_tokens(&[]), 0);
+        assert_eq!(
+            estimate_output_tokens(&[
+                serde_json::json!({"type": "text", "text": ""}),
+                serde_json::json!({"type": "thinking", "thinking": ""})
+            ]),
+            0
+        );
+    }
+
+    #[test]
+    fn output_tokens_count_thinking_and_tool_name_like_kiro_go() {
+        let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        set_precise_counting(false);
+
+        let tool_input = serde_json::json!({"cmd": "pwd"});
+        let content = vec![
+            serde_json::json!({"type": "text", "text": "hello"}),
+            serde_json::json!({"type": "thinking", "thinking": "reasoning"}),
+            serde_json::json!({
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "exec_command",
+                "input": tool_input
+            }),
+        ];
+        let expected = count_tokens("hello")
+            + count_tokens("reasoning")
+            + count_tokens("exec_command")
+            + count_tokens(&serde_json::to_string(&content[2]["input"]).unwrap());
+
+        assert_eq!(estimate_output_tokens(&content), expected as i32);
+    }
+
+    #[test]
+    fn output_tokens_fall_back_to_json_for_unknown_blocks_like_kiro_go() {
+        let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        set_precise_counting(false);
+
+        let block = serde_json::json!({
+            "type": "custom_block",
+            "payload": {"answer": 42}
+        });
+        let expected = count_tokens(&serde_json::to_string(&block).unwrap());
+
+        assert_eq!(estimate_output_tokens(&[block]), expected as i32);
     }
 }

@@ -10,7 +10,7 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { useCredentials, useAddCredential, useDeleteCredential } from '@/hooks/use-credentials'
-import { getCredentialBalance, setCredentialDisabled } from '@/api/credentials'
+import { getCredentialBalance, importKiroGoCredential, setCredentialDisabled } from '@/api/credentials'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
 
 interface KamImportDialogProps {
@@ -20,20 +20,52 @@ interface KamImportDialogProps {
 
 // KAM 导出 JSON 中的账号结构
 interface KamAccount {
+  id?: string | number
   email?: string
   userId?: string | null
+  provider?: string
   nickname?: string
+  profileArn?: string
+  overageStatus?: string
+  startUrl?: string
+  clientIdHash?: string
+  idToken?: string
+  ssoSessionId?: string
+  weight?: number
   credentials: {
+    accessToken?: string
     refreshToken: string
     clientId?: string
     clientSecret?: string
+    tokenEndpoint?: string
+    issuerUrl?: string
+    scopes?: string
     region?: string
     authMethod?: string
     startUrl?: string
+    clientIdHash?: string
+    idToken?: string
+    ssoSessionId?: string
   }
   machineId?: string
+  proxyURL?: string
+  proxyUrl?: string
   status?: string
+  enabled?: boolean
 }
+
+const EXTERNAL_IDP_ALIASES = new Set([
+  'external_idp',
+  'azuread',
+  'azure',
+  'entra',
+  'entra-id',
+  'entra_id',
+  'microsoft',
+  'm365',
+  'office365',
+  'external',
+])
 
 interface VerificationResult {
   index: number
@@ -55,6 +87,14 @@ function normalizeKamAccount(item: unknown): unknown {
   // 新格式：refreshToken 直接在账号对象上，无 credentials 嵌套
   if (typeof obj.refreshToken === 'string' && typeof obj.credentials === 'undefined') {
     const email = typeof obj.email === 'string' ? obj.email : undefined
+    const id = typeof obj.id === 'string' || typeof obj.id === 'number' ? obj.id : undefined
+    const profileArn = typeof obj.profileArn === 'string' ? obj.profileArn : undefined
+    const provider = typeof obj.provider === 'string' ? obj.provider : undefined
+    const overageStatus = typeof obj.overageStatus === 'string' ? obj.overageStatus : undefined
+    const clientIdHash = typeof obj.clientIdHash === 'string' ? obj.clientIdHash : undefined
+    const idToken = typeof obj.idToken === 'string' ? obj.idToken : undefined
+    const ssoSessionId = typeof obj.ssoSessionId === 'string' ? obj.ssoSessionId : undefined
+    const weight = typeof obj.weight === 'number' ? obj.weight : undefined
     const userId =
       typeof obj.userId === 'string' || obj.userId === null ? (obj.userId as string | null) : undefined
     const nickname =
@@ -67,23 +107,52 @@ function normalizeKamAccount(item: unknown): unknown {
     const machineId = typeof obj.machineId === 'string' ? obj.machineId : undefined
     const clientId = typeof obj.clientId === 'string' ? obj.clientId : undefined
     const clientSecret = typeof obj.clientSecret === 'string' ? obj.clientSecret : undefined
+    const accessToken = typeof obj.accessToken === 'string' ? obj.accessToken : undefined
+    const tokenEndpoint = typeof obj.tokenEndpoint === 'string' ? obj.tokenEndpoint : undefined
+    const issuerUrl = typeof obj.issuerUrl === 'string' ? obj.issuerUrl : undefined
+    const scopes = typeof obj.scopes === 'string' ? obj.scopes : undefined
     const region = typeof obj.region === 'string' ? obj.region : undefined
     const authMethod = typeof obj.authMethod === 'string' ? obj.authMethod : undefined
     const startUrl = typeof obj.startUrl === 'string' ? obj.startUrl : undefined
+    const proxyURL =
+      typeof obj.proxyURL === 'string'
+        ? obj.proxyURL
+        : typeof obj.proxyUrl === 'string'
+          ? obj.proxyUrl
+          : undefined
+    const enabled = typeof obj.enabled === 'boolean' ? obj.enabled : undefined
 
     return {
       email,
+      id,
       userId,
+      provider,
       nickname,
+      profileArn,
+      overageStatus,
+      startUrl,
+      clientIdHash,
+      idToken,
+      ssoSessionId,
+      weight,
       status,
       machineId,
+      proxyURL,
+      enabled,
       credentials: {
+        accessToken,
         refreshToken: obj.refreshToken,
         clientId,
         clientSecret,
+        tokenEndpoint,
+        issuerUrl,
+        scopes,
         region,
         authMethod,
         startUrl,
+        clientIdHash,
+        idToken,
+        ssoSessionId,
       },
     }
   }
@@ -267,21 +336,82 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
         try {
           const clientId = cred.clientId?.trim() || undefined
           const clientSecret = cred.clientSecret?.trim() || undefined
-          const authMethod = clientId && clientSecret ? 'idc' : 'social'
+          const rawAuthMethod = cred.authMethod?.trim().toLowerCase()
+          const isExternalIdp = Boolean(
+            (rawAuthMethod && EXTERNAL_IDP_ALIASES.has(rawAuthMethod))
+              || cred.tokenEndpoint?.trim()
+              || cred.issuerUrl?.trim()
+              || cred.scopes?.trim()
+          )
+          const authMethod = isExternalIdp ? 'external_idp' : clientId && clientSecret ? 'idc' : 'social'
 
           // idc 模式下必须同时提供 clientId 和 clientSecret
           if (authMethod === 'social' && (clientId || clientSecret)) {
             throw new Error('idc 模式需要同时提供 clientId 和 clientSecret')
           }
 
-          const addedCred = await addCredential({
-            refreshToken: token,
-            authMethod,
-            authRegion: cred.region?.trim() || undefined,
-            clientId,
-            clientSecret,
-            machineId: account.machineId?.trim() || undefined,
-          })
+          const useKiroGoImport = Boolean(
+            authMethod === 'external_idp'
+              || cred.accessToken?.trim()
+              || cred.tokenEndpoint?.trim()
+              || cred.issuerUrl?.trim()
+              || cred.scopes?.trim()
+              || account.provider?.trim()
+              || cred.startUrl?.trim()
+              || account.startUrl?.trim()
+              || cred.clientIdHash?.trim()
+              || account.clientIdHash?.trim()
+              || cred.idToken?.trim()
+              || account.idToken?.trim()
+              || cred.ssoSessionId?.trim()
+              || account.ssoSessionId?.trim()
+              || account.userId?.trim()
+              || account.id !== undefined
+              || account.profileArn?.trim()
+              || account.overageStatus?.trim()
+              || account.weight !== undefined
+              || account.status === 'disabled'
+              || account.enabled !== undefined
+          )
+
+          const addedCred = useKiroGoImport
+            ? await importKiroGoCredential({
+                id: account.id,
+                accessToken: cred.accessToken?.trim() || undefined,
+                refreshToken: token,
+                clientId,
+                clientSecret,
+                authMethod,
+                provider: account.provider?.trim() || undefined,
+                region: cred.region?.trim() || undefined,
+                tokenEndpoint: cred.tokenEndpoint?.trim() || undefined,
+                issuerUrl: cred.issuerUrl?.trim() || undefined,
+                scopes: cred.scopes?.trim() || undefined,
+                startUrl: cred.startUrl?.trim() || account.startUrl?.trim() || undefined,
+                clientIdHash:
+                  cred.clientIdHash?.trim() || account.clientIdHash?.trim() || undefined,
+                idToken: cred.idToken?.trim() || account.idToken?.trim() || undefined,
+                ssoSessionId:
+                  cred.ssoSessionId?.trim() || account.ssoSessionId?.trim() || undefined,
+                weight: account.weight ?? 0,
+                email: account.email?.trim() || undefined,
+                profileArn: account.profileArn?.trim() || undefined,
+                userId: account.userId ?? undefined,
+                machineId: account.machineId?.trim() || undefined,
+                proxyURL: account.proxyURL?.trim() || account.proxyUrl?.trim() || undefined,
+                overageStatus: account.overageStatus?.trim() || undefined,
+                enabled: account.enabled,
+                disabled: account.status === 'disabled' ? true : undefined,
+              })
+            : await addCredential({
+                refreshToken: token,
+                authMethod,
+                authRegion: cred.region?.trim() || undefined,
+                clientId,
+                clientSecret,
+                weight: account.weight ?? 0,
+                machineId: account.machineId?.trim() || undefined,
+              })
 
           addedCredId = addedCred.credentialId
 

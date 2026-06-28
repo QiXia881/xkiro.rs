@@ -1,9 +1,15 @@
+//! xkiro.rs - Kiro API 代理
+
+// 抑制有意保留的未使用代码警告（admin 模块、协议功能等）
+#![allow(dead_code)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+
 mod admin;
 mod admin_ui;
 mod anthropic;
 mod common;
 mod http_client;
-pub mod image;
 mod kiro;
 mod model;
 mod openai;
@@ -12,9 +18,14 @@ pub mod token;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use axum::http::StatusCode;
+use axum::response::Json;
+use axum::routing::{get, post};
 use clap::Parser;
 use kiro::background_refresh::BackgroundRefreshConfig;
-use kiro::endpoint::{CliEndpoint, IdeEndpoint, KiroEndpoint};
+#[allow(unused_imports)]
+use kiro::endpoint::CODEWHISPERER_ENDPOINT_NAME;
+use kiro::endpoint::{CliEndpoint, CodewhispererEndpoint, IdeEndpoint, KiroEndpoint};
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
@@ -34,6 +45,31 @@ async fn main() {
             .unwrap_or_else(|| Config::default_config_path().to_string());
         if let Err(e) = model::init::run_init(std::path::Path::new(&config_path), force) {
             eprintln!("初始化失败: {:#}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // social-helper 子命令：本机完成 OAuth 并回传远程 xkiro，独立于服务启动流程
+    if let Some(Command::SocialHelper {
+        server,
+        session,
+        provider,
+        api_key,
+        auth_endpoint,
+        proxy,
+    }) = args.command
+    {
+        let helper_args = kiro::auth::helper::HelperArgs {
+            server,
+            session,
+            provider,
+            api_key,
+            auth_endpoint,
+            proxy,
+        };
+        if let Err(e) = kiro::auth::helper::run(helper_args).await {
+            eprintln!("Social helper 失败: {:#}", e);
             std::process::exit(1);
         }
         return;
@@ -102,9 +138,23 @@ async fn main() {
 
     // 获取 API Key
     let api_key = config.api_key.clone().unwrap_or_else(|| {
-        tracing::error!("配置文件中未设置 apiKey");
-        std::process::exit(1);
+        if config.require_api_key {
+            tracing::error!("配置文件中未设置 apiKey");
+            std::process::exit(1);
+        }
+        String::new()
     });
+    let client_api_key_runtime = Arc::new(RwLock::new(api_key.clone()));
+    let require_api_key_runtime =
+        Arc::new(std::sync::atomic::AtomicBool::new(config.require_api_key));
+    let admin_api_key_runtime = Arc::new(RwLock::new(
+        config.admin_api_key.clone().unwrap_or_default(),
+    ));
+    let thinking_config = Arc::new(RwLock::new(anthropic::middleware::ThinkingRuntimeConfig {
+        suffix: config.thinking_suffix.clone(),
+        openai_format: config.openai_thinking_format.clone(),
+        claude_format: config.claude_thinking_format.clone(),
+    }));
 
     // 构建代理配置
     let proxy_config = config.proxy_url.as_ref().map(|url| {
@@ -126,6 +176,8 @@ async fn main() {
         endpoints.insert(ide.name().to_string(), Arc::new(ide));
         let cli = CliEndpoint::new();
         endpoints.insert(cli.name().to_string(), Arc::new(cli));
+        let cw = CodewhispererEndpoint::new();
+        endpoints.insert(cw.name().to_string(), Arc::new(cw));
     }
 
     // 校验默认端点存在
@@ -136,10 +188,7 @@ async fn main() {
 
     // 校验所有凭据声明的端点都已注册
     for cred in &credentials_list {
-        let name = cred
-            .endpoint
-            .as_deref()
-            .unwrap_or(&config.default_endpoint);
+        let name = cred.endpoint.as_deref().unwrap_or(&config.default_endpoint);
         if !endpoints.contains_key(name) {
             tracing::error!(
                 "凭据 id={:?} 指定了未知端点 \"{}\"（已注册: {:?}）",
@@ -195,6 +244,16 @@ async fn main() {
     // tiktoken cl100k_base 精确计数开关（admin API 不暴露热改，需重启）
     token::set_precise_counting(config.precise_token_counting);
 
+    let api_keys_cache_dir = token_manager.cache_dir();
+    let api_keys_store_path = api_keys_cache_dir
+        .as_ref()
+        .map(|d| d.join("kiro_api_keys.json"));
+    let api_keys_runtime = admin::AdminService::load_api_keys_runtime_with_legacy(
+        api_keys_cache_dir.as_deref(),
+        config.api_key.as_deref(),
+        config.require_api_key,
+    );
+
     // 共享压缩配置（admin API 可运行时修改）
     let compression_config = Arc::new(RwLock::new(config.compression.clone()));
 
@@ -206,21 +265,18 @@ async fn main() {
 
     // Prompt Cache 运行时（共享引用，支持热更新）
     // Prompt Cache 运行时（共享引用，支持热更新）
-    let prompt_cache_runtime = Arc::new(RwLock::new(
-        anthropic::middleware::PromptCacheRuntime::new(
+    let prompt_cache_runtime =
+        Arc::new(RwLock::new(anthropic::middleware::PromptCacheRuntime::new(
             config.prompt_cache_ttl_seconds,
             config.prompt_cache_accounting_enabled,
-        ),
-    ));
-
-    // 截断恢复识别开关（admin API 可运行时修改）
-    let truncation_recovery_notice = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
-        config.truncation_recovery_system_notice,
-    ));
+        )));
 
     // 构建 Anthropic API 路由（profile_arn 由首个凭据提供）
     let anthropic_app = anthropic::create_router_with_provider(
         &api_key,
+        config.require_api_key,
+        client_api_key_runtime.clone(),
+        require_api_key_runtime.clone(),
         Some(kiro_provider.clone()),
         first_credentials.profile_arn.clone(),
         config.extract_thinking,
@@ -228,7 +284,12 @@ async fn main() {
         prompt_filter_config.clone(),
         prompt_runtime.clone(),
         prompt_cache_runtime.clone(),
-        truncation_recovery_notice.clone(),
+        thinking_config.clone(),
+        api_keys_runtime.clone(),
+        api_keys_store_path,
+        Some(crate::openai::responses_store::responses_store_dir(
+            std::path::Path::new(&config_path),
+        )),
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
@@ -248,12 +309,21 @@ async fn main() {
                 token_manager.clone(),
                 Some(kiro_provider.clone()),
                 compression_config.clone(),
+                client_api_key_runtime.clone(),
+                require_api_key_runtime.clone(),
+                admin_api_key_runtime.clone(),
+                prompt_filter_config.clone(),
+                thinking_config.clone(),
                 prompt_cache_runtime.clone(),
                 prompt_runtime.clone(),
-                truncation_recovery_notice.clone(),
+                api_keys_runtime.clone(),
                 endpoint_names.clone(),
             );
-            let admin_state = admin::AdminState::new(admin_key, admin_service, compression_config.clone());
+            let admin_state = admin::AdminState::new(
+                admin_api_key_runtime,
+                admin_service,
+                compression_config.clone(),
+            );
 
             // 注册 credit usage 观察者：metering 事件透传时同步更新 admin disk cache
             {
@@ -270,10 +340,7 @@ async fn main() {
             }
             // 启动周期性余额刷新：周期/并发/启停由 config.balance_refresh_* 控制（热更新）
             // 同步两层缓存（admin disk + token_manager 运行时），低余额自动禁用
-            admin_state
-                .service
-                .clone()
-                .start_periodic_balance_refresh();
+            admin_state.service.clone().start_periodic_balance_refresh();
 
             let admin_app = admin::create_admin_router(admin_state);
 
@@ -283,23 +350,69 @@ async fn main() {
             tracing::info!("Admin API 已启用");
             tracing::info!("Admin UI 已启用: /admin");
             anthropic_app
-                .nest("/api/admin", admin_app)
+                .nest("/api/admin", admin_app.clone())
+                .nest("/admin/api", admin_app)
                 .nest("/admin", admin_ui_app)
         }
     } else {
         anthropic_app
     };
 
+    // 记录启动时间（用于 health endpoint uptime 计算）
+    let start_time = std::time::Instant::now();
+
+    // 添加公共端点（无需 API Key 认证）：health、telemetry sink
+    let app = app
+        .route(
+            "/health",
+            get({
+                let start_time = start_time;
+                move || async move {
+                    let uptime = start_time.elapsed().as_secs();
+                    Json(serde_json::json!({
+                        "status": "ok",
+                        "version": env!("CARGO_PKG_VERSION"),
+                        "uptime": uptime
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/",
+            get({
+                let start_time = start_time;
+                move || async move {
+                    let uptime = start_time.elapsed().as_secs();
+                    Json(serde_json::json!({
+                        "status": "ok",
+                        "version": env!("CARGO_PKG_VERSION"),
+                        "uptime": uptime
+                    }))
+                }
+            }),
+        )
+        // Claude Code 遥测端点：黑洞，返回 200 OK
+        .route(
+            "/api/event_logging/batch",
+            post(|| async { (StatusCode::OK, Json(serde_json::json!({"status":"ok"}))) }),
+        );
+
     // 启动服务器
     let addr = format!("{}:{}", config.host, config.port);
     tracing::info!("启动 Anthropic API 端点: {}", addr);
-    tracing::info!("API Key: {}***", &api_key[..(api_key.len() / 2)]);
+    if config.require_api_key {
+        tracing::info!("API Key: {}***", &api_key[..(api_key.len() / 2)]);
+    } else {
+        tracing::info!("API Key 认证已关闭");
+    }
     tracing::info!("可用 API:");
+    tracing::info!("  GET  /health");
     tracing::info!("  GET  /v1/models");
     tracing::info!("  POST /v1/messages");
     tracing::info!("  POST /v1/messages/count_tokens");
     tracing::info!("  POST /v1/chat/completions");
     tracing::info!("  POST /v1/responses");
+    tracing::info!("  POST /api/event_logging/batch");
     if admin_key_valid {
         tracing::info!("Admin API:");
         tracing::info!("  GET  /api/admin/credentials");

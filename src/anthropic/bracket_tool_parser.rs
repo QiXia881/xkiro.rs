@@ -80,7 +80,11 @@ pub fn parse_bracket_tool_calls(text: &str) -> Vec<BracketToolCall> {
     let mut out = Vec::new();
     for m in header_regex().captures_iter(text) {
         let full = m.get(0).expect("regex group 0 always present");
-        let name = m.get(1).expect("name group always present").as_str().to_string();
+        let name = m
+            .get(1)
+            .expect("name group always present")
+            .as_str()
+            .to_string();
         let args_start = full.end();
         let json_start = match text[args_start..].find('{') {
             Some(rel) => args_start + rel,

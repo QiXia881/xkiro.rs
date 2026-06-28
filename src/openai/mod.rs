@@ -11,5 +11,6 @@
 
 pub mod converter;
 pub mod handlers;
+pub mod responses_store;
 pub mod stream;
 pub mod types;

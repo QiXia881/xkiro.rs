@@ -26,13 +26,12 @@ anyhow = "1.0"
 http = "1.0"
 futures = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1.10", features = ["v1", "v4", "fast-rng"] }
+uuid = { version = "1.10", features = ["v1", "v4", "v5", "fast-rng"] }
 fastrand = "2"
 sha2 = "0.10"
 hex = "0.4"
 crc = "3"           # CRC32C 计算
 base64 = "0.22"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 bytes = "1"         # 高效的字节缓冲区
 tower-http = { version = "0.6", features = ["cors"] }
 clap = { version = "4.5", features = ["derive"] }

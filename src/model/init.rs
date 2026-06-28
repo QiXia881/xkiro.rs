@@ -3,9 +3,9 @@
 //! 通过命令行问答生成最小可运行的 `config.json`：
 //! - host / port / apiKey 必填，提供默认值
 //! - adminApiKey 选填；留空则 Admin API + Admin UI 全部禁用
-//! - 其它字段（region / 压缩 / 提示词等）全部使用 [`Config::default`] 兜底
+//! - 其它字段（region / 提示词等）全部使用 [`Config::default`] 兜底
 //!
-//! 设计目标：让首次跑 xkiro-rs 的人 30 秒内拿到能用的配置文件，
+//! 设计目标：让首次跑 xkiro.rs 的人 30 秒内拿到能用的配置文件，
 //! 同时把"前端入口需要 adminApiKey"这件事讲清楚。
 
 use std::io::{self, Write};
@@ -68,17 +68,14 @@ fn prompt_yes_no(msg: &str, default_yes: bool) -> Result<bool> {
 pub fn run_init(path: &Path, force: bool) -> Result<()> {
     println!();
     println!("============================================================");
-    println!("  xkiro-rs 配置向导");
+    println!("  xkiro.rs 配置向导");
     println!("============================================================");
     println!("将生成最小可运行的 config.json，回车使用括号内默认值。");
-    println!("除此处询问的字段外，其它配置（region/压缩/提示词等）使用内置默认值。");
+    println!("除此处询问的字段外，其它配置（region/提示词等）使用内置默认值。");
     println!();
 
     if path.exists() && !force {
-        let overwrite = prompt_yes_no(
-            &format!("文件 {} 已存在，覆盖？", path.display()),
-            false,
-        )?;
+        let overwrite = prompt_yes_no(&format!("文件 {} 已存在，覆盖？", path.display()), false)?;
         if !overwrite {
             println!("已取消。");
             return Ok(());
@@ -92,7 +89,7 @@ pub fn run_init(path: &Path, force: bool) -> Result<()> {
         .parse()
         .map_err(|_| anyhow::anyhow!("端口必须是 0-65535 的整数: {}", port_str))?;
 
-    // apiKey（下游客户端访问 xkiro-rs 时的 Bearer Token）
+    // apiKey（下游客户端访问 xkiro.rs 时的 Bearer Token）
     println!();
     println!("【apiKey】下游客户端调用 /v1/messages 等接口时携带的 Bearer Token。");
     println!("         留空将拒绝启动；建议使用随机生成的默认值。");
@@ -114,19 +111,12 @@ pub fn run_init(path: &Path, force: bool) -> Result<()> {
         Some(admin_api_key)
     };
 
-    // 图片压缩开关
-    println!();
-    println!("【图片压缩】对入站图片做缩放 + 重编码，节省 token + 请求体。");
-    println!("            上游若已压缩（如 TRAE 国际版），重复压缩会损失质量，建议关闭。");
-    let image_compression_enabled = prompt_yes_no("启用图片压缩？", true)?;
-
     // 组装配置：从 default 起步，仅覆盖问到的字段
     let mut config = Config::default();
     config.host = host;
     config.port = port;
     config.api_key = Some(api_key);
     config.admin_api_key = admin_api_key.clone();
-    config.compression.image_compression_enabled = image_compression_enabled;
 
     // 写盘
     let content = serde_json::to_string_pretty(&config).context("序列化配置失败")?;
@@ -142,10 +132,7 @@ pub fn run_init(path: &Path, force: bool) -> Result<()> {
     println!();
     println!("------------------------------------------------------------");
     println!("配置已写入: {}", path.display());
-    println!(
-        "  监听: {}:{}",
-        config.host, config.port
-    );
+    println!("  监听: {}:{}", config.host, config.port);
     if admin_api_key.is_some() {
         println!(
             "  Admin UI: http://{}:{}/admin (使用 adminApiKey 登录)",
@@ -159,18 +146,10 @@ pub fn run_init(path: &Path, force: bool) -> Result<()> {
     } else {
         println!("  Admin UI: 未启用（adminApiKey 留空）");
     }
-    println!(
-        "  图片压缩: {}",
-        if image_compression_enabled {
-            "启用"
-        } else {
-            "禁用（透传原图）"
-        }
-    );
     println!("------------------------------------------------------------");
     println!("下一步：");
     println!("  1. 准备 credentials.json（社交登录或 idc 账号）");
-    println!("  2. 直接运行 xkiro-rs 即可启动服务");
+    println!("  2. 直接运行 xkiro.rs 即可启动服务");
     println!();
 
     Ok(())

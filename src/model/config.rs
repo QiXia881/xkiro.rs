@@ -47,42 +47,10 @@ pub struct UserPreset {
     pub content: String,
 }
 
-
 /// 压缩配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompressionConfig {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default = "default_true")]
-    pub whitespace_compression: bool,
-    #[serde(default = "default_thinking_strategy")]
-    pub thinking_strategy: String,
-    #[serde(default = "default_8000")]
-    pub tool_result_max_chars: usize,
-    #[serde(default = "default_80")]
-    pub tool_result_head_lines: usize,
-    #[serde(default = "default_40")]
-    pub tool_result_tail_lines: usize,
-    #[serde(default = "default_6000")]
-    pub tool_use_input_max_chars: usize,
-    #[serde(default = "default_4000")]
-    pub tool_description_max_chars: usize,
-    #[serde(default = "default_80_turns")]
-    pub max_history_turns: usize,
-    #[serde(default = "default_400k")]
-    pub max_history_chars: usize,
-    #[serde(default = "default_image_max_long_edge")]
-    pub image_max_long_edge: u32,
-    #[serde(default = "default_image_max_pixels_single")]
-    pub image_max_pixels_single: u32,
-    #[serde(default = "default_image_max_pixels_multi")]
-    pub image_max_pixels_multi: u32,
-    #[serde(default = "default_image_multi_threshold")]
-    pub image_multi_threshold: usize,
-    /// 图片压缩开关：关闭后透传原始图片（适用于上游已压缩的场景，如 TRAE 国际版）
-    #[serde(default = "default_true")]
-    pub image_compression_enabled: bool,
     #[serde(default = "default_max_request_body_bytes")]
     pub max_request_body_bytes: usize,
 }
@@ -90,21 +58,6 @@ pub struct CompressionConfig {
 impl Default for CompressionConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
-            whitespace_compression: true,
-            thinking_strategy: default_thinking_strategy(),
-            tool_result_max_chars: default_8000(),
-            tool_result_head_lines: default_80(),
-            tool_result_tail_lines: default_40(),
-            tool_use_input_max_chars: default_6000(),
-            tool_description_max_chars: default_4000(),
-            max_history_turns: default_80_turns(),
-            max_history_chars: default_400k(),
-            image_max_long_edge: default_image_max_long_edge(),
-            image_max_pixels_single: default_image_max_pixels_single(),
-            image_max_pixels_multi: default_image_max_pixels_multi(),
-            image_multi_threshold: default_image_multi_threshold(),
-            image_compression_enabled: true,
             max_request_body_bytes: default_max_request_body_bytes(),
         }
     }
@@ -113,49 +66,18 @@ impl Default for CompressionConfig {
 fn default_true() -> bool {
     true
 }
-fn default_thinking_strategy() -> String {
-    "discard".to_string()
-}
-fn default_8000() -> usize {
-    8000
-}
-fn default_80() -> usize {
-    80
-}
-fn default_40() -> usize {
-    40
-}
-fn default_6000() -> usize {
-    6000
-}
-fn default_4000() -> usize {
-    4000
-}
-fn default_80_turns() -> usize {
-    80
-}
-fn default_400k() -> usize {
-    400_000
-}
-fn default_image_max_long_edge() -> u32 {
-    4000
-}
-fn default_image_max_pixels_single() -> u32 {
-    4_000_000
-}
-fn default_image_max_pixels_multi() -> u32 {
-    4_000_000
-}
-fn default_image_multi_threshold() -> usize {
-    20
-}
+
+/// 默认请求体大小上限
+///
+/// 对齐 Kiro-Go `maxPayloadBytes = 900 * 1024` (900KB)：
+/// Kiro 上游对请求体有硬性大小限制，超过会返回 400。
 fn default_max_request_body_bytes() -> usize {
-    4_718_592
+    900 * 1024 // 921,600 bytes = 900KB
 }
 
 /// 系统提示清洗配置
 ///
-/// 镜像 KAM `gateway/prompt_filter.rs` 的 4 个开关 + 自定义规则。
+/// 对齐 Kiro-Go `applyPromptFilters`：三个内置开关 + 自定义规则。
 /// 默认全 `false`、规则为空 —— 与未启用此模块时行为一致。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -169,10 +91,6 @@ pub struct PromptFilterConfig {
     /// 跳过 `# Environment` / `# auto memory` section 与单行噪音
     #[serde(default)]
     pub filter_env_noise: bool,
-    /// 剥离 Claude Code 客户端注入的安全/沙箱限制段（content_safety、git_safety、
-    /// safety_guardrails、executing_actions 等）。默认 false（opt-in）。
-    #[serde(default)]
-    pub filter_strip_restrictions: bool,
     /// 自定义过滤规则
     #[serde(default)]
     pub rules: Vec<PromptFilterRule>,
@@ -265,6 +183,10 @@ pub struct Config {
     #[serde(default)]
     pub admin_api_key: Option<String>,
 
+    /// 是否要求客户端 API Key（Kiro-Go 兼容设置）
+    #[serde(default = "default_true")]
+    pub require_api_key: bool,
+
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
     /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
@@ -275,6 +197,30 @@ pub struct Config {
     /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
+
+    /// Kiro-Go thinking 模型后缀（默认 "-thinking"）
+    #[serde(default = "default_thinking_suffix")]
+    pub thinking_suffix: String,
+
+    /// Kiro-Go OpenAI thinking 输出格式
+    #[serde(default = "default_openai_thinking_format")]
+    pub openai_thinking_format: String,
+
+    /// Kiro-Go Claude thinking 输出格式
+    #[serde(default = "default_claude_thinking_format")]
+    pub claude_thinking_format: String,
+
+    /// Kiro-Go 首选 endpoint（auto/kiro/codewhisperer/amazonq）
+    #[serde(default = "default_preferred_endpoint")]
+    pub preferred_endpoint: String,
+
+    /// Kiro-Go endpoint fallback 开关
+    #[serde(default = "default_true")]
+    pub endpoint_fallback: bool,
+
+    /// Kiro-Go 全局超额使用开关；开启后余额/配额耗尽不会触发自动禁用。
+    #[serde(default)]
+    pub allow_over_usage: bool,
 
     /// 端点特定的配置
     ///
@@ -350,13 +296,6 @@ pub struct Config {
     /// 关闭后停止后台周期拉取，调度仅用最后一次缓存值；启动预取不受影响。
     #[serde(default = "default_true")]
     pub balance_refresh_enabled: bool,
-
-    /// 是否在 system prompt 末尾注入截断恢复识别说明
-    ///
-    /// 告知模型 `[System Notice]` / `[API Limitation]` 是 xkiro 的截断恢复标记，
-    /// 不是 prompt injection。避免模型把这些标记当作越权指令而拒答。
-    #[serde(default = "default_true")]
-    pub truncation_recovery_system_notice: bool,
 
     /// 是否启用 tiktoken cl100k_base 精确 token 计数
     ///
@@ -467,6 +406,22 @@ fn default_endpoint() -> String {
     crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
 }
 
+fn default_thinking_suffix() -> String {
+    "-thinking".to_string()
+}
+
+fn default_openai_thinking_format() -> String {
+    "reasoning_content".to_string()
+}
+
+fn default_claude_thinking_format() -> String {
+    "thinking".to_string()
+}
+
+fn default_preferred_endpoint() -> String {
+    "auto".to_string()
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -488,8 +443,15 @@ impl Default for Config {
             proxy_username: None,
             proxy_password: None,
             admin_api_key: None,
+            require_api_key: true,
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
+            thinking_suffix: default_thinking_suffix(),
+            openai_thinking_format: default_openai_thinking_format(),
+            claude_thinking_format: default_claude_thinking_format(),
+            preferred_endpoint: default_preferred_endpoint(),
+            endpoint_fallback: true,
+            allow_over_usage: false,
             endpoints: HashMap::new(),
             compression: CompressionConfig::default(),
             prompt_filter: PromptFilterConfig::default(),
@@ -508,7 +470,6 @@ impl Default for Config {
             balance_refresh_concurrency: default_balance_refresh_concurrency(),
             session_affinity_enabled: false,
             privacy_mode: true,
-            truncation_recovery_system_notice: true,
             precise_token_counting: false,
             config_path: None,
         }

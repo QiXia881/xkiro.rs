@@ -1,18 +1,13 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 
-use crate::token::{
-    count_message_content_tokens, count_system_message_tokens, count_tool_definition_tokens,
-};
-
-use super::types::{CacheControl, Message, MessagesRequest};
+use super::types::{Message, MessagesRequest};
 
 const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(300);
 const ONE_HOUR_CACHE_TTL: Duration = Duration::from_secs(3600);
-const PREFIX_LOOKBACK_LIMIT: usize = 20;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CacheResult {
@@ -26,19 +21,13 @@ pub struct CacheResult {
 pub struct CacheProfile {
     total_input_tokens: i32,
     min_cacheable_tokens: i32,
-    blocks: Vec<CacheBlock>,
     breakpoints: Vec<CacheBreakpoint>,
 }
 
 #[derive(Debug, Clone)]
-struct CacheBlock {
+struct CacheBreakpoint {
     prefix_fingerprint: [u8; 32],
     cumulative_tokens: i32,
-}
-
-#[derive(Debug, Clone)]
-struct CacheBreakpoint {
-    block_index: usize,
     ttl: Duration,
 }
 
@@ -55,16 +44,14 @@ struct CachedCheckpointStore {
 
 pub struct CacheTracker {
     entries: Mutex<CachedCheckpointStore>,
-    max_supported_ttl: Duration,
 }
 
 impl CacheTracker {
-    pub fn new(max_supported_ttl: Duration) -> Self {
+    pub fn new(_max_supported_ttl: Duration) -> Self {
         Self {
             entries: Mutex::new(CachedCheckpointStore {
                 by_credential: HashMap::new(),
             }),
-            max_supported_ttl,
         }
     }
 
@@ -74,78 +61,48 @@ impl CacheTracker {
         total_input_tokens: i32,
     ) -> CacheProfile {
         let flattened = flatten_cacheable_blocks(payload);
-
-        // 与 prompt 内容无关但会影响官方缓存可复用性的固定配置。
-        let request_prelude = canonicalize_json(serde_json::json!({
-            "model": payload.model,
-            "tool_choice": payload.tool_choice,
-        }));
-        let prelude_bytes = serde_json::to_vec(&request_prelude).unwrap_or_default();
-        let mut prefix_hasher = Sha256::new();
-        prefix_hasher.update((prelude_bytes.len() as u64).to_be_bytes());
-        prefix_hasher.update(&prelude_bytes);
-
-        let mut blocks = Vec::with_capacity(flattened.len());
+        let mut hasher = Sha256::new();
         let mut breakpoints = Vec::new();
         let mut cumulative_tokens = 0i32;
+        let mut active_ttl = Duration::ZERO;
 
-        let mut active_ttl: Option<Duration> = None;
-        let mut seen_breakpoints: std::collections::BTreeSet<usize> =
-            std::collections::BTreeSet::new();
-
-        for (index, block) in flattened.into_iter().enumerate() {
+        for block in flattened {
+            let canonical = canonicalize_cache_value(&block.value);
+            write_hash_chunk(&mut hasher, &canonical);
             cumulative_tokens = cumulative_tokens.saturating_add(block.tokens);
 
-            let block_bytes = serde_json::to_vec(&block.value).unwrap_or_default();
-            let block_hash: [u8; 32] = Sha256::digest(&block_bytes).into();
+            let breakpoint_ttl = if block.ttl > Duration::ZERO {
+                let ttl = normalize_prompt_cache_ttl(block.ttl);
+                active_ttl = ttl;
+                ttl
+            } else if block.is_message_end && active_ttl > Duration::ZERO {
+                active_ttl
+            } else {
+                Duration::ZERO
+            };
 
-            let mut next_prefix_hasher = prefix_hasher.clone();
-            next_prefix_hasher.update(block_hash);
-            let prefix_fingerprint: [u8; 32] = next_prefix_hasher.finalize().into();
-            prefix_hasher = Sha256::new();
-            prefix_hasher.update(prefix_fingerprint);
-
-            blocks.push(CacheBlock {
-                prefix_fingerprint,
-                cumulative_tokens,
-            });
-
-            if let Some(ttl) = block.breakpoint_ttl {
-                let ttl = ttl.min(self.max_supported_ttl);
-                active_ttl = Some(ttl);
-                if seen_breakpoints.insert(index) {
-                    breakpoints.push(CacheBreakpoint {
-                        block_index: index,
-                        ttl,
-                    });
-                }
-            }
-
-            if block.is_message_end
-                && block.message_index.is_some()
-                && let Some(ttl) = active_ttl
-                && seen_breakpoints.insert(index)
-            {
+            if breakpoint_ttl > Duration::ZERO {
+                let prefix_fingerprint: [u8; 32] = hasher.clone().finalize().into();
                 breakpoints.push(CacheBreakpoint {
-                    block_index: index,
-                    ttl,
+                    prefix_fingerprint,
+                    cumulative_tokens,
+                    ttl: breakpoint_ttl,
                 });
             }
         }
 
         CacheProfile {
-            total_input_tokens: total_input_tokens.max(0),
+            total_input_tokens: total_input_tokens.max(cumulative_tokens).max(0),
             min_cacheable_tokens: minimum_cacheable_tokens_for_model(&payload.model),
-            blocks,
             breakpoints,
         }
     }
 
     pub fn compute(&self, credential_id: u64, profile: &CacheProfile) -> CacheResult {
-        let Some(last_breakpoint) = profile.last_cacheable_breakpoint() else {
+        let Some(last_breakpoint) = profile.last_breakpoint() else {
             return CacheResult::default();
         };
-        let last_breakpoint_tokens = last_breakpoint
+        let mut last_breakpoint_tokens = last_breakpoint
             .cumulative_tokens
             .min(profile.total_input_tokens);
 
@@ -154,16 +111,35 @@ impl CacheTracker {
         prune_expired(&mut entries.by_credential, now);
 
         let Some(credential_entries) = entries.by_credential.get_mut(&credential_id) else {
-            // 首次请求，需要创建缓存
             tracing::debug!(credential_id, "首次请求，无缓存条目");
+            let effective_creation = if last_breakpoint_tokens < profile.min_cacheable_tokens {
+                0
+            } else {
+                last_breakpoint_tokens
+            };
             let (cache_5m, cache_1h) = compute_ttl_breakdown(profile, 0);
             return CacheResult {
                 cache_read_input_tokens: 0,
-                cache_creation_input_tokens: last_breakpoint_tokens,
+                cache_creation_input_tokens: effective_creation,
                 cache_creation_5m_input_tokens: cache_5m,
                 cache_creation_1h_input_tokens: cache_1h,
             };
         };
+        if credential_entries.is_empty() {
+            tracing::debug!(credential_id, "首次请求，缓存条目为空");
+            let effective_creation = if last_breakpoint_tokens < profile.min_cacheable_tokens {
+                0
+            } else {
+                last_breakpoint_tokens
+            };
+            let (cache_5m, cache_1h) = compute_ttl_breakdown(profile, 0);
+            return CacheResult {
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: effective_creation,
+                cache_creation_5m_input_tokens: cache_5m,
+                cache_creation_1h_input_tokens: cache_1h,
+            };
+        }
 
         tracing::debug!(
             credential_id,
@@ -171,24 +147,26 @@ impl CacheTracker {
             "查找缓存匹配"
         );
 
+        let max_cacheable = ((profile.total_input_tokens as f64) * 0.85) as i32;
+        if last_breakpoint_tokens > max_cacheable {
+            last_breakpoint_tokens = max_cacheable;
+        }
+
         let mut matched_tokens = 0;
 
-        let cacheable_breakpoints = profile.cacheable_breakpoints();
-        let candidate_breakpoints: Vec<_> = cacheable_breakpoints
-            .iter()
-            .rev()
-            .take(PREFIX_LOOKBACK_LIMIT)
-            .copied()
-            .collect();
-
-        'outer: for breakpoint in candidate_breakpoints {
-            let candidate = &profile.blocks[breakpoint.block_index];
-            if let Some(entry) = credential_entries.get_mut(&candidate.prefix_fingerprint) {
+        'outer: for breakpoint in profile.breakpoints.iter().rev() {
+            if breakpoint.cumulative_tokens < profile.min_cacheable_tokens {
+                continue;
+            }
+            if let Some(entry) = credential_entries.get_mut(&breakpoint.prefix_fingerprint) {
                 if entry.expires_at <= now {
                     continue;
                 }
                 entry.expires_at = now + entry.ttl;
-                matched_tokens = breakpoint.cumulative_tokens.min(profile.total_input_tokens);
+                matched_tokens = breakpoint
+                    .cumulative_tokens
+                    .min(profile.total_input_tokens)
+                    .min(last_breakpoint_tokens);
                 break 'outer;
             }
         }
@@ -220,52 +198,47 @@ impl CacheTracker {
 
         let credential_entries = entries.by_credential.entry(credential_id).or_default();
 
-        for breakpoint in profile.cacheable_breakpoints() {
-            let block = &profile.blocks[breakpoint.block_index];
-            let next_expiry = now + breakpoint.ttl;
-
-            match credential_entries.get_mut(&block.prefix_fingerprint) {
-                Some(existing) => {
-                    existing.token_count = existing.token_count.max(block.cumulative_tokens);
-                    existing.ttl = existing.ttl.max(breakpoint.ttl);
-                    existing.expires_at = existing.expires_at.max(next_expiry);
-                }
-                None => {
-                    credential_entries.insert(
-                        block.prefix_fingerprint,
-                        CacheEntry {
-                            token_count: block.cumulative_tokens,
-                            ttl: breakpoint.ttl,
-                            expires_at: next_expiry,
-                        },
-                    );
-                }
+        for breakpoint in &profile.breakpoints {
+            if breakpoint.cumulative_tokens < profile.min_cacheable_tokens {
+                continue;
             }
+            credential_entries.insert(
+                breakpoint.prefix_fingerprint,
+                CacheEntry {
+                    token_count: breakpoint.cumulative_tokens,
+                    ttl: breakpoint.ttl,
+                    expires_at: now + breakpoint.ttl,
+                },
+            );
         }
     }
 }
 
 /// 计算不同 TTL 的缓存创建 token 数
 fn compute_ttl_breakdown(profile: &CacheProfile, matched_tokens: i32) -> (i32, i32) {
-    let Some(last_breakpoint) = profile.last_cacheable_breakpoint() else {
-        return (0, 0);
-    };
-
-    let new_tokens = last_breakpoint
-        .cumulative_tokens
-        .min(profile.total_input_tokens)
-        .saturating_sub(matched_tokens)
-        .max(0);
-
-    if new_tokens == 0 {
+    if profile.breakpoints.is_empty() {
         return (0, 0);
     }
 
-    if last_breakpoint.ttl == ONE_HOUR_CACHE_TTL {
-        (0, new_tokens)
-    } else {
-        (new_tokens, 0)
+    let mut cache_5m = 0;
+    let mut cache_1h = 0;
+    let mut previous = matched_tokens;
+
+    for breakpoint in &profile.breakpoints {
+        let current = breakpoint.cumulative_tokens.min(profile.total_input_tokens);
+        if current <= previous {
+            continue;
+        }
+        let delta = current - previous;
+        if breakpoint.ttl >= ONE_HOUR_CACHE_TTL {
+            cache_1h += delta;
+        } else {
+            cache_5m += delta;
+        }
+        previous = current;
     }
+
+    (cache_5m, cache_1h)
 }
 
 impl CacheProfile {
@@ -278,18 +251,25 @@ impl CacheProfile {
         self.breakpoints
             .iter()
             .filter_map(|breakpoint| {
-                let block = self.blocks.get(breakpoint.block_index)?;
-                if block.cumulative_tokens < self.min_cacheable_tokens {
+                if breakpoint.cumulative_tokens < self.min_cacheable_tokens {
                     return None;
                 }
 
                 Some(ResolvedBreakpoint {
-                    block_index: breakpoint.block_index,
-                    cumulative_tokens: block.cumulative_tokens,
+                    cumulative_tokens: breakpoint.cumulative_tokens,
                     ttl: breakpoint.ttl,
                 })
             })
             .collect()
+    }
+
+    fn last_breakpoint(&self) -> Option<ResolvedBreakpoint> {
+        self.breakpoints
+            .last()
+            .map(|breakpoint| ResolvedBreakpoint {
+                cumulative_tokens: breakpoint.cumulative_tokens,
+                ttl: breakpoint.ttl,
+            })
     }
 
     fn last_cacheable_breakpoint(&self) -> Option<ResolvedBreakpoint> {
@@ -299,7 +279,6 @@ impl CacheProfile {
 
 #[derive(Debug, Clone, Copy)]
 struct ResolvedBreakpoint {
-    block_index: usize,
     cumulative_tokens: i32,
     ttl: Duration,
 }
@@ -308,52 +287,59 @@ struct ResolvedBreakpoint {
 struct PendingBlock {
     value: serde_json::Value,
     tokens: i32,
-    breakpoint_ttl: Option<Duration>,
-    message_index: Option<usize>,
+    ttl: Duration,
     is_message_end: bool,
 }
 
 fn flatten_cacheable_blocks(payload: &MessagesRequest) -> Vec<PendingBlock> {
     let mut blocks = Vec::new();
 
+    let prelude = serde_json::json!({
+        "kind": "request_prelude",
+        "model": payload.model,
+        "tool_choice": payload.tool_choice,
+    });
+    append_cache_block(&mut blocks, prelude, Duration::ZERO, false);
+
     if let Some(tools) = &payload.tools {
         for (tool_index, tool) in tools.iter().enumerate() {
-            let mut value = serde_json::to_value(tool).unwrap_or(serde_json::Value::Null);
-            let breakpoint_ttl = extract_cache_ttl(&value);
-            strip_cache_control(&mut value);
-
-            blocks.push(PendingBlock {
-                value: canonicalize_json(serde_json::json!({
-                    "kind": "tool",
-                    "tool_index": tool_index,
-                    "tool": value,
-                })),
-                tokens: count_tool_definition_tokens(tool) as i32,
-                breakpoint_ttl,
-                message_index: None,
-                is_message_end: false,
+            let tool_value = serde_json::json!({
+                "kind": "tool",
+                "tool_index": tool_index,
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.input_schema,
             });
+            let ttl = serde_json::to_value(tool)
+                .ok()
+                .and_then(|value| extract_cache_ttl(&value))
+                .unwrap_or(Duration::ZERO);
+            append_cache_block(
+                &mut blocks,
+                strip_cache_position_keys(tool_value),
+                ttl,
+                false,
+            );
         }
     }
 
     if let Some(system) = &payload.system {
         for (system_index, block) in system.iter().enumerate() {
-            let mut value = serde_json::to_value(block).unwrap_or(serde_json::Value::Null);
-            let breakpoint_ttl = extract_cache_ttl(&value);
-            strip_cache_control(&mut value);
-            canonicalize_system_block_for_cache(&mut value);
-
-            blocks.push(PendingBlock {
-                value: canonicalize_json(serde_json::json!({
+            let value = serde_json::to_value(block).unwrap_or(serde_json::Value::Null);
+            if is_anthropic_billing_header_block(&value) {
+                continue;
+            }
+            let ttl = extract_cache_ttl(&value).unwrap_or(Duration::ZERO);
+            append_cache_block(
+                &mut blocks,
+                strip_cache_position_keys(serde_json::json!({
                     "kind": "system",
                     "system_index": system_index,
                     "block": value,
                 })),
-                tokens: count_system_message_tokens(block) as i32,
-                breakpoint_ttl,
-                message_index: None,
-                is_message_end: false,
-            });
+                ttl,
+                false,
+            );
         }
     }
 
@@ -362,33 +348,6 @@ fn flatten_cacheable_blocks(payload: &MessagesRequest) -> Vec<PendingBlock> {
     }
 
     blocks
-}
-
-fn canonicalize_system_block_for_cache(value: &mut serde_json::Value) {
-    let Some(obj) = value.as_object_mut() else {
-        return;
-    };
-
-    let is_text_block = obj
-        .get("type")
-        .and_then(|v| v.as_str())
-        .map(|t| t == "text")
-        .unwrap_or(true);
-    if !is_text_block {
-        return;
-    }
-
-    let Some(text) = obj.get("text").and_then(|v| v.as_str()) else {
-        return;
-    };
-    if !text.starts_with("x-anthropic-billing-header:") {
-        return;
-    }
-
-    obj.insert(
-        "text".to_string(),
-        serde_json::Value::String("__anthropic_billing_header__".to_string()),
-    );
 }
 
 fn flatten_message_blocks(message_index: usize, message: &Message) -> Vec<PendingBlock> {
@@ -401,7 +360,7 @@ fn flatten_message_blocks(message_index: usize, message: &Message) -> Vec<Pendin
                 "type": "text",
                 "text": text,
             }),
-            None,
+            Duration::ZERO,
             true,
         )],
         serde_json::Value::Array(blocks) => {
@@ -410,15 +369,13 @@ fn flatten_message_blocks(message_index: usize, message: &Message) -> Vec<Pendin
                 .iter()
                 .enumerate()
                 .map(|(block_index, block)| {
-                    let breakpoint_ttl = extract_cache_ttl(block);
-                    let mut normalized = block.clone();
-                    strip_cache_control(&mut normalized);
+                    let ttl = extract_cache_ttl(block).unwrap_or(Duration::ZERO);
                     build_message_block(
                         message_index,
                         &message.role,
                         block_index,
-                        normalized,
-                        breakpoint_ttl,
+                        block.clone(),
+                        ttl,
                         block_index == last_block_index,
                     )
                 })
@@ -429,7 +386,7 @@ fn flatten_message_blocks(message_index: usize, message: &Message) -> Vec<Pendin
             &message.role,
             0,
             other.clone(),
-            None,
+            Duration::ZERO,
             true,
         )],
     }
@@ -440,66 +397,254 @@ fn build_message_block(
     role: &str,
     block_index: usize,
     block: serde_json::Value,
-    breakpoint_ttl: Option<Duration>,
+    ttl: Duration,
     is_message_end: bool,
 ) -> PendingBlock {
-    PendingBlock {
-        tokens: count_message_content_tokens(&block) as i32,
-        value: canonicalize_json(serde_json::json!({
+    let value = strip_cache_position_keys(serde_json::json!({
             "kind": "message",
             "message_index": message_index,
             "role": role,
             "block_index": block_index,
             "block": block,
-        })),
-        breakpoint_ttl,
-        message_index: Some(message_index),
+    }));
+    build_pending_block(value, ttl, is_message_end)
+}
+
+fn append_cache_block(
+    blocks: &mut Vec<PendingBlock>,
+    value: serde_json::Value,
+    ttl: Duration,
+    is_message_end: bool,
+) {
+    blocks.push(build_pending_block(value, ttl, is_message_end));
+}
+
+fn build_pending_block(
+    value: serde_json::Value,
+    ttl: Duration,
+    is_message_end: bool,
+) -> PendingBlock {
+    let canonical = canonicalize_cache_value(&value);
+    PendingBlock {
+        tokens: estimate_approx_tokens(&canonical),
+        value,
+        ttl: normalize_prompt_cache_ttl(ttl),
         is_message_end,
     }
 }
 
 fn extract_cache_ttl(value: &serde_json::Value) -> Option<Duration> {
-    let cache_control = value.get("cache_control")?;
-    let cache_control: CacheControl = serde_json::from_value(cache_control.clone()).ok()?;
-    if cache_control.cache_type != "ephemeral" {
+    let cache_control = value.get("cache_control")?.as_object()?;
+    let cache_type = cache_control
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if !cache_type.eq_ignore_ascii_case("ephemeral") {
         return None;
     }
 
-    Some(match cache_control.ttl.as_deref() {
-        Some("1h") => ONE_HOUR_CACHE_TTL,
-        _ => DEFAULT_CACHE_TTL,
-    })
+    parse_prompt_cache_ttl_value(cache_control.get("ttl")).or(Some(DEFAULT_CACHE_TTL))
 }
 
-fn strip_cache_control(value: &mut serde_json::Value) {
+fn parse_prompt_cache_ttl_value(value: Option<&serde_json::Value>) -> Option<Duration> {
+    match value? {
+        serde_json::Value::String(text) => parse_prompt_cache_ttl_string(text),
+        serde_json::Value::Number(number) => number
+            .as_u64()
+            .or_else(|| {
+                number.as_f64().and_then(|seconds| {
+                    if seconds.is_finite() && seconds > 0.0 {
+                        Some(seconds as u64)
+                    } else {
+                        None
+                    }
+                })
+            })
+            .filter(|seconds| *seconds > 0)
+            .map(Duration::from_secs),
+        _ => None,
+    }
+}
+
+fn parse_prompt_cache_ttl_string(value: &str) -> Option<Duration> {
+    let trimmed = value.trim().to_lowercase();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed == "1h" {
+        return Some(ONE_HOUR_CACHE_TTL);
+    }
+    if let Some(seconds) = trimmed.strip_suffix('s')
+        && let Ok(seconds) = seconds.parse::<u64>()
+        && seconds > 0
+    {
+        return Some(Duration::from_secs(seconds));
+    }
+    if let Some(minutes) = trimmed.strip_suffix('m')
+        && let Ok(minutes) = minutes.parse::<u64>()
+        && minutes > 0
+    {
+        return Some(Duration::from_secs(minutes.saturating_mul(60)));
+    }
+    if let Some(hours) = trimmed.strip_suffix('h')
+        && let Ok(hours) = hours.parse::<u64>()
+        && hours > 0
+    {
+        return Some(Duration::from_secs(hours.saturating_mul(3600)));
+    }
+    if let Ok(seconds) = trimmed.parse::<u64>()
+        && seconds > 0
+    {
+        return Some(Duration::from_secs(seconds));
+    }
+    None
+}
+
+fn normalize_prompt_cache_ttl(ttl: Duration) -> Duration {
+    if ttl <= Duration::ZERO {
+        Duration::ZERO
+    } else if ttl > ONE_HOUR_CACHE_TTL || ttl > DEFAULT_CACHE_TTL {
+        ONE_HOUR_CACHE_TTL
+    } else {
+        DEFAULT_CACHE_TTL
+    }
+}
+
+fn strip_cache_position_keys(value: serde_json::Value) -> serde_json::Value {
     match value {
-        serde_json::Value::Array(arr) => {
-            for item in arr {
-                strip_cache_control(item);
+        serde_json::Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (key, value) in map {
+                if matches!(
+                    key.as_str(),
+                    "tool_index" | "system_index" | "message_index" | "block_index"
+                ) {
+                    continue;
+                }
+                out.insert(key, value);
             }
+            serde_json::Value::Object(out)
+        }
+        other => other,
+    }
+}
+
+fn canonicalize_cache_value(value: &serde_json::Value) -> String {
+    let mut out = String::new();
+    write_canonical_json(&mut out, value);
+    out
+}
+
+fn write_canonical_json(out: &mut String, value: &serde_json::Value) {
+    match value {
+        serde_json::Value::Null => out.push_str("null"),
+        serde_json::Value::Bool(true) => out.push_str("true"),
+        serde_json::Value::Bool(false) => out.push_str("false"),
+        serde_json::Value::Number(number) => out.push_str(&number.to_string()),
+        serde_json::Value::String(text) => {
+            out.push_str(&serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string()));
+        }
+        serde_json::Value::Array(items) => {
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                write_canonical_json(out, item);
+            }
+            out.push(']');
         }
         serde_json::Value::Object(map) => {
-            map.remove("cache_control");
-            for item in map.values_mut() {
-                strip_cache_control(item);
+            out.push('{');
+            let mut keys: Vec<_> = map
+                .keys()
+                .filter(|key| key.as_str() != "cache_control")
+                .collect();
+            keys.sort();
+            for (index, key) in keys.into_iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                out.push_str(&serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_string()));
+                out.push(':');
+                if let Some(item) = map.get(key) {
+                    write_canonical_json(out, item);
+                }
             }
+            out.push('}');
         }
-        _ => {}
     }
+}
+
+fn write_hash_chunk(hasher: &mut Sha256, chunk: &str) {
+    hasher.update(chunk.len().to_string().as_bytes());
+    hasher.update([0]);
+    hasher.update(chunk.as_bytes());
+    hasher.update([0]);
+}
+
+fn estimate_approx_tokens(text: &str) -> i32 {
+    if text.is_empty() {
+        return 0;
+    }
+
+    let length = text.chars().count();
+    if length == 0 {
+        return 0;
+    }
+    if length < 5 {
+        return ((length as f64) / 3.0).ceil().max(1.0) as i32;
+    }
+
+    let mut regular_ascii = 0usize;
+    let mut digits = 0usize;
+    let mut symbols = 0usize;
+    let mut non_ascii = 0usize;
+
+    for ch in text.chars() {
+        match ch {
+            '\u{80}'.. => non_ascii += 1,
+            '0'..='9' => digits += 1,
+            '!'..='/' | ':'..='@' | '['..='`' | '{'..='~' => symbols += 1,
+            _ => regular_ascii += 1,
+        }
+    }
+
+    ((regular_ascii as f64) / 4.5
+        + (digits as f64) / 2.0
+        + (symbols as f64) / 1.5
+        + (non_ascii as f64) / 1.5)
+        .ceil()
+        .max(1.0) as i32
 }
 
 fn minimum_cacheable_tokens_for_model(model: &str) -> i32 {
     let model_lower = model.to_lowercase();
 
-    if model_lower.contains("haiku-4") || model_lower.contains("haiku_4") {
+    if model_lower.contains("opus") {
         4096
-    } else if model_lower.contains("opus") {
-        1024
-    } else if model_lower.contains("fable") || model_lower.contains("mythos") {
-        512
     } else {
         1024
     }
+}
+
+fn is_anthropic_billing_header_block(value: &serde_json::Value) -> bool {
+    let Some(obj) = value.as_object() else {
+        return false;
+    };
+    let is_text_block = obj
+        .get("type")
+        .and_then(|v| v.as_str())
+        .is_none_or(|t| t.is_empty() || t == "text");
+    if !is_text_block {
+        return false;
+    }
+    let Some(text) = obj.get("text").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    text.trim_start()
+        .to_lowercase()
+        .starts_with("x-anthropic-billing-header:")
 }
 
 fn prune_expired(entries: &mut HashMap<u64, HashMap<[u8; 32], CacheEntry>>, now: Instant) {
@@ -509,37 +654,18 @@ fn prune_expired(entries: &mut HashMap<u64, HashMap<[u8; 32], CacheEntry>>, now:
     });
 }
 
-fn canonicalize_json(value: serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::Array(arr) => {
-            serde_json::Value::Array(arr.into_iter().map(canonicalize_json).collect())
-        }
-        serde_json::Value::Object(map) => {
-            let ordered: BTreeMap<_, _> = map
-                .into_iter()
-                .map(|(key, value)| (key, canonicalize_json(value)))
-                .collect();
-
-            let mut out = serde_json::Map::new();
-            for (key, value) in ordered {
-                out.insert(key, value);
-            }
-            serde_json::Value::Object(out)
-        }
-        other => other,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::anthropic::types::{SystemMessage, Tool};
+    use crate::anthropic::types::{CacheControl, SystemMessage, Tool};
     use crate::token;
 
     fn build_request(messages: Vec<Message>) -> MessagesRequest {
         MessagesRequest {
             model: "claude-sonnet-4-6".to_string(),
             max_tokens: 1024,
+            temperature: None,
+            top_p: None,
             messages,
             stream: false,
             system: Some(vec![SystemMessage {
@@ -611,6 +737,78 @@ mod tests {
         ) as i32
     }
 
+    fn kiro_go_cache_cap(profile: &CacheProfile) -> i32 {
+        ((profile.total_input_tokens() as f64) * 0.85) as i32
+    }
+
+    #[test]
+    fn numeric_ttl_value_is_parsed_like_kiro_go() {
+        let req = build_request(vec![
+            msg(
+                "user",
+                serde_json::json!([{
+                    "type": "text",
+                    "text": long_cacheable_text(),
+                    "cache_control": { "type": "ephemeral", "ttl": 3600 }
+                }]),
+            ),
+            msg("assistant", serde_json::json!("R1")),
+        ]);
+        let tracker = CacheTracker::new(Duration::ZERO);
+        let profile = tracker.build_profile(&req, estimate_input_tokens(&req));
+
+        let breakpoints = profile.cacheable_breakpoints();
+        assert!(!breakpoints.is_empty());
+        assert!(
+            breakpoints
+                .iter()
+                .all(|bp| bp.ttl == Duration::from_secs(3600))
+        );
+    }
+
+    #[test]
+    fn system_numeric_ttl_deserializes_like_kiro_go() {
+        let payload = serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 1024,
+            "system": [{
+                "type": "text",
+                "text": long_cacheable_text(),
+                "cache_control": { "type": "ephemeral", "ttl": 3600 }
+            }],
+            "messages": [{ "role": "user", "content": "hello" }]
+        });
+        let req: MessagesRequest = serde_json::from_value(payload).unwrap();
+        let tracker = CacheTracker::new(Duration::from_secs(300));
+        let profile = tracker.build_profile(&req, estimate_input_tokens(&req));
+
+        assert_eq!(
+            profile.last_cacheable_breakpoint().map(|bp| bp.ttl),
+            Some(Duration::from_secs(3600))
+        );
+    }
+
+    #[test]
+    fn ttl_constructor_argument_does_not_cap_breakpoints_like_kiro_go() {
+        let req = build_request(vec![msg(
+            "user",
+            serde_json::json!([{
+                "type": "text",
+                "text": long_cacheable_text(),
+                "cache_control": { "type": "ephemeral", "ttl": "1h" }
+            }]),
+        )]);
+        let tracker = CacheTracker::new(Duration::from_secs(300));
+        let profile = tracker.build_profile(&req, estimate_input_tokens(&req));
+
+        assert!(
+            profile
+                .cacheable_breakpoints()
+                .iter()
+                .all(|bp| bp.ttl == Duration::from_secs(3600))
+        );
+    }
+
     #[test]
     fn attribution_header_drift_does_not_break_cache_hit() {
         let tracker = CacheTracker::new(Duration::from_secs(3600));
@@ -660,13 +858,76 @@ mod tests {
         let result = tracker.compute(1, &profile2);
         let expected_match = profile2
             .last_cacheable_breakpoint()
-            .map(|bp| bp.cumulative_tokens.min(profile2.total_input_tokens()))
+            .map(|bp| {
+                bp.cumulative_tokens
+                    .min(profile2.total_input_tokens())
+                    .min(kiro_go_cache_cap(&profile2))
+            })
             .unwrap_or(0);
 
         assert!(total1 != total2);
         assert!(result.cache_read_input_tokens > 0);
         assert_eq!(result.cache_read_input_tokens, expected_match);
         assert_eq!(result.cache_creation_input_tokens, 0);
+    }
+
+    #[test]
+    fn attribution_header_block_is_skipped_like_kiro_go() {
+        let tracker = CacheTracker::new(Duration::from_secs(3600));
+        let system_with_header = vec![
+            SystemMessage {
+                block_type: Some("text".to_string()),
+                text: "x-anthropic-billing-header: cc_version=2.1.87.1; cch=aaaaa;".to_string(),
+                cache_control: None,
+            },
+            SystemMessage {
+                block_type: Some("text".to_string()),
+                text: long_cacheable_text(),
+                cache_control: Some(CacheControl {
+                    cache_type: "ephemeral".to_string(),
+                    ttl: None,
+                }),
+            },
+        ];
+        let system_without_header = vec![SystemMessage {
+            block_type: Some("text".to_string()),
+            text: long_cacheable_text(),
+            cache_control: Some(CacheControl {
+                cache_type: "ephemeral".to_string(),
+                ttl: None,
+            }),
+        }];
+
+        let with_header = build_request_with_system(
+            vec![msg("user", serde_json::json!("hello"))],
+            system_with_header,
+        );
+        let without_header = build_request_with_system(
+            vec![msg("user", serde_json::json!("hello"))],
+            system_without_header,
+        );
+        let profile_with = tracker.build_profile(&with_header, estimate_input_tokens(&with_header));
+        let profile_without =
+            tracker.build_profile(&without_header, estimate_input_tokens(&without_header));
+
+        assert_eq!(
+            profile_with
+                .last_cacheable_breakpoint()
+                .map(|bp| bp.cumulative_tokens),
+            profile_without
+                .last_cacheable_breakpoint()
+                .map(|bp| bp.cumulative_tokens)
+        );
+    }
+
+    #[test]
+    fn opus_uses_4096_min_cacheable_tokens_like_kiro_go() {
+        assert_eq!(minimum_cacheable_tokens_for_model("claude-opus-4.8"), 4096);
+        assert_eq!(
+            minimum_cacheable_tokens_for_model("claude-sonnet-4.6"),
+            1024
+        );
+        assert_eq!(minimum_cacheable_tokens_for_model("claude-haiku-4.5"), 1024);
     }
 
     #[test]
@@ -723,6 +984,27 @@ mod tests {
     }
 
     #[test]
+    fn empty_credential_cache_after_uncacheable_update_is_treated_as_first_request_like_kiro_go() {
+        let tracker = CacheTracker::new(Duration::from_secs(3600));
+        let short_req = build_request(vec![msg("user", cache_text("short"))]);
+        let short_profile = tracker.build_profile(&short_req, estimate_input_tokens(&short_req));
+        tracker.update(1, &short_profile);
+
+        let long_req = build_request(vec![msg("user", cache_text(&long_cacheable_text()))]);
+        let long_profile = tracker.build_profile(&long_req, estimate_input_tokens(&long_req));
+        let result = tracker.compute(1, &long_profile);
+
+        assert_eq!(result.cache_read_input_tokens, 0);
+        assert_eq!(
+            result.cache_creation_input_tokens,
+            long_profile
+                .last_cacheable_breakpoint()
+                .map(|bp| bp.cumulative_tokens)
+                .unwrap_or(0)
+        );
+    }
+
+    #[test]
     fn same_content_with_shape_drift_does_not_false_hit() {
         let tracker = CacheTracker::new(Duration::from_secs(3600));
         let req1 = build_request(vec![msg("user", cache_text(&long_cacheable_text()))]);
@@ -766,7 +1048,7 @@ mod tests {
             result.cache_read_input_tokens,
             profile1
                 .last_cacheable_breakpoint()
-                .map(|bp| bp.cumulative_tokens)
+                .map(|bp| bp.cumulative_tokens.min(kiro_go_cache_cap(&profile2)))
                 .unwrap_or(0)
         );
         assert_eq!(result.cache_creation_input_tokens, 0);
@@ -801,10 +1083,20 @@ mod tests {
             .last_cacheable_breakpoint()
             .map(|bp| bp.cumulative_tokens)
             .unwrap_or(0);
+        let capped_last_tokens = profile2
+            .last_cacheable_breakpoint()
+            .map(|bp| bp.cumulative_tokens.min(kiro_go_cache_cap(&profile2)))
+            .unwrap_or(0);
 
         assert!(matched_tokens > 0);
-        assert_eq!(result.cache_read_input_tokens, matched_tokens);
-        assert!(result.cache_creation_input_tokens > 0);
+        assert_eq!(
+            result.cache_read_input_tokens,
+            matched_tokens.min(kiro_go_cache_cap(&profile2))
+        );
+        assert_eq!(
+            result.cache_creation_input_tokens,
+            capped_last_tokens.saturating_sub(result.cache_read_input_tokens)
+        );
     }
 
     #[test]
@@ -931,21 +1223,30 @@ mod tests {
             result.cache_creation_input_tokens,
             profile2
                 .last_cacheable_breakpoint()
-                .map(|bp| bp.cumulative_tokens)
+                .map(|bp| bp.cumulative_tokens.min(kiro_go_cache_cap(&profile2)))
                 .unwrap_or(0)
         );
     }
 
     #[test]
     fn minimum_cacheable_tokens_model_matrix() {
-        assert_eq!(minimum_cacheable_tokens_for_model("claude-opus-4-8"), 1024);
-        assert_eq!(minimum_cacheable_tokens_for_model("claude-opus-4-7"), 1024);
-        assert_eq!(minimum_cacheable_tokens_for_model("claude-sonnet-4-6"), 1024);
-        assert_eq!(minimum_cacheable_tokens_for_model("claude-sonnet-4-5-20250929"), 1024);
-        assert_eq!(minimum_cacheable_tokens_for_model("claude-haiku-4-5-20251001"), 4096);
-        assert_eq!(minimum_cacheable_tokens_for_model("claude-haiku-4-5"), 4096);
-        assert_eq!(minimum_cacheable_tokens_for_model("claude-fable-5"), 512);
-        assert_eq!(minimum_cacheable_tokens_for_model("claude-mythos-5"), 512);
+        assert_eq!(minimum_cacheable_tokens_for_model("claude-opus-4-8"), 4096);
+        assert_eq!(minimum_cacheable_tokens_for_model("claude-opus-4-7"), 4096);
+        assert_eq!(
+            minimum_cacheable_tokens_for_model("claude-sonnet-4-6"),
+            1024
+        );
+        assert_eq!(
+            minimum_cacheable_tokens_for_model("claude-sonnet-4-5-20250929"),
+            1024
+        );
+        assert_eq!(
+            minimum_cacheable_tokens_for_model("claude-haiku-4-5-20251001"),
+            1024
+        );
+        assert_eq!(minimum_cacheable_tokens_for_model("claude-haiku-4-5"), 1024);
+        assert_eq!(minimum_cacheable_tokens_for_model("claude-fable-5"), 1024);
+        assert_eq!(minimum_cacheable_tokens_for_model("claude-mythos-5"), 1024);
         assert_eq!(minimum_cacheable_tokens_for_model("claude-haiku-3"), 1024);
     }
 
@@ -964,7 +1265,10 @@ mod tests {
             }),
         };
 
-        let mut req1 = build_request_with_system(vec![msg("user", cache_text(&long_text))], vec![system_block.clone()]);
+        let mut req1 = build_request_with_system(
+            vec![msg("user", cache_text(&long_text))],
+            vec![system_block.clone()],
+        );
         // Replace tools with 15 distinct tools to push the system breakpoint beyond position 10
         req1.tools = Some(
             (0..15)

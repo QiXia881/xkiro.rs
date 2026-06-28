@@ -8,6 +8,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::kiro::model::events::{Event, MeteringEvent};
+use crate::token;
 
 use super::thinking_parser::{
     find_char_boundary, find_real_thinking_end_tag, find_real_thinking_end_tag_at_buffer_end,
@@ -24,7 +25,7 @@ use super::thinking_parser::{
 /// 上游 Kiro 不下发真实 Anthropic 签名，因此在 thinking 块结束前发一个
 /// `signature_delta` 占位字符串以满足客户端本地校验。该字段不参与转发回 Kiro
 /// 的逻辑（converter 只读 `block.thinking`，不读 signature）。
-pub(super) const THINKING_SIGNATURE_PLACEHOLDER: &str = "xkiro-rs-thinking-signature";
+pub(super) const THINKING_SIGNATURE_PLACEHOLDER: &str = "xkiro.rs-thinking-signature";
 
 pub(crate) use super::thinking_parser::extract_thinking_from_complete_text;
 
@@ -69,6 +70,20 @@ impl BlockState {
             stopped: false,
         }
     }
+}
+
+#[derive(Debug, Clone, Default)]
+struct StreamToolOutput {
+    name: String,
+    input: String,
+}
+
+#[derive(Debug, Clone)]
+struct StreamPendingToolUse {
+    tool_use_id: String,
+    name: String,
+    input_buffer: String,
+    generated_id: bool,
 }
 
 /// 最终事件 usage 字段聚合
@@ -353,6 +368,13 @@ impl SseStateManager {
 
 use super::converter::get_context_window_size;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThinkingStreamSource {
+    Unknown,
+    ReasoningEvent,
+    TagBlock,
+}
+
 /// 流处理上下文
 pub struct StreamContext {
     /// SSE 状态管理器
@@ -374,6 +396,10 @@ pub struct StreamContext {
     pub context_input_tokens: Option<i32>,
     /// 输出 tokens 累计
     pub output_tokens: i32,
+    actual_output_tokens: Option<i32>,
+    output_text: String,
+    output_thinking: String,
+    output_tool_uses: HashMap<String, StreamToolOutput>,
     /// 工具块索引映射 (tool_id -> block_index)
     pub tool_block_indices: HashMap<String, i32>,
     /// 工具名称反向映射（短名称 → 原始名称），用于响应时还原
@@ -397,6 +423,18 @@ pub struct StreamContext {
     strip_thinking_leading_newline: bool,
     /// 已发出的 text_delta 聚合内容（用于流末尾 bracket 工具调用回退检测）
     pub emitted_text: String,
+    /// 上一个 assistantResponseEvent 的完整内容（用于 chunk 归一化）
+    /// Kiro 上游发送累积文本而非增量，需要自行计算差量
+    last_assistant_content: String,
+    /// 上一个 reasoningContentEvent 的完整内容（用于 chunk 归一化）
+    last_reasoning_content: String,
+    thinking_source: ThinkingStreamSource,
+    drop_tag_thinking: bool,
+    /// 对齐 Kiro-Go `toolUseState.GeneratedID`: 工具名 → 生成的 fallback ID
+    /// 当上游未提供 tool_use_id 时，同一工具名复用同一个生成的 ID
+    generated_tool_ids: HashMap<String, String>,
+    pending_tool_use: Option<StreamPendingToolUse>,
+    thinking_format: String,
 }
 
 impl StreamContext {
@@ -408,6 +446,24 @@ impl StreamContext {
         thinking_enabled: bool,
         tool_name_map: HashMap<String, String>,
     ) -> Self {
+        Self::new_with_thinking_format(
+            model,
+            input_tokens,
+            cache_usage,
+            thinking_enabled,
+            tool_name_map,
+            "thinking",
+        )
+    }
+
+    pub fn new_with_thinking_format(
+        model: impl Into<String>,
+        input_tokens: i32,
+        cache_usage: Option<CacheUsageBreakdown>,
+        thinking_enabled: bool,
+        tool_name_map: HashMap<String, String>,
+        thinking_format: impl Into<String>,
+    ) -> Self {
         Self {
             state_manager: SseStateManager::new(),
             model: model.into(),
@@ -416,6 +472,10 @@ impl StreamContext {
             cache_usage,
             context_input_tokens: None,
             output_tokens: 0,
+            actual_output_tokens: None,
+            output_text: String::new(),
+            output_thinking: String::new(),
+            output_tool_uses: HashMap::new(),
             tool_block_indices: HashMap::new(),
             tool_name_map,
             thinking_enabled,
@@ -427,7 +487,75 @@ impl StreamContext {
             metering: None,
             strip_thinking_leading_newline: false,
             emitted_text: String::new(),
+            last_assistant_content: String::new(),
+            last_reasoning_content: String::new(),
+            thinking_source: ThinkingStreamSource::Unknown,
+            drop_tag_thinking: false,
+            generated_tool_ids: HashMap::new(),
+            pending_tool_use: None,
+            thinking_format: thinking_format.into(),
         }
+    }
+
+    pub fn set_actual_output_tokens(&mut self, output_tokens: i32) {
+        self.actual_output_tokens = Some(output_tokens);
+        self.output_tokens = output_tokens;
+    }
+
+    pub fn final_input_tokens(&self) -> i32 {
+        self.context_input_tokens.unwrap_or(self.input_tokens)
+    }
+
+    pub fn final_output_tokens(&self) -> i32 {
+        if let Some(output_tokens) = self.actual_output_tokens {
+            return output_tokens;
+        }
+
+        let mut content = Vec::new();
+        if !self.output_text.is_empty() {
+            content.push(json!({
+                "type": "text",
+                "text": self.output_text,
+            }));
+        }
+        if !self.output_thinking.is_empty() {
+            content.push(json!({
+                "type": "thinking",
+                "thinking": self.output_thinking,
+            }));
+        }
+        for (id, tool_use) in &self.output_tool_uses {
+            let mut block = json!({
+                "type": "tool_use",
+                "id": id,
+                "name": tool_use.name,
+            });
+            if !tool_use.input.is_empty() {
+                block["input"] = serde_json::from_str(&tool_use.input)
+                    .unwrap_or_else(|_| serde_json::Value::String(tool_use.input.clone()));
+            }
+            content.push(block);
+        }
+
+        token::estimate_output_tokens(&content)
+    }
+
+    fn allow_reasoning_source(&mut self) -> bool {
+        if self.thinking_source == ThinkingStreamSource::TagBlock {
+            return false;
+        }
+        self.thinking_source = ThinkingStreamSource::ReasoningEvent;
+        true
+    }
+
+    fn allow_tag_source(&mut self) -> bool {
+        if self.thinking_source == ThinkingStreamSource::ReasoningEvent {
+            return false;
+        }
+        if self.thinking_source == ThinkingStreamSource::Unknown {
+            self.thinking_source = ThinkingStreamSource::TagBlock;
+        }
+        self.thinking_source == ThinkingStreamSource::TagBlock
     }
 
     /// 生成 message_start 事件
@@ -485,7 +613,23 @@ impl StreamContext {
     /// 处理 Kiro 事件并转换为 Anthropic SSE 事件
     pub fn process_kiro_event(&mut self, event: &Event) -> Vec<SseEvent> {
         match event {
-            Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
+            Event::AssistantResponse(resp) => {
+                // Kiro 上游发送累积文本而非增量，需要归一化为差量
+                let delta = normalize_chunk(&resp.content, &mut self.last_assistant_content);
+                if delta.is_empty() {
+                    return Vec::new();
+                }
+                self.process_assistant_response(&delta)
+            }
+            Event::ReasoningContent(resp) => {
+                // reasoningContentEvent: thinking 模式下独立发送的推理内容
+                // 同样需要 chunk 归一化
+                let delta = normalize_chunk(&resp.text, &mut self.last_reasoning_content);
+                if delta.is_empty() {
+                    return Vec::new();
+                }
+                self.process_reasoning_content(&delta)
+            }
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
             Event::ContextUsage(context_usage) => {
                 // 从上下文使用百分比计算实际的 input_tokens
@@ -543,17 +687,71 @@ impl StreamContext {
             return Vec::new();
         }
 
-        // 估算 tokens
-        self.output_tokens += estimate_tokens(content);
-
         // 如果启用了thinking，需要处理thinking块
         if self.thinking_enabled {
             return self.process_content_with_thinking(content);
         }
 
         // 非 thinking 模式同样复用统一的 text_delta 发送逻辑，
-        // 以便在 tool_use 自动关闭文本块后能够自愈重建新的文本块，避免“吞字”。
+        // 以便在 tool_use 自动关闭文本块后能够自愈重建新的文本块，避免"吞字"。
         self.create_text_delta_events(content)
+    }
+
+    /// 处理推理/思考内容事件（reasoningContentEvent）
+    ///
+    /// Kiro 上游在 thinking 模式下会通过独立的 reasoningContentEvent 发送推理内容，
+    /// 而非嵌入在 assistantResponseEvent 的 `<thinking>` 标签中。
+    /// 此方法将推理内容转换为 Anthropic 的 thinking content block。
+    fn process_reasoning_content(&mut self, text: &str) -> Vec<SseEvent> {
+        if text.is_empty() {
+            return Vec::new();
+        }
+        if !self.thinking_enabled || !self.allow_reasoning_source() {
+            return Vec::new();
+        }
+
+        if self.thinking_format == "think" {
+            return self.create_text_delta_events(&format!("<think>{}</think>", text));
+        }
+
+        let mut events = Vec::new();
+
+        // 如果尚未创建 thinking block，创建一个
+        if self.thinking_block_index.is_none() {
+            let thinking_index = self.state_manager.next_block_index();
+            self.thinking_block_index = Some(thinking_index);
+            let start_events = self.state_manager.handle_content_block_start(
+                thinking_index,
+                "thinking",
+                json!({
+                    "type": "content_block_start",
+                    "index": thinking_index,
+                    "content_block": {
+                        "type": "thinking",
+                        "thinking": ""
+                    }
+                }),
+            );
+            events.extend(start_events);
+        }
+
+        // 发送 thinking_delta
+        if let Some(thinking_index) = self.thinking_block_index {
+            let delta_event = self.state_manager.handle_content_block_delta(
+                thinking_index,
+                json!({
+                    "type": "content_block_delta",
+                    "index": thinking_index,
+                    "delta": {
+                        "type": "thinking_delta",
+                        "thinking": text
+                    }
+                }),
+            );
+            events.extend(delta_event);
+        }
+
+        events
     }
 
     /// 处理包含thinking块的内容
@@ -578,25 +776,28 @@ impl StreamContext {
                     // 进入 thinking 块
                     self.in_thinking_block = true;
                     self.strip_thinking_leading_newline = true;
+                    self.drop_tag_thinking = !self.allow_tag_source();
                     self.thinking_buffer =
                         self.thinking_buffer[start_pos + "<thinking>".len()..].to_string();
 
-                    // 创建 thinking 块的 content_block_start 事件
-                    let thinking_index = self.state_manager.next_block_index();
-                    self.thinking_block_index = Some(thinking_index);
-                    let start_events = self.state_manager.handle_content_block_start(
-                        thinking_index,
-                        "thinking",
-                        json!({
-                            "type": "content_block_start",
-                            "index": thinking_index,
-                            "content_block": {
-                                "type": "thinking",
-                                "thinking": ""
-                            }
-                        }),
-                    );
-                    events.extend(start_events);
+                    if !self.drop_tag_thinking {
+                        // 创建 thinking 块的 content_block_start 事件
+                        let thinking_index = self.state_manager.next_block_index();
+                        self.thinking_block_index = Some(thinking_index);
+                        let start_events = self.state_manager.handle_content_block_start(
+                            thinking_index,
+                            "thinking",
+                            json!({
+                                "type": "content_block_start",
+                                "index": thinking_index,
+                                "content_block": {
+                                    "type": "thinking",
+                                    "thinking": ""
+                                }
+                            }),
+                        );
+                        events.extend(start_events);
+                    }
                 } else {
                     // 没有找到 <thinking>，检查是否可能是部分标签
                     // 保留可能是部分标签的内容
@@ -636,7 +837,7 @@ impl StreamContext {
                 if let Some(end_pos) = find_real_thinking_end_tag(&self.thinking_buffer) {
                     // 提取 thinking 内容
                     let thinking_content = self.thinking_buffer[..end_pos].to_string();
-                    if !thinking_content.is_empty() {
+                    if !self.drop_tag_thinking && !thinking_content.is_empty() {
                         if let Some(thinking_index) = self.thinking_block_index {
                             events.push(
                                 self.create_thinking_delta_event(thinking_index, &thinking_content),
@@ -649,18 +850,21 @@ impl StreamContext {
                     self.thinking_extracted = true;
 
                     // 发送空的 thinking_delta 事件，然后发送 content_block_stop 事件
-                    if let Some(thinking_index) = self.thinking_block_index {
-                        // 先发送空的 thinking_delta
-                        events.push(self.create_thinking_delta_event(thinking_index, ""));
-                        // signature_delta：满足客户端 thinking 模式下的本地校验
-                        events.push(self.create_signature_delta_event(thinking_index));
-                        // 再发送 content_block_stop
-                        if let Some(stop_event) =
-                            self.state_manager.handle_content_block_stop(thinking_index)
-                        {
-                            events.push(stop_event);
+                    if !self.drop_tag_thinking {
+                        if let Some(thinking_index) = self.thinking_block_index {
+                            // 先发送空的 thinking_delta
+                            events.push(self.create_thinking_delta_event(thinking_index, ""));
+                            // signature_delta：满足客户端 thinking 模式下的本地校验
+                            events.push(self.create_signature_delta_event(thinking_index));
+                            // 再发送 content_block_stop
+                            if let Some(stop_event) =
+                                self.state_manager.handle_content_block_stop(thinking_index)
+                            {
+                                events.push(stop_event);
+                            }
                         }
                     }
+                    self.drop_tag_thinking = false;
 
                     // 剥离 `</thinking>\n\n`（find_real_thinking_end_tag 已确认 \n\n 存在）
                     self.thinking_buffer =
@@ -679,7 +883,7 @@ impl StreamContext {
                     let safe_len = find_char_boundary(&self.thinking_buffer, target_len);
                     if safe_len > 0 {
                         let safe_content = self.thinking_buffer[..safe_len].to_string();
-                        if !safe_content.is_empty() {
+                        if !self.drop_tag_thinking && !safe_content.is_empty() {
                             if let Some(thinking_index) = self.thinking_block_index {
                                 events.push(
                                     self.create_thinking_delta_event(thinking_index, &safe_content),
@@ -712,12 +916,14 @@ impl StreamContext {
     /// 返回值包含可能的 content_block_start 事件和 content_block_delta 事件。
     fn create_text_delta_events(&mut self, text: &str) -> Vec<SseEvent> {
         let mut events = Vec::new();
+        events.extend(self.close_reasoning_thinking_block());
 
         // 累积已发出的文本，便于流末尾的 bracket 工具调用回退检测
         self.emitted_text.push_str(text);
+        self.output_text.push_str(text);
 
         // 如果当前 text_block_index 指向的块已经被关闭（例如 tool_use 开始时自动 stop），
-        // 则丢弃该索引并创建新的文本块继续输出，避免 delta 被状态机拒绝导致“吞字”。
+        // 则丢弃该索引并创建新的文本块继续输出，避免 delta 被状态机拒绝导致"吞字"。
         if let Some(idx) = self.text_block_index {
             if !self.state_manager.is_block_open_of_type(idx, "text") {
                 self.text_block_index = None;
@@ -767,8 +973,33 @@ impl StreamContext {
         events
     }
 
+    fn close_reasoning_thinking_block(&mut self) -> Vec<SseEvent> {
+        if self.thinking_source != ThinkingStreamSource::ReasoningEvent {
+            return Vec::new();
+        }
+        let Some(thinking_index) = self.thinking_block_index else {
+            return Vec::new();
+        };
+        if !self
+            .state_manager
+            .is_block_open_of_type(thinking_index, "thinking")
+        {
+            return Vec::new();
+        }
+
+        let mut events = Vec::new();
+        events.push(self.create_thinking_delta_event(thinking_index, ""));
+        events.push(self.create_signature_delta_event(thinking_index));
+        if let Some(stop_event) = self.state_manager.handle_content_block_stop(thinking_index) {
+            events.push(stop_event);
+        }
+        self.thinking_extracted = true;
+        events
+    }
+
     /// 创建 thinking_delta 事件
-    fn create_thinking_delta_event(&self, index: i32, thinking: &str) -> SseEvent {
+    fn create_thinking_delta_event(&mut self, index: i32, thinking: &str) -> SseEvent {
+        self.output_thinking.push_str(thinking);
         SseEvent::new(
             "content_block_delta",
             json!({
@@ -814,11 +1045,11 @@ impl StreamContext {
         // tool_use 必须发生在 thinking 结束之后。
         // 但当 `</thinking>` 后面没有 `\n\n`（例如紧跟 tool_use 或流结束）时，
         // thinking 结束标签会滞留在 thinking_buffer，导致后续 flush 时把 `</thinking>` 当作内容输出。
-        // 这里在开始 tool_use block 前做一次“边界场景”的结束标签识别与过滤。
+        // 这里在开始 tool_use block 前做一次"边界场景"的结束标签识别与过滤。
         if self.thinking_enabled && self.in_thinking_block {
             if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(&self.thinking_buffer) {
                 let thinking_content = self.thinking_buffer[..end_pos].to_string();
-                if !thinking_content.is_empty() {
+                if !self.drop_tag_thinking && !thinking_content.is_empty() {
                     if let Some(thinking_index) = self.thinking_block_index {
                         events.push(
                             self.create_thinking_delta_event(thinking_index, &thinking_content),
@@ -830,18 +1061,21 @@ impl StreamContext {
                 self.in_thinking_block = false;
                 self.thinking_extracted = true;
 
-                if let Some(thinking_index) = self.thinking_block_index {
-                    // 先发送空的 thinking_delta
-                    events.push(self.create_thinking_delta_event(thinking_index, ""));
-                    // signature_delta：满足客户端 thinking 模式下的本地校验
-                    events.push(self.create_signature_delta_event(thinking_index));
-                    // 再发送 content_block_stop
-                    if let Some(stop_event) =
-                        self.state_manager.handle_content_block_stop(thinking_index)
-                    {
-                        events.push(stop_event);
+                if !self.drop_tag_thinking {
+                    if let Some(thinking_index) = self.thinking_block_index {
+                        // 先发送空的 thinking_delta
+                        events.push(self.create_thinking_delta_event(thinking_index, ""));
+                        // signature_delta：满足客户端 thinking 模式下的本地校验
+                        events.push(self.create_signature_delta_event(thinking_index));
+                        // 再发送 content_block_stop
+                        if let Some(stop_event) =
+                            self.state_manager.handle_content_block_stop(thinking_index)
+                        {
+                            events.push(stop_event);
+                        }
                     }
                 }
+                self.drop_tag_thinking = false;
 
                 // 把结束标签后的内容当作普通文本（通常为空或空白）
                 let after_pos = end_pos + "</thinking>".len();
@@ -865,25 +1099,109 @@ impl StreamContext {
             events.extend(self.create_text_delta_events(&buffered));
         }
 
-        // 获取或分配块索引
-        let block_index = if let Some(&idx) = self.tool_block_indices.get(&tool_use.tool_use_id) {
-            idx
-        } else {
-            let idx = self.state_manager.next_block_index();
-            self.tool_block_indices
-                .insert(tool_use.tool_use_id.clone(), idx);
-            idx
-        };
+        if !tool_use.tool_use_id.is_empty() && !tool_use.name.is_empty() {
+            match self.pending_tool_use.as_mut() {
+                None => {
+                    self.pending_tool_use = Some(StreamPendingToolUse {
+                        tool_use_id: tool_use.tool_use_id.clone(),
+                        name: tool_use.name.clone(),
+                        input_buffer: String::new(),
+                        generated_id: false,
+                    });
+                }
+                Some(pending) if pending.tool_use_id != tool_use.tool_use_id => {
+                    if pending.generated_id && pending.name == tool_use.name {
+                        pending.tool_use_id = tool_use.tool_use_id.clone();
+                        pending.generated_id = false;
+                    } else {
+                        events.extend(self.flush_pending_tool_use());
+                        self.pending_tool_use = Some(StreamPendingToolUse {
+                            tool_use_id: tool_use.tool_use_id.clone(),
+                            name: tool_use.name.clone(),
+                            input_buffer: String::new(),
+                            generated_id: false,
+                        });
+                    }
+                }
+                Some(_) => {}
+            }
+        } else if !tool_use.name.is_empty() {
+            match self.pending_tool_use.as_ref() {
+                None => {
+                    let generated = self.generated_tool_id_for(&tool_use.name);
+                    self.pending_tool_use = Some(StreamPendingToolUse {
+                        tool_use_id: generated,
+                        name: tool_use.name.clone(),
+                        input_buffer: String::new(),
+                        generated_id: true,
+                    });
+                }
+                Some(pending) if pending.name != tool_use.name => {
+                    events.extend(self.flush_pending_tool_use());
+                    let generated = self.generated_tool_id_for(&tool_use.name);
+                    self.pending_tool_use = Some(StreamPendingToolUse {
+                        tool_use_id: generated,
+                        name: tool_use.name.clone(),
+                        input_buffer: String::new(),
+                        generated_id: true,
+                    });
+                }
+                Some(_) => {}
+            }
+        }
 
-        // 还原工具名称（如果有映射）
+        if let Some(pending) = self.pending_tool_use.as_mut() {
+            tool_use.apply_input_to_buffer(&mut pending.input_buffer);
+        }
+
+        if tool_use.stop {
+            events.extend(self.flush_pending_tool_use());
+        }
+
+        events
+    }
+
+    fn generated_tool_id_for(&mut self, name: &str) -> String {
+        if let Some(existing) = self.generated_tool_ids.get(name) {
+            return existing.clone();
+        }
+        let generated = crate::kiro::model::events::ToolUseEvent::generate_fallback_id();
+        tracing::debug!("上游 toolUseEvent 缺少 ID，生成 fallback: {}", generated);
+        self.generated_tool_ids
+            .insert(name.to_string(), generated.clone());
+        generated
+    }
+
+    fn flush_pending_tool_use(&mut self) -> Vec<SseEvent> {
+        let Some(pending) = self.pending_tool_use.take() else {
+            return Vec::new();
+        };
+        if pending.name.is_empty() {
+            return Vec::new();
+        }
+
+        let effective_id = if pending.tool_use_id.is_empty() {
+            self.generated_tool_id_for(&pending.name)
+        } else {
+            pending.tool_use_id
+        };
+        let block_index = self.state_manager.next_block_index();
+        self.tool_block_indices
+            .insert(effective_id.clone(), block_index);
         let original_name = self
             .tool_name_map
-            .get(&tool_use.name)
+            .get(&pending.name)
             .cloned()
-            .unwrap_or_else(|| tool_use.name.clone());
+            .unwrap_or(pending.name);
+        self.output_tool_uses.insert(
+            effective_id.clone(),
+            StreamToolOutput {
+                name: original_name.clone(),
+                input: pending.input_buffer.clone(),
+            },
+        );
 
-        // 发送 content_block_start
-        let start_events = self.state_manager.handle_content_block_start(
+        let mut events = self.state_manager.handle_content_block_start(
             block_index,
             "tool_use",
             json!({
@@ -891,40 +1209,32 @@ impl StreamContext {
                 "index": block_index,
                 "content_block": {
                     "type": "tool_use",
-                    "id": tool_use.tool_use_id,
+                    "id": effective_id,
                     "name": original_name,
                     "input": {}
                 }
             }),
         );
-        events.extend(start_events);
 
-        // 发送参数增量 (ToolUseEvent.input 是 String 类型)
-        if !tool_use.input.is_empty() {
-            self.output_tokens += (tool_use.input.len() as i32 + 3) / 4; // 估算 token
-
-            if let Some(delta_event) = self.state_manager.handle_content_block_delta(
+        if !pending.input_buffer.is_empty()
+            && let Some(delta_event) = self.state_manager.handle_content_block_delta(
                 block_index,
                 json!({
                     "type": "content_block_delta",
                     "index": block_index,
                     "delta": {
                         "type": "input_json_delta",
-                        "partial_json": tool_use.input
+                        "partial_json": pending.input_buffer
                     }
                 }),
-            ) {
-                events.push(delta_event);
-            }
+            )
+        {
+            events.push(delta_event);
         }
 
-        // 如果是完整的工具调用（stop=true），发送 content_block_stop
-        if tool_use.stop {
-            if let Some(stop_event) = self.state_manager.handle_content_block_stop(block_index) {
-                events.push(stop_event);
-            }
+        if let Some(stop_event) = self.state_manager.handle_content_block_stop(block_index) {
+            events.push(stop_event);
         }
-
         events
     }
 
@@ -940,7 +1250,7 @@ impl StreamContext {
                     find_real_thinking_end_tag_at_buffer_end(&self.thinking_buffer)
                 {
                     let thinking_content = self.thinking_buffer[..end_pos].to_string();
-                    if !thinking_content.is_empty() {
+                    if !self.drop_tag_thinking && !thinking_content.is_empty() {
                         if let Some(thinking_index) = self.thinking_block_index {
                             events.push(
                                 self.create_thinking_delta_event(thinking_index, &thinking_content),
@@ -949,16 +1259,19 @@ impl StreamContext {
                     }
 
                     // 关闭 thinking 块：先发送空的 thinking_delta，再发送 content_block_stop
-                    if let Some(thinking_index) = self.thinking_block_index {
-                        events.push(self.create_thinking_delta_event(thinking_index, ""));
-                        // signature_delta：满足客户端 thinking 模式下的本地校验
-                        events.push(self.create_signature_delta_event(thinking_index));
-                        if let Some(stop_event) =
-                            self.state_manager.handle_content_block_stop(thinking_index)
-                        {
-                            events.push(stop_event);
+                    if !self.drop_tag_thinking {
+                        if let Some(thinking_index) = self.thinking_block_index {
+                            events.push(self.create_thinking_delta_event(thinking_index, ""));
+                            // signature_delta：满足客户端 thinking 模式下的本地校验
+                            events.push(self.create_signature_delta_event(thinking_index));
+                            if let Some(stop_event) =
+                                self.state_manager.handle_content_block_stop(thinking_index)
+                            {
+                                events.push(stop_event);
+                            }
                         }
                     }
+                    self.drop_tag_thinking = false;
 
                     // 把结束标签后的内容当作普通文本（通常为空或空白）
                     let after_pos = end_pos + "</thinking>".len();
@@ -971,24 +1284,30 @@ impl StreamContext {
                     }
                 } else {
                     // 如果还在 thinking 块内，发送剩余内容作为 thinking_delta
-                    if let Some(thinking_index) = self.thinking_block_index {
+                    if !self.drop_tag_thinking
+                        && let Some(thinking_index) = self.thinking_block_index
+                    {
+                        let thinking_buffer = self.thinking_buffer.clone();
                         events.push(
-                            self.create_thinking_delta_event(thinking_index, &self.thinking_buffer),
+                            self.create_thinking_delta_event(thinking_index, &thinking_buffer),
                         );
                     }
                     // 关闭 thinking 块：先发送空的 thinking_delta，再发送 content_block_stop
-                    if let Some(thinking_index) = self.thinking_block_index {
-                        // 先发送空的 thinking_delta
-                        events.push(self.create_thinking_delta_event(thinking_index, ""));
-                        // signature_delta：满足客户端 thinking 模式下的本地校验
-                        events.push(self.create_signature_delta_event(thinking_index));
-                        // 再发送 content_block_stop
-                        if let Some(stop_event) =
-                            self.state_manager.handle_content_block_stop(thinking_index)
-                        {
-                            events.push(stop_event);
+                    if !self.drop_tag_thinking {
+                        if let Some(thinking_index) = self.thinking_block_index {
+                            // 先发送空的 thinking_delta
+                            events.push(self.create_thinking_delta_event(thinking_index, ""));
+                            // signature_delta：满足客户端 thinking 模式下的本地校验
+                            events.push(self.create_signature_delta_event(thinking_index));
+                            // 再发送 content_block_stop
+                            if let Some(stop_event) =
+                                self.state_manager.handle_content_block_stop(thinking_index)
+                            {
+                                events.push(stop_event);
+                            }
                         }
                     }
+                    self.drop_tag_thinking = false;
                 }
             } else {
                 // 否则发送剩余内容作为 text_delta
@@ -998,13 +1317,13 @@ impl StreamContext {
             self.thinking_buffer.clear();
         }
 
+        events.extend(self.close_reasoning_thinking_block());
+
         // 兜底：thinking 开启但全流程未产生任何 thinking 块
         // （Opus 4.7/4.8 adaptive 在简单任务可能完全跳过 <thinking> 标签）
         // 注入一对空 thinking start/sig/stop，保证客户端 SSE 含 thinking content_block，
-        // 避免 UI 卡在“思考中…”及客户端校验失败。
-        if self.thinking_enabled
-            && !self.thinking_extracted
-            && self.thinking_block_index.is_none()
+        // 避免 UI 卡在"思考中…"及客户端校验失败。
+        if self.thinking_enabled && !self.thinking_extracted && self.thinking_block_index.is_none()
         {
             let thinking_index = self.state_manager.next_block_index();
             self.thinking_block_index = Some(thinking_index);
@@ -1020,15 +1339,14 @@ impl StreamContext {
             events.extend(start_events);
             // signature_delta：满足客户端 thinking 模式下的本地校验
             events.push(self.create_signature_delta_event(thinking_index));
-            if let Some(stop_event) = self.state_manager.handle_content_block_stop(thinking_index)
-            {
+            if let Some(stop_event) = self.state_manager.handle_content_block_stop(thinking_index) {
                 events.push(stop_event);
             }
             self.thinking_extracted = true;
-            tracing::debug!(
-                "thinking 兜底：流结束未见 <thinking> 标签，注入空 thinking block"
-            );
+            tracing::debug!("thinking 兜底：流结束未见 <thinking> 标签，注入空 thinking block");
         }
+
+        events.extend(self.flush_pending_tool_use());
 
         // 如果整个流中只产生了 thinking 块，没有 text 也没有 tool_use，
         // 则设置 stop_reason 为 max_tokens（表示模型耗尽了 token 预算在思考上），
@@ -1056,9 +1374,7 @@ impl StreamContext {
 
                 // 关闭仍开着的 text block，让 tool_use 拿到新的索引
                 if let Some(idx) = self.text_block_index.take() {
-                    if let Some(stop_event) =
-                        self.state_manager.handle_content_block_stop(idx)
-                    {
+                    if let Some(stop_event) = self.state_manager.handle_content_block_stop(idx) {
                         events.push(stop_event);
                     }
                 }
@@ -1071,8 +1387,8 @@ impl StreamContext {
                         .get(&call.name)
                         .cloned()
                         .unwrap_or(call.name);
-                    let input_json = serde_json::to_string(&call.input)
-                        .unwrap_or_else(|_| "{}".to_string());
+                    let input_json =
+                        serde_json::to_string(&call.input).unwrap_or_else(|_| "{}".to_string());
 
                     events.extend(self.state_manager.handle_content_block_start(
                         block_index,
@@ -1113,7 +1429,8 @@ impl StreamContext {
         }
 
         // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
-        let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
+        let final_input_tokens = self.final_input_tokens();
+        self.output_tokens = self.final_output_tokens();
 
         // 生成最终事件
         events.extend(self.state_manager.generate_final_events(FinalUsage {
@@ -1152,7 +1469,7 @@ pub(crate) fn billed_input_tokens(
 /// 4. 一次性返回所有事件
 pub struct BufferedStreamContext {
     /// 内部流处理上下文（复用现有的事件处理逻辑）
-    inner: StreamContext,
+    pub(crate) inner: StreamContext,
     /// 缓冲的所有事件（包括 message_start、content_block_start 等）
     event_buffer: Vec<SseEvent>,
     /// 估算的 input_tokens（用于回退）
@@ -1170,12 +1487,31 @@ impl BufferedStreamContext {
         tool_name_map: HashMap<String, String>,
         cache_usage: Option<CacheUsageBreakdown>,
     ) -> Self {
-        let inner = StreamContext::new_with_thinking(
+        Self::new_with_format(
+            model,
+            estimated_input_tokens,
+            thinking_enabled,
+            tool_name_map,
+            cache_usage,
+            "thinking",
+        )
+    }
+
+    pub fn new_with_format(
+        model: impl Into<String>,
+        estimated_input_tokens: i32,
+        thinking_enabled: bool,
+        tool_name_map: HashMap<String, String>,
+        cache_usage: Option<CacheUsageBreakdown>,
+        thinking_format: impl Into<String>,
+    ) -> Self {
+        let inner = StreamContext::new_with_thinking_format(
             model,
             estimated_input_tokens,
             cache_usage,
             thinking_enabled,
             tool_name_map,
+            thinking_format,
         );
         Self {
             inner,
@@ -1239,36 +1575,118 @@ impl BufferedStreamContext {
         std::mem::take(&mut self.event_buffer)
     }
 
+    pub fn final_input_tokens(&self) -> i32 {
+        self.inner.final_input_tokens()
+    }
+
+    pub fn final_output_tokens(&self) -> i32 {
+        self.inner.final_output_tokens()
+    }
+
     /// 已收到的 metering（meteringEvent.usage）；用于驱动余额扣减
     pub fn metering(&self) -> Option<&MeteringEvent> {
         self.inner.metering.as_ref()
     }
 }
 
-/// 简单的 token 估算
-fn estimate_tokens(text: &str) -> i32 {
-    let chars: Vec<char> = text.chars().collect();
-    let mut chinese_count = 0;
-    let mut other_count = 0;
+/// 将累积文本归一化为增量（差量）
+///
+/// Kiro 上游的 assistantResponseEvent / reasoningContentEvent 发送的是累积文本
+/// （每次包含从头到当前位置的完整内容），而非增量。此函数通过比较当前 chunk
+/// 与上一次的完整内容，计算出真正的增量文本。
+///
+/// 对齐 Kiro-Go `normalizeChunk()` 逻辑：
+/// - chunk == prev → 空增量（无新内容）
+/// - chunk 以 prev 开头 → 返回后缀差量
+/// - prev 以 chunk 开头 → 返回空（回退场景）
+/// - 有重叠 → 返回重叠之后的部分
+/// - 无重叠 → 返回整个 chunk
+pub(crate) fn normalize_chunk(chunk: &str, previous: &mut String) -> String {
+    if chunk.is_empty() {
+        return String::new();
+    }
 
-    for c in &chars {
-        if *c >= '\u{4E00}' && *c <= '\u{9FFF}' {
-            chinese_count += 1;
-        } else {
-            other_count += 1;
+    let prev = previous.as_str();
+    if prev.is_empty() {
+        *previous = chunk.to_string();
+        return chunk.to_string();
+    }
+
+    if chunk == prev {
+        return String::new();
+    }
+
+    // chunk 以 prev 开头：正常累积，返回后缀差量
+    if let Some(delta) = chunk.strip_prefix(prev) {
+        *previous = chunk.to_string();
+        return delta.to_string();
+    }
+
+    // prev 以 chunk 开头：回退场景，无新内容
+    if prev.starts_with(chunk) {
+        return String::new();
+    }
+
+    // 寻找最大重叠：prev 的后缀与 chunk 的前缀匹配
+    let max_overlap_len = prev.len().min(chunk.len());
+    let mut max_overlap = 0;
+    for i in chunk
+        .char_indices()
+        .map(|(idx, _)| idx)
+        .skip(1)
+        .chain(std::iter::once(chunk.len()))
+    {
+        if i > max_overlap_len {
+            break;
+        }
+        if prev.ends_with(&chunk[..i]) {
+            max_overlap = i;
         }
     }
 
-    // 中文约 1.5 字符/token，英文约 4 字符/token
-    let chinese_tokens = (chinese_count * 2 + 2) / 3;
-    let other_tokens = (other_count + 3) / 4;
-
-    (chinese_tokens + other_tokens).max(1)
+    *previous = chunk.to_string();
+    if max_overlap > 0 {
+        chunk[max_overlap..].to_string()
+    } else {
+        chunk.to_string()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reasoning_event(text: &str) -> Event {
+        let mut event = crate::kiro::model::events::ReasoningContentEvent::default();
+        event.text = text.to_string();
+        Event::ReasoningContent(event)
+    }
+
+    fn assistant_event(content: &str) -> Event {
+        let mut event = crate::kiro::model::events::AssistantResponseEvent::default();
+        event.content = content.to_string();
+        Event::AssistantResponse(event)
+    }
+
+    fn joined_thinking_deltas(events: &[SseEvent]) -> String {
+        events
+            .iter()
+            .filter(|e| {
+                e.event == "content_block_delta" && e.data["delta"]["type"] == "thinking_delta"
+            })
+            .filter_map(|e| e.data["delta"]["thinking"].as_str())
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    fn joined_text_deltas(events: &[SseEvent]) -> String {
+        events
+            .iter()
+            .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta")
+            .filter_map(|e| e.data["delta"]["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("")
+    }
 
     #[test]
     fn test_sse_event_format() {
@@ -1278,6 +1696,16 @@ mod tests {
         assert!(sse_str.starts_with("event: message_start\n"));
         assert!(sse_str.contains("data: "));
         assert!(sse_str.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn test_normalize_chunk_handles_multibyte_overlap_without_panic() {
+        let mut previous = "你好世界".to_string();
+
+        let delta = normalize_chunk("世界🙂继续", &mut previous);
+
+        assert_eq!(delta, "🙂继续");
+        assert_eq!(previous, "世界🙂继续");
     }
 
     #[test]
@@ -1332,6 +1760,7 @@ mod tests {
             name: "short_abc12345".to_string(),
             tool_use_id: "toolu_01".to_string(),
             input: r#"{"key":"value"}"#.to_string(),
+            input_is_json_object: false,
             stop: true,
         });
 
@@ -1350,7 +1779,8 @@ mod tests {
 
     #[test]
     fn test_text_delta_after_tool_use_restarts_text_block() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, None, false, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, None, false, HashMap::new());
 
         let initial_events = ctx.generate_initial_events();
         assert!(
@@ -1378,7 +1808,8 @@ mod tests {
             name: "test_tool".to_string(),
             tool_use_id: "tool_1".to_string(),
             input: "{}".to_string(),
-            stop: false,
+            input_is_json_object: false,
+            stop: true,
         });
         assert!(
             tool_events.iter().any(|e| {
@@ -1418,7 +1849,8 @@ mod tests {
 
     #[test]
     fn test_tool_use_only_does_not_emit_empty_text_block() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, None, false, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, None, false, HashMap::new());
 
         let mut all_events = Vec::new();
         all_events.extend(ctx.generate_initial_events());
@@ -1427,6 +1859,7 @@ mod tests {
                 name: "test_tool".to_string(),
                 tool_use_id: "tool_1".to_string(),
                 input: "{}".to_string(),
+                input_is_json_object: false,
                 stop: true,
             }),
         );
@@ -1444,6 +1877,161 @@ mod tests {
             }),
             "tool_use-only stream should not start a text block"
         );
+    }
+
+    #[test]
+    fn stream_tool_use_waits_until_stop_like_kiro_go() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, None, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+
+        let events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "mcpIdaProMcpStatus".to_string(),
+            tool_use_id: "toolu_1".to_string(),
+            input: "{\"server\":\"".to_string(),
+            input_is_json_object: false,
+            stop: false,
+        });
+
+        assert!(
+            events.iter().all(|e| e.event != "content_block_start"),
+            "partial tool_use should be buffered until completion"
+        );
+
+        let events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "mcpIdaProMcpStatus".to_string(),
+            tool_use_id: "toolu_1".to_string(),
+            input: r#"ida-pro-mcp"}"#.to_string(),
+            input_is_json_object: false,
+            stop: true,
+        });
+
+        let start = events
+            .iter()
+            .find(|e| e.event == "content_block_start")
+            .expect("completed tool_use should start a block");
+        assert_eq!(start.data["content_block"]["id"], "toolu_1");
+        let partial_jsons: Vec<_> = events
+            .iter()
+            .filter(|e| e.event == "content_block_delta")
+            .filter_map(|e| e.data["delta"]["partial_json"].as_str())
+            .collect();
+        assert!(
+            partial_jsons.contains(&r#"{"server":"ida-pro-mcp"}"#),
+            "expected joined tool input, got {partial_jsons:?}"
+        );
+        assert!(events.iter().any(|e| e.event == "content_block_stop"));
+    }
+
+    #[test]
+    fn stream_tool_use_replaces_generated_id_when_real_id_arrives_like_kiro_go() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, None, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+
+        let first = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "mcpIdaProMcpStatus".to_string(),
+            tool_use_id: String::new(),
+            input: "{\"server\":\"".to_string(),
+            input_is_json_object: false,
+            stop: false,
+        });
+        assert!(
+            first.iter().all(|e| e.event != "content_block_start"),
+            "missing-id tool_use should stay pending"
+        );
+
+        let second = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "mcpIdaProMcpStatus".to_string(),
+            tool_use_id: "toolu_real".to_string(),
+            input: r#"ida-pro-mcp"}"#.to_string(),
+            input_is_json_object: false,
+            stop: true,
+        });
+
+        let starts: Vec<_> = second
+            .iter()
+            .filter(|e| e.event == "content_block_start")
+            .collect();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0].data["content_block"]["id"], "toolu_real");
+        let partial_jsons: Vec<_> = second
+            .iter()
+            .filter(|e| e.event == "content_block_delta")
+            .filter_map(|e| e.data["delta"]["partial_json"].as_str())
+            .collect();
+        assert!(
+            partial_jsons.contains(&r#"{"server":"ida-pro-mcp"}"#),
+            "expected joined tool input, got {partial_jsons:?}"
+        );
+    }
+
+    #[test]
+    fn stream_tool_use_object_input_replaces_buffer_like_kiro_go() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, None, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+
+        let first = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "mcpIdaProMcpStatus".to_string(),
+            tool_use_id: String::new(),
+            input: "{\"server\":\"old".to_string(),
+            input_is_json_object: false,
+            stop: false,
+        });
+        assert!(
+            first.iter().all(|e| e.event != "content_block_start"),
+            "partial input should stay pending"
+        );
+
+        let second = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "mcpIdaProMcpStatus".to_string(),
+            tool_use_id: "toolu_real".to_string(),
+            input: serde_json::json!({"server": "ida-pro-mcp"}).to_string(),
+            input_is_json_object: true,
+            stop: true,
+        });
+
+        let partial_jsons: Vec<_> = second
+            .iter()
+            .filter(|e| e.event == "content_block_delta")
+            .filter_map(|e| e.data["delta"]["partial_json"].as_str())
+            .collect();
+        assert!(
+            partial_jsons.contains(&r#"{"server":"ida-pro-mcp"}"#),
+            "object input should replace stale chunks, got {partial_jsons:?}"
+        );
+        assert!(
+            partial_jsons.iter().all(|value| !value.contains("old")),
+            "stale partial input should not be retained"
+        );
+    }
+
+    #[test]
+    fn stream_final_events_flush_pending_tool_use_on_eof_like_kiro_go() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, None, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+
+        let partial = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "mcpIdaProMcpStatus".to_string(),
+            tool_use_id: "toolu_1".to_string(),
+            input: r#"{"server":"ida-pro-mcp"}"#.to_string(),
+            input_is_json_object: false,
+            stop: false,
+        });
+        assert!(
+            partial.iter().all(|e| e.event != "content_block_start"),
+            "pending tool_use should not be emitted before EOF"
+        );
+
+        let final_events = ctx.generate_final_events();
+        let start = final_events
+            .iter()
+            .find(|e| e.event == "content_block_start")
+            .expect("EOF should flush pending tool_use");
+        assert_eq!(start.data["content_block"]["id"], "toolu_1");
+        assert!(final_events.iter().any(|e| e.event == "content_block_stop"));
     }
 
     #[test]
@@ -1470,7 +2058,8 @@ mod tests {
             name: "Write".to_string(),
             tool_use_id: "tool_1".to_string(),
             input: "{}".to_string(),
-            stop: false,
+            input_is_json_object: false,
+            stop: true,
         });
 
         let text_start_index = events.iter().find_map(|e| {
@@ -1526,10 +2115,82 @@ mod tests {
     }
 
     #[test]
-    fn test_estimate_tokens() {
-        assert!(estimate_tokens("Hello") > 0);
-        assert!(estimate_tokens("你好") > 0);
-        assert!(estimate_tokens("Hello 你好") > 0);
+    fn stream_output_tokens_count_final_content_like_kiro_go() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, None, true, HashMap::new());
+
+        ctx.process_assistant_response("<thinking>reasoning</thinking>\n\nhello");
+        ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "exec_command".to_string(),
+            tool_use_id: "tool_1".to_string(),
+            input: "{\"cmd\":\"pwd\"}".to_string(),
+            input_is_json_object: false,
+            stop: true,
+        });
+
+        let content = vec![
+            json!({"type": "text", "text": "hello"}),
+            json!({"type": "thinking", "thinking": "reasoning"}),
+            json!({
+                "type": "tool_use",
+                "id": "tool_1",
+                "name": "exec_command",
+                "input": {"cmd": "pwd"}
+            }),
+        ];
+
+        assert_eq!(
+            ctx.final_output_tokens(),
+            token::estimate_output_tokens(&content)
+        );
+    }
+
+    #[test]
+    fn stream_output_tokens_prefer_upstream_usage() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, None, false, HashMap::new());
+
+        ctx.process_assistant_response("hello");
+        ctx.set_actual_output_tokens(45);
+
+        assert_eq!(ctx.final_output_tokens(), 45);
+    }
+
+    #[test]
+    fn thinking_stream_reasoning_event_blocks_tag_source_like_kiro_go() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, None, true, HashMap::new());
+
+        let mut events = Vec::new();
+        events.extend(ctx.process_kiro_event(&reasoning_event("event reasoning")));
+        events.extend(ctx.process_kiro_event(&assistant_event(
+            "<thinking>tag reasoning</thinking>\n\nfinal answer",
+        )));
+        events.extend(ctx.generate_final_events());
+
+        let thinking = joined_thinking_deltas(&events);
+        let text = joined_text_deltas(&events);
+
+        assert!(thinking.contains("event reasoning"));
+        assert!(!thinking.contains("tag reasoning"));
+        assert!(text.contains("final answer"));
+    }
+
+    #[test]
+    fn thinking_stream_tag_source_blocks_reasoning_event_like_kiro_go() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, None, true, HashMap::new());
+
+        let mut events = Vec::new();
+        events.extend(ctx.process_kiro_event(&assistant_event(
+            "<thinking>tag reasoning</thinking>\n\nfinal answer",
+        )));
+        events.extend(ctx.process_kiro_event(&reasoning_event("event reasoning")));
+        events.extend(ctx.generate_final_events());
+
+        let thinking = joined_thinking_deltas(&events);
+        let text = joined_text_deltas(&events);
+
+        assert!(thinking.contains("tag reasoning"));
+        assert!(!thinking.contains("event reasoning"));
+        assert!(text.contains("final answer"));
     }
 
     #[test]
@@ -1546,7 +2207,8 @@ mod tests {
             name: "Write".to_string(),
             tool_use_id: "tool_1".to_string(),
             input: "{}".to_string(),
-            stop: false,
+            input_is_json_object: false,
+            stop: true,
         });
         all_events.extend(tool_events);
 
@@ -1932,6 +2594,7 @@ mod tests {
                 name: "test_tool".to_string(),
                 tool_use_id: "tool_1".to_string(),
                 input: "{}".to_string(),
+                input_is_json_object: false,
                 stop: true,
             }),
         );
@@ -1950,7 +2613,8 @@ mod tests {
 
     #[test]
     fn test_bracket_tool_call_fallback_in_stream_finalize() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, None, false, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, None, false, HashMap::new());
         let _ = ctx.generate_initial_events();
         let _ = ctx.process_assistant_response(
             r#"hello [Called get_weather with args: {"city":"London"}] done"#,
@@ -1960,8 +2624,7 @@ mod tests {
         let tool_start = final_events
             .iter()
             .find(|e| {
-                e.event == "content_block_start"
-                    && e.data["content_block"]["type"] == "tool_use"
+                e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use"
             })
             .expect("bracket fallback should emit a tool_use content_block_start");
         assert_eq!(tool_start.data["content_block"]["name"], "get_weather");
@@ -1969,8 +2632,7 @@ mod tests {
         let input_delta = final_events
             .iter()
             .find(|e| {
-                e.event == "content_block_delta"
-                    && e.data["delta"]["type"] == "input_json_delta"
+                e.event == "content_block_delta" && e.data["delta"]["type"] == "input_json_delta"
             })
             .expect("bracket fallback should emit input_json_delta");
         let partial = input_delta.data["delta"]["partial_json"]
@@ -1990,15 +2652,15 @@ mod tests {
     fn test_bracket_fallback_skipped_when_structured_tool_use_present() {
         use crate::kiro::model::events::ToolUseEvent;
 
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, None, false, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, None, false, HashMap::new());
         let _ = ctx.generate_initial_events();
-        let _ = ctx.process_assistant_response(
-            r#"prefix [Called fake_one with args: {"x":1}]"#,
-        );
+        let _ = ctx.process_assistant_response(r#"prefix [Called fake_one with args: {"x":1}]"#);
         let _ = ctx.process_kiro_event(&Event::ToolUse(ToolUseEvent {
             name: "real_tool".to_string(),
             tool_use_id: "toolu_real".to_string(),
             input: r#"{"y":2}"#.to_string(),
+            input_is_json_object: false,
             stop: true,
         }));
         let final_events = ctx.generate_final_events();
@@ -2007,8 +2669,7 @@ mod tests {
             .iter()
             .chain(std::iter::empty())
             .filter(|e| {
-                e.event == "content_block_start"
-                    && e.data["content_block"]["type"] == "tool_use"
+                e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use"
             })
             .collect();
         assert!(

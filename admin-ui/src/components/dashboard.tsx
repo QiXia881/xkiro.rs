@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Settings, ZoomIn, FileText, Download } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Trash2, RotateCcw, CheckCircle2, Settings, FileText, Download, Plus } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -9,17 +9,18 @@ import { Badge } from '@/components/ui/badge'
 import { CredentialCard } from '@/components/credential-card'
 import { BalanceDialog } from '@/components/balance-dialog'
 import { ModelsDialog } from '@/components/models-dialog'
-import { ImportJsonDialog } from '@/components/import-json-dialog'
-import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import { SettingsDialog } from '@/components/settings-dialog'
 import { SystemPromptDialog } from '@/components/system-prompt-dialog'
+import { AddCredentialDialog } from '@/components/add-credential-dialog'
+import { RequestLogsDialog } from '@/components/request-logs-dialog'
 import { useCredentials, useDeleteCredential, useResetFailure } from '@/hooks/use-credentials'
 import { useRuntimeStats } from '@/hooks/use-runtime-stats'
-import { useUiScale } from '@/hooks/use-ui-scale'
 import { getCredentialBalance, refreshBatch, refreshBalancesBatch, getCachedBalances, exportTokenJson, exportKam } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
-import type { BalanceResponse } from '@/types/api'
+import type { BalanceResponse, CredentialStatusItem } from '@/types/api'
+
+const EMPTY_CREDENTIALS: CredentialStatusItem[] = []
 
 interface DashboardProps {
   onLogout: () => void
@@ -29,8 +30,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [selectedCredentialId, setSelectedCredentialId] = useState<number | null>(null)
   const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
   const [modelsDialogOpen, setModelsDialogOpen] = useState(false)
-  const [importJsonDialogOpen, setImportJsonDialogOpen] = useState(false)
-  const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false)
+  const [addCredDialogOpen, setAddCredDialogOpen] = useState(false)
+  const [requestLogsDialogOpen, setRequestLogsDialogOpen] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [verifyDialogOpen, setVerifyDialogOpen] = useState(false)
   const [settingsDialogOpen, setSettingsDialogOpen] = useState(false)
@@ -59,20 +60,19 @@ export function Dashboard({ onLogout }: DashboardProps) {
     }
     return false
   })
-  const { scale: uiScale, setScale: setUiScale, scales: uiScales } = useUiScale()
-
   const queryClient = useQueryClient()
   const { data, isLoading, error, refetch } = useCredentials()
   const { mutate: deleteCredential } = useDeleteCredential()
   const { mutate: resetFailure } = useResetFailure()
   const { data: runtimeMap } = useRuntimeStats()
+  const credentials = Array.isArray(data?.credentials) ? data.credentials : EMPTY_CREDENTIALS
 
   // 计算分页
-  const totalPages = Math.ceil((data?.credentials.length || 0) / itemsPerPage)
+  const totalPages = Math.ceil(credentials.length / itemsPerPage)
   const startIndex = (currentPage - 1) * itemsPerPage
   const endIndex = startIndex + itemsPerPage
   // 切片后逐元素 merge runtimeMap 的实时字段（K/N + lastUsedAt + disabled）
-  const currentCredentials = (data?.credentials.slice(startIndex, endIndex) || []).map(credential => {
+  const currentCredentials = credentials.slice(startIndex, endIndex).map(credential => {
     const runtime = runtimeMap?.get(credential.id)
     if (!runtime) return credential
     return {
@@ -83,26 +83,26 @@ export function Dashboard({ onLogout }: DashboardProps) {
       disabled: runtime.disabled,
     }
   })
-  const disabledCredentialCount = data?.credentials.filter(credential => credential.disabled).length || 0
+  const disabledCredentialCount = credentials.filter(credential => credential.disabled).length
   const selectedDisabledCount = Array.from(selectedIds).filter(id => {
-    const credential = data?.credentials.find(c => c.id === id)
+    const credential = credentials.find(c => c.id === id)
     return Boolean(credential?.disabled)
   }).length
 
   // 当凭据列表变化时重置到第一页
   useEffect(() => {
     setCurrentPage(1)
-  }, [data?.credentials.length])
+  }, [credentials.length])
 
   // 只保留当前仍存在的凭据缓存，避免删除后残留旧数据
   useEffect(() => {
-    if (!data?.credentials) {
+    if (credentials.length === 0) {
       setBalanceMap(new Map())
       setLoadingBalanceIds(new Set())
       return
     }
 
-    const validIds = new Set(data.credentials.map(credential => credential.id))
+    const validIds = new Set(credentials.map(credential => credential.id))
 
     setBalanceMap(prev => {
       const next = new Map<number, BalanceResponse>()
@@ -126,7 +126,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
       })
       return next.size === prev.size ? prev : next
     })
-  }, [data?.credentials])
+  }, [credentials])
 
   // 初始化时应用主题
   useEffect(() => {
@@ -147,7 +147,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
         if (cancelled) return
         setBalanceMap(prev => {
           const next = new Map(prev)
-          resp.balances.forEach(item => {
+          const cachedBalances = Array.isArray(resp.balances) ? resp.balances : []
+          cachedBalances.forEach(item => {
             // 把 CachedBalanceItem 投影到 BalanceResponse 形状（字段一一对应）
             next.set(item.id, {
               id: item.id,
@@ -263,7 +264,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
     }
 
     const disabledIds = Array.from(selectedIds).filter(id => {
-      const credential = data?.credentials.find(c => c.id === id)
+      const credential = credentials.find(c => c.id === id)
       return Boolean(credential?.disabled)
     })
 
@@ -320,7 +321,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
     }
 
     const failedIds = Array.from(selectedIds).filter(id => {
-      const cred = data?.credentials.find(c => c.id === id)
+      const cred = credentials.find(c => c.id === id)
       return cred && cred.failureCount > 0
     })
 
@@ -368,7 +369,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
     }
 
     const enabledIds = Array.from(selectedIds).filter(id => {
-      const cred = data?.credentials.find(c => c.id === id)
+      const cred = credentials.find(c => c.id === id)
       return cred && !cred.disabled
     })
 
@@ -407,7 +408,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
     }
 
     const enabledIds = Array.from(selectedIds).filter(id => {
-      const cred = data?.credentials.find(c => c.id === id)
+      const cred = credentials.find(c => c.id === id)
       return cred && !cred.disabled
     })
 
@@ -450,12 +451,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
   // 一键清除所有已禁用凭据
   const handleClearAll = async () => {
-    if (!data?.credentials || data.credentials.length === 0) {
+    if (credentials.length === 0) {
       toast.error('没有可清除的凭据')
       return
     }
 
-    const disabledCredentials = data.credentials.filter(credential => credential.disabled)
+    const disabledCredentials = credentials.filter(credential => credential.disabled)
 
     if (disabledCredentials.length === 0) {
       toast.error('没有可清除的已禁用凭据')
@@ -499,12 +500,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
   // 查询所有未禁用凭据信息（一次往返调 batch 端点，不刷 token）
   const handleQueryCurrentPageInfo = async () => {
-    if (!data?.credentials || data.credentials.length === 0) {
+    if (credentials.length === 0) {
       toast.error('暂无可查询的凭据')
       return
     }
 
-    const ids = data.credentials
+    const ids = credentials
       .filter(credential => !credential.disabled)
       .map(credential => credential.id)
 
@@ -748,7 +749,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
             <div className="flex h-7 w-7 items-center justify-center rounded-md bg-primary text-primary-foreground">
               <Server className="h-4 w-4" />
             </div>
-            <span className="text-sm font-semibold tracking-tight">Kiro Admin</span>
+            <span className="text-sm font-semibold tracking-tight">xkiro.rs</span>
             <div className="ml-3 hidden items-center gap-3 text-xs text-muted-foreground sm:flex">
               <span className="tabular">
                 <span className="font-medium text-foreground">{data?.total ?? 0}</span> 总数
@@ -768,19 +769,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </div>
           </div>
           <div className="flex items-center gap-1">
-            <Button
-              variant="ghost"
-              size="icon"
-              className="h-8 w-auto px-2 gap-1"
-              onClick={() => {
-                const i = uiScales.indexOf(uiScale)
-                setUiScale(uiScales[(i + 1) % uiScales.length])
-              }}
-              title={`UI 缩放 ${uiScale}%（点击循环 ${uiScales.join(' / ')}%）`}
-            >
-              <ZoomIn className="h-4 w-4" />
-              <span className="text-xs tabular text-muted-foreground">{uiScale}%</span>
-            </Button>
             <Button variant="ghost" size="icon" className="h-8 w-8" onClick={toggleDarkMode} title="切换主题">
               {darkMode ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
             </Button>
@@ -803,8 +791,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
       {/* 主内容 */}
       <main className="mx-auto w-full max-w-[2400px] px-4 sm:px-6 lg:px-8 2xl:px-10 py-6">
-        {/* 工具栏：选择/批量/添加 */}
+        {/* 工具栏：分组布局 */}
         <div className="mb-5 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+          {/* 左侧：标题 + 选择状态 */}
           <div className="flex items-center gap-3">
             <h2 className="text-lg font-semibold tracking-tight">凭据管理</h2>
             {selectedIds.size > 0 && (
@@ -818,7 +807,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
               </div>
             )}
           </div>
-          <div className="flex flex-wrap gap-2">
+
+          {/* 右侧：操作按钮（分组） */}
+          <div className="flex flex-wrap items-center gap-2">
+            {/* --- 选择操作组（仅选中时显示） --- */}
             {selectedIds.size > 0 && (
               <>
                 <Button onClick={handleBatchVerify} size="sm" variant="outline" className="h-8">
@@ -868,16 +860,21 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   <Trash2 className="h-3.5 w-3.5 mr-1.5" />
                   批量删除
                 </Button>
-                <span className="mx-1 h-6 w-px self-center bg-border" />
+                {/* 分隔线 */}
+                <span className="mx-0.5 h-6 w-px self-center bg-border" />
               </>
             )}
+
+            {/* 验活进行中指示器 */}
             {verifying && !verifyDialogOpen && (
               <Button onClick={() => setVerifyDialogOpen(true)} size="sm" variant="secondary" className="h-8">
                 <CheckCircle2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />
                 验活中 {verifyProgress.current}/{verifyProgress.total}
               </Button>
             )}
-            {data?.credentials && data.credentials.length > 0 && (
+
+            {/* --- 视图操作组 --- */}
+            {credentials.length > 0 && (
               <Button
                 onClick={handleQueryCurrentPageInfo}
                 size="sm"
@@ -889,7 +886,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                 {queryingInfo ? `查询 ${queryInfoProgress.current}/${queryInfoProgress.total}` : '查询本页'}
               </Button>
             )}
-            {data?.credentials && data.credentials.length > 0 && (
+            {credentials.length > 0 && (
               <Button
                 onClick={handleClearAll}
                 size="sm"
@@ -902,19 +899,24 @@ export function Dashboard({ onLogout }: DashboardProps) {
                 清除已禁用
               </Button>
             )}
-            <Button onClick={() => setKamImportDialogOpen(true)} size="sm" variant="outline" className="h-8">
-              <FileUp className="h-3.5 w-3.5 mr-1.5" />
-              KAM 导入
+            <Button onClick={() => setRequestLogsDialogOpen(true)} size="sm" variant="outline" className="h-8">
+              <FileText className="h-3.5 w-3.5 mr-1.5" />
+              日志
             </Button>
-            <Button onClick={() => setImportJsonDialogOpen(true)} size="sm" className="h-8">
-              <Upload className="h-3.5 w-3.5 mr-1.5" />
-              导入 JSON
+
+            {/* 分隔线 */}
+            <span className="mx-0.5 h-6 w-px self-center bg-border" />
+
+            {/* --- 添加凭据（统一入口） --- */}
+            <Button onClick={() => setAddCredDialogOpen(true)} size="sm" className="h-8">
+              <Plus className="h-3.5 w-3.5 mr-1.5" />
+              添加凭据
             </Button>
           </div>
         </div>
 
         {/* 凭据列表 */}
-        {data?.credentials.length === 0 ? (
+        {credentials.length === 0 ? (
           <Card>
             <CardContent className="py-16 text-center text-sm text-muted-foreground">
               暂无凭据，点击「添加凭据」开始
@@ -958,7 +960,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   上一页
                 </Button>
                 <span className="tabular text-muted-foreground">
-                  {currentPage} / {totalPages} · 共 {data?.credentials.length} 个
+                  {currentPage} / {totalPages} · 共 {credentials.length} 个
                 </span>
                 <Button
                   variant="outline"
@@ -989,18 +991,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
         onOpenChange={setModelsDialogOpen}
       />
 
-      {/* 导入 JSON 对话框（添加凭据 + 批量导入一体化） */}
-      <ImportJsonDialog
-        open={importJsonDialogOpen}
-        onOpenChange={setImportJsonDialogOpen}
-      />
-
-      {/* KAM 账号导入对话框 */}
-      <KamImportDialog
-        open={kamImportDialogOpen}
-        onOpenChange={setKamImportDialogOpen}
-      />
-
       {/* 批量验活对话框 */}
       <BatchVerifyDialog
         open={verifyDialogOpen}
@@ -1021,6 +1011,21 @@ export function Dashboard({ onLogout }: DashboardProps) {
       <SystemPromptDialog
         open={systemPromptDialogOpen}
         onOpenChange={setSystemPromptDialogOpen}
+      />
+
+      {/* 添加凭据（统一入口，内含 6 种方法 + KAM/JSON 批量导入） */}
+      <AddCredentialDialog
+        open={addCredDialogOpen}
+        onOpenChange={setAddCredDialogOpen}
+        onSuccess={() => {
+          queryClient.invalidateQueries({ queryKey: ['credentials'] })
+        }}
+      />
+
+      {/* 请求日志对话框 */}
+      <RequestLogsDialog
+        open={requestLogsDialogOpen}
+        onOpenChange={setRequestLogsDialogOpen}
       />
     </div>
   )

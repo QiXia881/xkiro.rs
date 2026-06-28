@@ -94,11 +94,9 @@ pub struct ChatToolCallFunction {
     pub arguments: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ChatTool {
-    #[serde(rename = "type")]
     pub tool_type: String,
-    #[serde(default)]
     pub function: Option<ChatToolDef>,
 }
 
@@ -109,6 +107,72 @@ pub struct ChatToolDef {
     pub description: Option<String>,
     #[serde(default)]
     pub parameters: Option<serde_json::Value>,
+}
+
+impl<'de> Deserialize<'de> for ChatTool {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawTool {
+            #[serde(rename = "type", default)]
+            tool_type: String,
+            #[serde(default)]
+            name: Option<String>,
+            #[serde(default)]
+            description: Option<String>,
+            #[serde(default)]
+            parameters: Option<serde_json::Value>,
+            #[serde(default)]
+            function: Option<RawToolFunction>,
+        }
+
+        #[derive(Deserialize)]
+        struct RawToolFunction {
+            #[serde(default)]
+            name: Option<String>,
+            #[serde(default)]
+            description: Option<String>,
+            #[serde(default)]
+            parameters: Option<serde_json::Value>,
+        }
+
+        let raw = RawTool::deserialize(deserializer)?;
+        let function = if raw.function.is_some()
+            || raw.name.is_some()
+            || raw.description.is_some()
+            || raw.parameters.is_some()
+        {
+            let nested = raw.function;
+            let nested_name = nested.as_ref().and_then(|f| f.name.clone());
+            let nested_description = nested.as_ref().and_then(|f| f.description.clone());
+            let nested_parameters = nested.and_then(|f| f.parameters);
+
+            let name = match nested_name {
+                Some(name) if !name.is_empty() => name,
+                _ => raw.name.unwrap_or_default(),
+            };
+            let description = match nested_description {
+                Some(description) if !description.is_empty() => Some(description),
+                _ => raw.description,
+            };
+            let parameters = nested_parameters.or(raw.parameters);
+
+            Some(ChatToolDef {
+                name,
+                description,
+                parameters,
+            })
+        } else {
+            None
+        };
+
+        Ok(Self {
+            tool_type: raw.tool_type,
+            function,
+        })
+    }
 }
 
 // ============================================================================
@@ -135,8 +199,9 @@ pub struct ChatChoice {
 #[derive(Debug, Serialize)]
 pub struct ChatChoiceMessage {
     pub role: &'static str, // "assistant"
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ChatToolCall>>,
 }
@@ -204,6 +269,10 @@ pub struct ChatChunkDeltaFunction {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ResponsesRequest {
+    #[serde(
+        default = "default_responses_model",
+        deserialize_with = "deserialize_responses_model"
+    )]
     pub model: String,
     /// 可为字符串、消息数组、或包含 input_text/input_image 的多模态结构
     pub input: serde_json::Value,
@@ -226,12 +295,31 @@ pub struct ResponsesRequest {
     /// 透传字段，本实现暂未做 stateful 会话恢复，仅在响应中回填便于客户端跟踪
     #[serde(default)]
     pub previous_response_id: Option<String>,
+    #[serde(default)]
+    pub store: Option<bool>,
     /// reasoning: { effort: "low|medium|high" }（仅做兼容透传）
     #[serde(default)]
     #[allow(dead_code)]
     pub reasoning: Option<serde_json::Value>,
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
 }
 
 fn default_stream_true() -> bool {
     false
+}
+
+fn default_responses_model() -> String {
+    "claude-sonnet-4.5".to_string()
+}
+
+fn deserialize_responses_model<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let model = Option::<String>::deserialize(deserializer)?;
+    Ok(match model {
+        Some(model) if !model.trim().is_empty() => model,
+        _ => default_responses_model(),
+    })
 }

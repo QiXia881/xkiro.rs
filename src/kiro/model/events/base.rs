@@ -5,11 +5,40 @@
 use crate::kiro::parser::error::{ParseError, ParseResult};
 use crate::kiro::parser::frame::Frame;
 
+/// 从帧 payload 中提取 token 使用量
+///
+/// 对齐 Kiro-Go `updateTokensFromEvent()`: 递归查找 usage map。
+pub fn extract_token_usage_from_frame(frame: &Frame) -> Option<super::token_usage::TokenUsage> {
+    if frame.payload.is_empty() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(&frame.payload).ok()?;
+    super::token_usage::extract_token_usage(&value)
+}
+
+pub fn extract_token_usage_from_frame_with_current(
+    frame: &Frame,
+    current_input_tokens: Option<i64>,
+    current_output_tokens: Option<i64>,
+) -> Option<super::token_usage::TokenUsage> {
+    if frame.payload.is_empty() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(&frame.payload).ok()?;
+    super::token_usage::extract_token_usage_with_current(
+        &value,
+        current_input_tokens,
+        current_output_tokens,
+    )
+}
+
 /// 事件类型枚举
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EventType {
     /// 助手响应事件
     AssistantResponse,
+    /// 推理/思考内容事件（thinking 模式下独立发送）
+    ReasoningContent,
     /// 工具使用事件
     ToolUse,
     /// 计费事件
@@ -25,6 +54,7 @@ impl EventType {
     pub fn from_str(s: &str) -> Self {
         match s {
             "assistantResponseEvent" => Self::AssistantResponse,
+            "reasoningContentEvent" => Self::ReasoningContent,
             "toolUseEvent" => Self::ToolUse,
             "meteringEvent" => Self::Metering,
             "contextUsageEvent" => Self::ContextUsage,
@@ -36,6 +66,7 @@ impl EventType {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::AssistantResponse => "assistantResponseEvent",
+            Self::ReasoningContent => "reasoningContentEvent",
             Self::ToolUse => "toolUseEvent",
             Self::Metering => "meteringEvent",
             Self::ContextUsage => "contextUsageEvent",
@@ -65,6 +96,8 @@ pub trait EventPayload: Sized {
 pub enum Event {
     /// 助手响应
     AssistantResponse(super::AssistantResponseEvent),
+    /// 推理/思考内容（thinking 模式下独立发送）
+    ReasoningContent(super::ReasoningContentEvent),
     /// 工具使用
     ToolUse(super::ToolUseEvent),
     /// 计费
@@ -111,6 +144,10 @@ impl Event {
             EventType::AssistantResponse => {
                 let payload = super::AssistantResponseEvent::from_frame(&frame)?;
                 Ok(Self::AssistantResponse(payload))
+            }
+            EventType::ReasoningContent => {
+                let payload = super::ReasoningContentEvent::from_frame(&frame)?;
+                Ok(Self::ReasoningContent(payload))
             }
             EventType::ToolUse => {
                 let payload = super::ToolUseEvent::from_frame(&frame)?;

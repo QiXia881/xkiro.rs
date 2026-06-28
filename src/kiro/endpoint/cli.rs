@@ -141,6 +141,9 @@ impl KiroEndpoint for CliEndpoint {
         if ctx.credentials.is_api_key_credential() {
             req = req.header("tokentype", "API_KEY");
         }
+        if ctx.credentials.is_external_idp_credential() {
+            req = req.header("TokenType", "EXTERNAL_IDP");
+        }
         req
     }
 
@@ -155,6 +158,9 @@ impl KiroEndpoint for CliEndpoint {
 
         if ctx.credentials.is_api_key_credential() {
             req = req.header("tokentype", "API_KEY");
+        }
+        if ctx.credentials.is_external_idp_credential() {
+            req = req.header("TokenType", "EXTERNAL_IDP");
         }
         req
     }
@@ -200,6 +206,9 @@ impl KiroEndpoint for CliEndpoint {
         if ctx.credentials.is_api_key_credential() {
             headers.push(("tokentype", "API_KEY".to_string()));
         }
+        if ctx.credentials.is_external_idp_credential() {
+            headers.push(("TokenType", "EXTERNAL_IDP".to_string()));
+        }
 
         Ok(UsageRequestParts { url, headers })
     }
@@ -220,7 +229,7 @@ impl KiroEndpoint for CliEndpoint {
         let is_sso_oidc = matches!(auth_method, Some("builder-id") | Some("idc"))
             || (ctx.credentials.client_id.is_some() && ctx.credentials.client_secret.is_some());
         if !is_sso_oidc {
-            if let Some(arn) = ctx.credentials.profile_arn.as_deref() {
+            if let Some(arn) = ctx.credentials.profile_arn_trimmed() {
                 body["profileArn"] = serde_json::Value::String(arn.to_string());
             }
         }
@@ -238,6 +247,9 @@ impl KiroEndpoint for CliEndpoint {
 
         if ctx.credentials.is_api_key_credential() {
             headers.push(("tokentype", "API_KEY".to_string()));
+        }
+        if ctx.credentials.is_external_idp_credential() {
+            headers.push(("TokenType", "EXTERNAL_IDP".to_string()));
         }
 
         Ok(PreferenceRequestParts {

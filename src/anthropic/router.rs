@@ -1,6 +1,7 @@
 //! Anthropic API 路由配置
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use axum::{
     Router,
@@ -16,7 +17,7 @@ use crate::model::runtime::SharedPromptConfig;
 
 use super::{
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
-    middleware::{AppState, auth_middleware, cors_layer},
+    middleware::{AppState, ThinkingRuntimeConfig, auth_middleware, cors_layer},
 };
 use crate::openai::handlers::{post_chat_completions, post_responses};
 
@@ -41,6 +42,9 @@ const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 /// - `Authorization: Bearer ***` header
 pub fn create_router_with_provider(
     api_key: impl Into<String>,
+    require_api_key: bool,
+    api_key_runtime: Arc<RwLock<String>>,
+    require_api_key_runtime: Arc<AtomicBool>,
     kiro_provider: Option<Arc<KiroProvider>>,
     profile_arn: Option<String>,
     extract_thinking: bool,
@@ -48,17 +52,31 @@ pub fn create_router_with_provider(
     prompt_filter: Arc<RwLock<PromptFilterConfig>>,
     prompt_runtime: SharedPromptConfig,
     prompt_cache_runtime: Arc<RwLock<super::middleware::PromptCacheRuntime>>,
-    truncation_recovery_notice: Arc<std::sync::atomic::AtomicBool>,
+    thinking_config: Arc<RwLock<ThinkingRuntimeConfig>>,
+    api_keys_runtime: super::middleware::SharedApiKeys,
+    api_keys_store_path: Option<std::path::PathBuf>,
+    responses_store_dir: Option<std::path::PathBuf>,
 ) -> Router {
+    let thinking_snapshot = thinking_config.read().clone();
     let mut state = AppState::new(
         api_key,
+        require_api_key,
         extract_thinking,
         prompt_cache_runtime,
-        truncation_recovery_notice,
+        thinking_snapshot,
     )
-        .with_compression_config(compression)
-        .with_prompt_filter_config(prompt_filter)
-        .with_prompt_runtime(prompt_runtime);
+    .with_auth_runtime(api_key_runtime, require_api_key_runtime)
+    .with_api_keys_runtime(api_keys_runtime)
+    .with_thinking_config(thinking_config)
+    .with_compression_config(compression)
+    .with_prompt_filter_config(prompt_filter)
+    .with_prompt_runtime(prompt_runtime);
+    if let Some(path) = api_keys_store_path {
+        state = state.with_api_keys_path(path);
+    }
+    if let Some(dir) = responses_store_dir {
+        state = state.with_responses_store_dir(dir);
+    }
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
     }

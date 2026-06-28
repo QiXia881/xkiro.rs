@@ -70,10 +70,13 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
 /// 提供 index.html
 fn serve_index() -> Response<Body> {
     match Asset::get("index.html") {
+        // index.html 是 SPA 入口，用 no-store 强制每次重新拉取：no-cache 仍允许浏览器
+        // 缓存后用条件请求复验，已打开的页面可能继续运行旧 bundle，导致重新部署后用户
+        // 看到旧行为（带哈希的 assets 仍可长期缓存，入口换新即可加载新 bundle）。
         Some(content) => Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-            .header(header::CACHE_CONTROL, "no-cache")
+            .header(header::CACHE_CONTROL, "no-store")
             .body(Body::from(content.data.into_owned()))
             .expect("Failed to build response"),
         None => Response::builder()
@@ -88,8 +91,8 @@ fn serve_index() -> Response<Body> {
 /// 根据文件类型返回合适的缓存策略
 fn get_cache_control(path: &str) -> &'static str {
     if path.ends_with(".html") {
-        // HTML 文件不缓存，确保用户获取最新版本
-        "no-cache"
+        // HTML 入口不缓存，避免重新部署后旧页面驻留（与 serve_index 一致）
+        "no-store"
     } else if path.starts_with("assets/") {
         // assets/ 目录下的文件带有内容哈希，可以长期缓存
         "public, max-age=31536000, immutable"

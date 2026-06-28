@@ -34,9 +34,17 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
 
-    /// 认证方式 (social / idc)
+    /// 认证方式 (social / idc / external_idp / api_key)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_method: Option<String>,
+
+    /// 身份提供方（Kiro-Go / KAM 兼容元数据）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+
+    /// Kiro 用户 ID（Kiro-Go / KAM 兼容元数据）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
 
     /// OIDC Client ID (IdC 认证需要)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -46,10 +54,43 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_secret: Option<String>,
 
+    /// External IdP OAuth2 token endpoint（external_idp 刷新需要）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_endpoint: Option<String>,
+
+    /// External IdP OIDC issuer URL
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer_url: Option<String>,
+
+    /// External IdP 授权 scopes（空格分隔）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<String>,
+
+    /// AWS SSO Start URL（Kiro-Go / KAM / IDE cache 兼容元数据）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_url: Option<String>,
+
+    /// KAM / IDE cache 使用的 clientIdHash
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id_hash: Option<String>,
+
+    /// KAM / IDE cache 兼容元数据
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id_token: Option<String>,
+
+    /// KAM / IDE cache 兼容元数据
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sso_session_id: Option<String>,
+
     /// 凭据优先级（数字越小优先级越高，默认为 0）
     #[serde(default)]
     #[serde(skip_serializing_if = "is_zero")]
     pub priority: u32,
+
+    /// Kiro-Go 兼容权重（0/1 等价于 1，2+ 表示加权轮询份额）
+    #[serde(default)]
+    #[serde(skip_serializing_if = "is_zero")]
+    pub weight: u32,
 
     /// 凭据级最大并发数（可选）
     ///
@@ -85,6 +126,15 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub subscription_title: Option<String>,
+
+    /// 上游 overage 开关状态（兼容 Kiro-Go 的 overageStatus 元数据）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub overage_status: Option<String>,
+
+    /// 旧版 Kiro-Go 字段，仅用于加载后迁移到 overage_status，不再写回。
+    #[serde(rename = "allowOverage", default, skip_serializing)]
+    pub legacy_allow_overage: bool,
 
     /// 凭据级代理 URL（可选）
     /// 支持 http/https/socks5 协议
@@ -127,6 +177,10 @@ fn is_zero(value: &u32) -> bool {
 fn canonicalize_auth_method_value(value: &str) -> &str {
     if value.eq_ignore_ascii_case("builder-id") || value.eq_ignore_ascii_case("iam") {
         "idc"
+    } else if value.eq_ignore_ascii_case("external-idp")
+        || value.eq_ignore_ascii_case("externalidp")
+    {
+        "external_idp"
     } else if value.eq_ignore_ascii_case("api_key") || value.eq_ignore_ascii_case("apikey") {
         "api_key"
     } else {
@@ -254,6 +308,23 @@ impl KiroCredentials {
         }
     }
 
+    pub fn migrate_legacy_allow_overage(&mut self) -> bool {
+        if !self.legacy_allow_overage {
+            return false;
+        }
+        if self
+            .overage_status
+            .as_deref()
+            .map(str::trim)
+            .filter(|status| !status.is_empty())
+            .is_none()
+        {
+            self.overage_status = Some("ENABLED".to_string());
+        }
+        self.legacy_allow_overage = false;
+        true
+    }
+
     /// 检查凭据是否支持 Opus 模型
     ///
     /// Free 账号不支持 Opus 模型，需要 PRO 或更高等级订阅
@@ -282,6 +353,13 @@ impl KiroCredentials {
             .unwrap_or("ide")
     }
 
+    pub fn profile_arn_trimmed(&self) -> Option<&str> {
+        self.profile_arn
+            .as_deref()
+            .map(str::trim)
+            .filter(|arn| !arn.is_empty())
+    }
+
     /// 检查是否为 API Key 凭据
     ///
     /// API Key 凭据直接使用 kiro_api_key 作为 Bearer Token，无需 refreshToken
@@ -292,6 +370,15 @@ impl KiroCredentials {
                 .as_deref()
                 .map(|m| m.eq_ignore_ascii_case("api_key") || m.eq_ignore_ascii_case("apikey"))
                 .unwrap_or(false)
+    }
+
+    pub fn is_external_idp_credential(&self) -> bool {
+        self.auth_method
+            .as_deref()
+            .map(|m| {
+                m.eq_ignore_ascii_case("external_idp") || m.eq_ignore_ascii_case("external-idp")
+            })
+            .unwrap_or(false)
     }
 }
 
@@ -341,6 +428,35 @@ mod tests {
     }
 
     #[test]
+    fn test_reference_account_metadata_roundtrip() {
+        let json = r#"{
+            "refreshToken": "test_refresh",
+            "authMethod": "idc",
+            "provider": "Enterprise",
+            "userId": "user-1",
+            "startUrl": "https://d-123.awsapps.com/start",
+            "clientIdHash": "hash-1",
+            "idToken": "id-token-1",
+            "ssoSessionId": "session-1"
+        }"#;
+
+        let creds = KiroCredentials::from_json(json).unwrap();
+        assert_eq!(creds.provider.as_deref(), Some("Enterprise"));
+        assert_eq!(creds.user_id.as_deref(), Some("user-1"));
+        assert_eq!(
+            creds.start_url.as_deref(),
+            Some("https://d-123.awsapps.com/start")
+        );
+        assert_eq!(creds.client_id_hash.as_deref(), Some("hash-1"));
+        assert_eq!(creds.id_token.as_deref(), Some("id-token-1"));
+        assert_eq!(creds.sso_session_id.as_deref(), Some("session-1"));
+
+        let output = creds.to_pretty_json().unwrap();
+        assert!(output.contains("clientIdHash"));
+        assert!(output.contains("ssoSessionId"));
+    }
+
+    #[test]
     fn test_to_json() {
         let creds = KiroCredentials {
             id: None,
@@ -349,9 +465,12 @@ mod tests {
             profile_arn: None,
             expires_at: None,
             auth_method: Some("social".to_string()),
+            provider: None,
+            user_id: None,
             client_id: None,
             client_secret: None,
             priority: 0,
+            weight: 0,
             concurrency: None,
             region: None,
             auth_region: None,
@@ -359,12 +478,21 @@ mod tests {
             machine_id: None,
             email: None,
             subscription_title: None,
+            overage_status: None,
+            legacy_allow_overage: false,
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
+            start_url: None,
+            client_id_hash: None,
+            id_token: None,
+            sso_session_id: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -431,6 +559,27 @@ mod tests {
         assert_eq!(list[2].refresh_token, Some("t1".to_string())); // priority 2
     }
 
+    #[test]
+    fn legacy_allow_overage_migrates_to_overage_status_like_kiro_go() {
+        let mut creds =
+            KiroCredentials::from_json(r#"{"refreshToken":"test","allowOverage":true}"#).unwrap();
+
+        assert!(creds.migrate_legacy_allow_overage());
+        assert_eq!(creds.overage_status.as_deref(), Some("ENABLED"));
+        assert!(!creds.legacy_allow_overage);
+        let json = creds.to_pretty_json().unwrap();
+        assert!(json.contains("overageStatus"));
+        assert!(!json.contains("allowOverage"));
+
+        let mut preset = KiroCredentials::from_json(
+            r#"{"refreshToken":"test","allowOverage":true,"overageStatus":"DISABLED"}"#,
+        )
+        .unwrap();
+        assert!(preset.migrate_legacy_allow_overage());
+        assert_eq!(preset.overage_status.as_deref(), Some("DISABLED"));
+        assert!(!preset.legacy_allow_overage);
+    }
+
     // ============ Region 字段测试 ============
 
     #[test]
@@ -468,9 +617,12 @@ mod tests {
             profile_arn: None,
             expires_at: None,
             auth_method: None,
+            provider: None,
+            user_id: None,
             client_id: None,
             client_secret: None,
             priority: 0,
+            weight: 0,
             concurrency: None,
             region: Some("eu-west-1".to_string()),
             auth_region: None,
@@ -478,12 +630,21 @@ mod tests {
             machine_id: None,
             email: None,
             subscription_title: None,
+            overage_status: None,
+            legacy_allow_overage: false,
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
+            start_url: None,
+            client_id_hash: None,
+            id_token: None,
+            sso_session_id: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -500,9 +661,12 @@ mod tests {
             profile_arn: None,
             expires_at: None,
             auth_method: None,
+            provider: None,
+            user_id: None,
             client_id: None,
             client_secret: None,
             priority: 0,
+            weight: 0,
             concurrency: None,
             region: None,
             auth_region: None,
@@ -510,12 +674,21 @@ mod tests {
             machine_id: None,
             email: None,
             subscription_title: None,
+            overage_status: None,
+            legacy_allow_overage: false,
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
+            start_url: None,
+            client_id_hash: None,
+            id_token: None,
+            sso_session_id: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -606,6 +779,19 @@ mod tests {
     }
 
     #[test]
+    fn test_profile_arn_trimmed_matches_kiro_go_cached_value() {
+        let mut creds = KiroCredentials::default();
+        creds.profile_arn = Some(" arn:aws:codewhisperer:profile/test ".to_string());
+        assert_eq!(
+            creds.profile_arn_trimmed(),
+            Some("arn:aws:codewhisperer:profile/test")
+        );
+
+        creds.profile_arn = Some("   ".to_string());
+        assert_eq!(creds.profile_arn_trimmed(), None);
+    }
+
+    #[test]
     fn test_region_roundtrip() {
         // 测试序列化和反序列化的往返一致性
         let original = KiroCredentials {
@@ -615,9 +801,12 @@ mod tests {
             profile_arn: None,
             expires_at: None,
             auth_method: Some("social".to_string()),
+            provider: None,
+            user_id: None,
             client_id: None,
             client_secret: None,
             priority: 3,
+            weight: 0,
             concurrency: None,
             region: Some("us-west-2".to_string()),
             auth_region: None,
@@ -625,12 +814,21 @@ mod tests {
             machine_id: Some("c".repeat(64)),
             email: None,
             subscription_title: None,
+            overage_status: None,
+            legacy_allow_overage: false,
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
+            start_url: None,
+            client_id_hash: None,
+            id_token: None,
+            sso_session_id: None,
         };
 
         let json = original.to_pretty_json().unwrap();
@@ -894,5 +1092,18 @@ mod tests {
         let creds = KiroCredentials::default();
         let result = creds.effective_proxy(None);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_external_idp_credential_detection_is_case_insensitive() {
+        let mut creds = KiroCredentials::default();
+        creds.auth_method = Some("EXTERNAL_IDP".to_string());
+        assert!(creds.is_external_idp_credential());
+
+        creds.auth_method = Some("external-idp".to_string());
+        assert!(creds.is_external_idp_credential());
+
+        creds.auth_method = Some("idc".to_string());
+        assert!(!creds.is_external_idp_credential());
     }
 }

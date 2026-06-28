@@ -20,7 +20,7 @@ use crate::model::config::CompressionConfig;
 #[derive(Clone)]
 pub struct AdminState {
     /// Admin API 密钥
-    pub admin_api_key: String,
+    pub admin_api_key: Arc<RwLock<String>>,
     /// Admin 服务
     pub service: Arc<AdminService>,
     /// 共享压缩配置（运行时可修改）
@@ -29,12 +29,12 @@ pub struct AdminState {
 
 impl AdminState {
     pub fn new(
-        admin_api_key: impl Into<String>,
+        admin_api_key: Arc<RwLock<String>>,
         service: AdminService,
         compression_config: Arc<RwLock<CompressionConfig>>,
     ) -> Self {
         Self {
-            admin_api_key: admin_api_key.into(),
+            admin_api_key,
             service: Arc::new(service),
             compression_config,
         }
@@ -50,7 +50,9 @@ pub async fn admin_auth_middleware(
     let api_key = auth::extract_api_key(&request);
 
     match api_key {
-        Some(key) if auth::constant_time_eq(&key, &state.admin_api_key) => next.run(request).await,
+        Some(key) if auth::constant_time_eq(&key, &state.admin_api_key.read()) => {
+            next.run(request).await
+        }
         _ => {
             let error = AdminErrorResponse::authentication_error();
             (StatusCode::UNAUTHORIZED, Json(error)).into_response()

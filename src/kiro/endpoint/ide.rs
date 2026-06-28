@@ -65,14 +65,14 @@ impl IdeEndpoint {
         if Self::is_aws_sso_oidc_credentials(credentials) {
             return None;
         }
-        credentials.profile_arn.as_deref()
+        credentials.profile_arn_trimmed()
     }
 
     /// 将 profileArn 注入或从请求体根对象移除
     ///
     /// - SSO OIDC 凭据：解析 JSON 并 remove `profileArn`
     /// - 其它凭据有 profile_arn：解析 JSON 并 insert
-    /// - 其它凭据无 profile_arn：原 body 透传
+    /// - 其它凭据无 profile_arn：保留并修剪 body 中已有 profileArn
     /// - 解析失败：返回错误，由 provider 立即终止该次调用
     fn inject_profile_arn(
         request_body: &str,
@@ -86,19 +86,36 @@ impl IdeEndpoint {
             return Ok(serde_json::to_string(&request)?);
         }
 
-        let Some(profile_arn) = Self::mcp_profile_arn_header_value(credentials) else {
+        if let Some(profile_arn) = Self::mcp_profile_arn_header_value(credentials) {
+            let mut request: serde_json::Value = serde_json::from_str(request_body)?;
+            let obj = request
+                .as_object_mut()
+                .ok_or_else(|| anyhow::anyhow!("request body is not a JSON object"))?;
+            obj.insert(
+                "profileArn".to_string(),
+                serde_json::Value::String(profile_arn.to_string()),
+            );
+            return Ok(serde_json::to_string(&request)?);
+        }
+
+        let Ok(mut request) = serde_json::from_str::<serde_json::Value>(request_body) else {
             return Ok(request_body.to_string());
         };
-
-        let mut request: serde_json::Value = serde_json::from_str(request_body)?;
-        let obj = request
-            .as_object_mut()
-            .ok_or_else(|| anyhow::anyhow!("request body is not a JSON object"))?;
-        obj.insert(
-            "profileArn".to_string(),
-            serde_json::Value::String(profile_arn.to_string()),
-        );
-        Ok(serde_json::to_string(&request)?)
+        let Some(obj) = request.as_object_mut() else {
+            return Ok(request_body.to_string());
+        };
+        if let Some(serde_json::Value::String(profile_arn)) = obj.get_mut("profileArn") {
+            let trimmed = profile_arn.trim();
+            if trimmed.is_empty() {
+                obj.remove("profileArn");
+            } else if trimmed.len() != profile_arn.len() {
+                *profile_arn = trimmed.to_string();
+            } else {
+                return Ok(request_body.to_string());
+            }
+            return Ok(serde_json::to_string(&request)?);
+        }
+        Ok(request_body.to_string())
     }
 }
 
@@ -138,6 +155,9 @@ impl KiroEndpoint for IdeEndpoint {
         if ctx.credentials.is_api_key_credential() {
             req = req.header("tokentype", "API_KEY");
         }
+        if ctx.credentials.is_external_idp_credential() {
+            req = req.header("TokenType", "EXTERNAL_IDP");
+        }
         req
     }
 
@@ -155,6 +175,9 @@ impl KiroEndpoint for IdeEndpoint {
         }
         if ctx.credentials.is_api_key_credential() {
             req = req.header("tokentype", "API_KEY");
+        }
+        if ctx.credentials.is_external_idp_credential() {
+            req = req.header("TokenType", "EXTERNAL_IDP");
         }
         req
     }
@@ -212,6 +235,9 @@ impl KiroEndpoint for IdeEndpoint {
         if ctx.credentials.is_api_key_credential() {
             headers.push(("tokentype", "API_KEY".to_string()));
         }
+        if ctx.credentials.is_external_idp_credential() {
+            headers.push(("TokenType", "EXTERNAL_IDP".to_string()));
+        }
 
         Ok(UsageRequestParts { url, headers })
     }
@@ -260,6 +286,9 @@ impl KiroEndpoint for IdeEndpoint {
         if ctx.credentials.is_api_key_credential() {
             headers.push(("tokentype", "API_KEY".to_string()));
         }
+        if ctx.credentials.is_external_idp_credential() {
+            headers.push(("TokenType", "EXTERNAL_IDP".to_string()));
+        }
 
         Ok(PreferenceRequestParts {
             url,
@@ -272,7 +301,9 @@ impl KiroEndpoint for IdeEndpoint {
 #[cfg(test)]
 mod tests {
     use super::IdeEndpoint;
+    use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
     use crate::kiro::model::credentials::KiroCredentials;
+    use crate::model::config::Config;
     use serde_json::Value;
 
     fn cred_with_arn(arn: Option<&str>) -> KiroCredentials {
@@ -297,6 +328,71 @@ mod tests {
     }
 
     #[test]
+    fn test_streaming_header_values_align_with_kiro_go_ide_format() {
+        let endpoint = IdeEndpoint::new();
+        let config = Config::default();
+        let credentials = KiroCredentials::default();
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: "token",
+            machine_id: "machine-123",
+            config: &config,
+        };
+
+        let user_agent = endpoint.user_agent(&ctx);
+        let amz_user_agent = endpoint.x_amz_user_agent(&ctx);
+
+        assert!(user_agent.contains("aws-sdk-js/1.0.34"));
+        assert!(user_agent.contains("api/codewhispererstreaming#1.0.34"));
+        assert!(user_agent.contains("KiroIDE-0.11.107-machine-123"));
+        assert!(amz_user_agent.contains("aws-sdk-js/1.0.34 KiroIDE-0.11.107-machine-123"));
+    }
+
+    #[test]
+    fn test_runtime_header_values_use_kiro_go_runtime_api_format() {
+        let endpoint = IdeEndpoint::new();
+        let config = Config::default();
+        let credentials = KiroCredentials::default();
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: "token",
+            machine_id: "machine-456",
+            config: &config,
+        };
+
+        let parts = endpoint.usage_request_parts(&ctx, false).unwrap();
+        let user_agent = parts
+            .headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("user-agent"))
+            .map(|(_, value)| value.as_str())
+            .expect("user-agent should exist");
+
+        assert!(user_agent.contains("aws-sdk-js/1.0.0"));
+        assert!(user_agent.contains("api/codewhispererruntime#1.0.0"));
+        assert!(user_agent.contains("m/N,E"));
+    }
+
+    #[test]
+    fn test_external_idp_usage_headers_include_token_type() {
+        let endpoint = IdeEndpoint::new();
+        let config = Config::default();
+        let mut credentials = KiroCredentials::default();
+        credentials.auth_method = Some("external_idp".to_string());
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: "token",
+            machine_id: "machine-789",
+            config: &config,
+        };
+
+        let parts = endpoint.usage_request_parts(&ctx, false).unwrap();
+        assert!(parts.headers.iter().any(|(key, value)| {
+            key.eq_ignore_ascii_case("TokenType") && value == "EXTERNAL_IDP"
+        }));
+    }
+
+    #[test]
     fn test_inject_profile_arn_with_some() {
         let body = r#"{"conversationState":{"conversationId":"c1"}}"#;
         let cred = cred_with_arn(Some("arn:aws:codewhisperer:us-east-1:123:profile/ABC"));
@@ -310,12 +406,40 @@ mod tests {
     }
 
     #[test]
+    fn test_inject_profile_arn_trims_cached_value_like_kiro_go() {
+        let body = r#"{"conversationState":{"conversationId":"c1"}}"#;
+        let cred = cred_with_arn(Some(" arn:aws:codewhisperer:profile/test "));
+        let result = IdeEndpoint::inject_profile_arn(body, &cred).unwrap();
+        let json: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(json["profileArn"], "arn:aws:codewhisperer:profile/test");
+    }
+
+    #[test]
     fn test_inject_profile_arn_with_none() {
         let body = r#"{"conversationState":{"conversationId":"c1"}}"#;
         let cred = cred_with_arn(None);
         let result = IdeEndpoint::inject_profile_arn(body, &cred).unwrap();
         // 没 arn 也没 SSO，原 body 透传
         assert_eq!(result, body);
+    }
+
+    #[test]
+    fn test_inject_profile_arn_preserves_and_trims_explicit_payload_arn_like_kiro_go() {
+        let body =
+            r#"{"conversationState":{},"profileArn":" arn:aws:codewhisperer:profile/explicit "}"#;
+        let cred = cred_with_arn(None);
+        let result = IdeEndpoint::inject_profile_arn(body, &cred).unwrap();
+        let json: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(json["profileArn"], "arn:aws:codewhisperer:profile/explicit");
+    }
+
+    #[test]
+    fn test_inject_profile_arn_removes_blank_explicit_payload_arn_like_kiro_go() {
+        let body = r#"{"conversationState":{},"profileArn":"   "}"#;
+        let cred = cred_with_arn(None);
+        let result = IdeEndpoint::inject_profile_arn(body, &cred).unwrap();
+        let json: Value = serde_json::from_str(&result).unwrap();
+        assert!(json.get("profileArn").is_none());
     }
 
     #[test]
@@ -371,10 +495,16 @@ mod tests {
 
     #[test]
     fn test_mcp_profile_arn_header_value_normal_returns_arn() {
-        let cred = cred_with_arn(Some("arn:test"));
+        let cred = cred_with_arn(Some(" arn:test "));
         assert_eq!(
             IdeEndpoint::mcp_profile_arn_header_value(&cred),
             Some("arn:test")
         );
+    }
+
+    #[test]
+    fn test_blank_profile_arn_header_value_returns_none() {
+        let cred = cred_with_arn(Some("   "));
+        assert!(IdeEndpoint::mcp_profile_arn_header_value(&cred).is_none());
     }
 }

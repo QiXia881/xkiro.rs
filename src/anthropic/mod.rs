@@ -22,10 +22,9 @@
 //! axum::serve(listener, app).await?;
 //! ```
 
-pub(crate) mod converter;
 pub mod bracket_tool_parser;
 pub mod cache_tracker;
-pub mod compressor;
+pub(crate) mod converter;
 mod handlers;
 pub mod middleware;
 pub mod prompt_filter;
@@ -33,9 +32,8 @@ pub mod prompt_presets;
 mod router;
 mod stream;
 pub mod thinking_parser;
-pub mod tool_compression;
-pub mod truncation;
 pub mod types;
 pub mod websearch;
 
+pub(crate) use handlers::{override_thinking_from_model_name, truncate_payload_to_body_limit};
 pub use router::create_router_with_provider;

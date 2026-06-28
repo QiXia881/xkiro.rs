@@ -1,5 +1,6 @@
 //! Anthropic API 中间件
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -21,12 +22,24 @@ use crate::model::runtime::{PromptRuntimeConfig, SharedPromptConfig};
 use super::cache_tracker::CacheTracker;
 use super::types::ErrorResponse;
 
+pub type SharedApiKeys = Arc<RwLock<Vec<crate::admin::types::ApiKeyEntry>>>;
+
+#[derive(Clone, Debug)]
+pub struct MatchedApiKeyId(pub Option<String>);
+
 #[derive(Clone)]
 pub(crate) struct PromptCacheSnapshot {
     pub accounting_enabled: bool,
     #[allow(dead_code)]
     pub ttl_seconds: u64,
     pub tracker: Arc<CacheTracker>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ThinkingRuntimeConfig {
+    pub suffix: String,
+    pub openai_format: String,
+    pub claude_format: String,
 }
 
 pub struct PromptCacheRuntime {
@@ -69,8 +82,14 @@ impl PromptCacheRuntime {
 /// 应用共享状态
 #[derive(Clone)]
 pub struct AppState {
-    /// API 密钥
-    pub api_key: String,
+    /// API 密钥（单 key 模式，向后兼容）
+    pub api_key: Arc<RwLock<String>>,
+    /// 是否要求客户端 API Key
+    pub require_api_key: Arc<AtomicBool>,
+    /// 多 API Key 列表（可选，启用后支持多个 key）
+    pub api_keys: Option<SharedApiKeys>,
+    /// 多 API Key 持久化路径
+    pub api_keys_path: Option<Arc<PathBuf>>,
     /// Kiro Provider（可选，用于实际 API 调用）
     /// 内部使用 MultiTokenManager，已支持线程安全的多凭据管理
     pub kiro_provider: Option<Arc<KiroProvider>>,
@@ -86,20 +105,28 @@ pub struct AppState {
     pub prompt_runtime: SharedPromptConfig,
     /// Prompt Cache 运行时配置（共享引用，支持热更新）
     pub prompt_cache_runtime: Arc<RwLock<PromptCacheRuntime>>,
-    /// 是否在 system prompt 末尾注入截断恢复识别说明（运行时可改）
-    pub truncation_recovery_notice: Arc<AtomicBool>,
+    /// Kiro-Go thinking 设置（运行时可改）
+    pub thinking_config: Arc<RwLock<ThinkingRuntimeConfig>>,
+    /// OpenAI Responses 历史存储目录
+    pub responses_store_dir: Option<Arc<PathBuf>>,
+    /// Kiro 可用模型缓存
+    pub models_cache: Arc<RwLock<Vec<crate::kiro::models::AvailableModel>>>,
 }
 
 impl AppState {
     /// 创建新的应用状态
     pub fn new(
         api_key: impl Into<String>,
+        require_api_key: bool,
         extract_thinking: bool,
         prompt_cache_runtime: Arc<RwLock<PromptCacheRuntime>>,
-        truncation_recovery_notice: Arc<AtomicBool>,
+        thinking_config: ThinkingRuntimeConfig,
     ) -> Self {
         Self {
-            api_key: api_key.into(),
+            api_key: Arc::new(RwLock::new(api_key.into())),
+            require_api_key: Arc::new(AtomicBool::new(require_api_key)),
+            api_keys: None,
+            api_keys_path: None,
             kiro_provider: None,
             extract_thinking,
             profile_arn: None,
@@ -113,8 +140,49 @@ impl AppState {
                 position: crate::model::config::SystemPromptPosition::default(),
             })),
             prompt_cache_runtime,
-            truncation_recovery_notice,
+            thinking_config: Arc::new(RwLock::new(thinking_config)),
+            responses_store_dir: None,
+            models_cache: Arc::new(RwLock::new(Vec::new())),
         }
+    }
+
+    /// 设置多 API Key 列表
+    pub fn with_api_keys(mut self, keys: Vec<crate::admin::types::ApiKeyEntry>) -> Self {
+        self.api_keys = Some(Arc::new(RwLock::new(keys)));
+        self
+    }
+
+    pub fn with_api_keys_runtime(mut self, keys: SharedApiKeys) -> Self {
+        self.api_keys = Some(keys);
+        self
+    }
+
+    pub fn with_api_keys_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.api_keys_path = Some(Arc::new(path.into()));
+        self
+    }
+
+    pub fn with_auth_runtime(
+        mut self,
+        api_key: Arc<RwLock<String>>,
+        require_api_key: Arc<AtomicBool>,
+    ) -> Self {
+        self.api_key = api_key;
+        self.require_api_key = require_api_key;
+        self
+    }
+
+    pub fn with_thinking_config(
+        mut self,
+        thinking_config: Arc<RwLock<ThinkingRuntimeConfig>>,
+    ) -> Self {
+        self.thinking_config = thinking_config;
+        self
+    }
+
+    pub fn with_responses_store_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.responses_store_dir = Some(Arc::new(dir.into()));
+        self
     }
 
     /// 设置 KiroProvider
@@ -152,23 +220,257 @@ impl AppState {
         self.prompt_cache_runtime.read().snapshot()
     }
 
-    pub fn truncation_recovery_notice_enabled(&self) -> bool {
-        self.truncation_recovery_notice.load(Ordering::Relaxed)
+    pub fn record_api_key_usage(&self, key_id: Option<&str>, tokens: i64, credits: f64) {
+        let Some(key_id) = key_id.filter(|id| !id.is_empty()) else {
+            return;
+        };
+        let Some(api_keys) = &self.api_keys else {
+            return;
+        };
+
+        let mut keys = api_keys.write();
+        let Some(entry) = keys.iter_mut().find(|k| k.id == key_id) else {
+            tracing::warn!(api_key_id = key_id, "API Key 使用量记录失败：未找到 key");
+            return;
+        };
+
+        if tokens > 0 {
+            entry.tokens_used += tokens;
+        }
+        if credits > 0.0 {
+            entry.credits_used += credits;
+        }
+        entry.requests_count += 1;
+        entry.last_used_at = Some(chrono::Utc::now().timestamp());
+
+        if let Some(path) = &self.api_keys_path {
+            match serde_json::to_string_pretty(&*keys) {
+                Ok(data) => {
+                    if let Err(e) = std::fs::write(path.as_ref(), data) {
+                        tracing::warn!(path = %path.display(), error = %e, "保存 API Keys 文件失败");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "序列化 API Keys 失败");
+                }
+            }
+        }
     }
 }
 
 /// API Key 认证中间件
+///
+/// 支持两种模式：
+/// 1. 单 key 模式：检查提取的 key 是否与配置的 api_key 匹配
+/// 2. 多 key 模式：检查提取的 key 是否在 api_keys 列表中（且 enabled）
 pub async fn auth_middleware(
     State(state): State<AppState>,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Response {
+    if !state.require_api_key.load(Ordering::Relaxed) {
+        request.extensions_mut().insert(MatchedApiKeyId(None));
+        return next.run(request).await;
+    }
+
     match auth::extract_api_key(&request) {
-        Some(key) if auth::constant_time_eq(&key, &state.api_key) => next.run(request).await,
+        Some(key) => match authenticate_client_api_key(&state, &key) {
+            Ok(api_key_id) => {
+                request.extensions_mut().insert(MatchedApiKeyId(api_key_id));
+                next.run(request).await
+            }
+            Err(ClientApiKeyAuthError::TokenLimitExceeded) => {
+                let error = ErrorResponse::rate_limit_error("Token limit exceeded");
+                (StatusCode::TOO_MANY_REQUESTS, Json(error)).into_response()
+            }
+            Err(ClientApiKeyAuthError::CreditLimitExceeded) => {
+                let error = ErrorResponse::rate_limit_error("Credit limit exceeded");
+                (StatusCode::TOO_MANY_REQUESTS, Json(error)).into_response()
+            }
+            Err(ClientApiKeyAuthError::Invalid) => {
+                let error = ErrorResponse::authentication_error();
+                (StatusCode::UNAUTHORIZED, Json(error)).into_response()
+            }
+        },
         _ => {
             let error = ErrorResponse::authentication_error();
             (StatusCode::UNAUTHORIZED, Json(error)).into_response()
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientApiKeyAuthError {
+    Invalid,
+    TokenLimitExceeded,
+    CreditLimitExceeded,
+}
+
+fn authenticate_client_api_key(
+    state: &AppState,
+    key: &str,
+) -> Result<Option<String>, ClientApiKeyAuthError> {
+    if let Some(api_keys) = &state.api_keys {
+        let keys = api_keys.read();
+        if !keys.is_empty() {
+            let Some(entry) = keys.iter().find(|k| k.key == key) else {
+                return Err(ClientApiKeyAuthError::Invalid);
+            };
+            if !entry.enabled {
+                return Err(ClientApiKeyAuthError::Invalid);
+            }
+            if entry.token_limit > 0 && entry.tokens_used >= entry.token_limit {
+                return Err(ClientApiKeyAuthError::TokenLimitExceeded);
+            }
+            if entry.credit_limit > 0.0 && entry.credits_used >= entry.credit_limit {
+                return Err(ClientApiKeyAuthError::CreditLimitExceeded);
+            }
+            return Ok(Some(entry.id.clone()));
+        }
+    }
+
+    let legacy_key = state.api_key.read().clone();
+    if !legacy_key.trim().is_empty() && auth::constant_time_eq(key, &legacy_key) {
+        return Ok(None);
+    }
+
+    Err(ClientApiKeyAuthError::Invalid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_state(api_key: &str) -> AppState {
+        AppState::new(
+            api_key,
+            true,
+            false,
+            Arc::new(RwLock::new(PromptCacheRuntime::new(300, false))),
+            ThinkingRuntimeConfig {
+                suffix: "-thinking".to_string(),
+                openai_format: "reasoning_content".to_string(),
+                claude_format: "thinking".to_string(),
+            },
+        )
+    }
+
+    fn api_key_entry(key: &str, enabled: bool) -> crate::admin::types::ApiKeyEntry {
+        crate::admin::types::ApiKeyEntry {
+            id: format!("id-{key}"),
+            name: Some(key.to_string()),
+            key: key.to_string(),
+            enabled,
+            created_at: 1,
+            last_used_at: None,
+            token_limit: 0,
+            credit_limit: 0.0,
+            tokens_used: 0,
+            credits_used: 0.0,
+            requests_count: 0,
+        }
+    }
+
+    #[test]
+    fn shared_api_keys_update_auth_immediately_like_kiro_go() {
+        let keys = Arc::new(RwLock::new(Vec::new()));
+        let state = test_state("").with_api_keys_runtime(keys.clone());
+
+        assert_eq!(
+            authenticate_client_api_key(&state, "sk-live"),
+            Err(ClientApiKeyAuthError::Invalid)
+        );
+
+        keys.write().push(api_key_entry("sk-live", true));
+
+        assert_eq!(
+            authenticate_client_api_key(&state, "sk-live"),
+            Ok(Some("id-sk-live".to_string()))
+        );
+    }
+
+    #[test]
+    fn shared_api_keys_disable_immediately_like_kiro_go() {
+        let keys = Arc::new(RwLock::new(vec![api_key_entry("sk-live", true)]));
+        let state = test_state("").with_api_keys_runtime(keys.clone());
+
+        assert_eq!(
+            authenticate_client_api_key(&state, "sk-live"),
+            Ok(Some("id-sk-live".to_string()))
+        );
+
+        keys.write()[0].enabled = false;
+
+        assert_eq!(
+            authenticate_client_api_key(&state, "sk-live"),
+            Err(ClientApiKeyAuthError::Invalid)
+        );
+    }
+
+    #[test]
+    fn empty_legacy_key_fails_closed_when_auth_is_required_like_kiro_go() {
+        let state = test_state("");
+
+        assert_eq!(
+            authenticate_client_api_key(&state, ""),
+            Err(ClientApiKeyAuthError::Invalid)
+        );
+    }
+
+    #[test]
+    fn configured_api_keys_take_priority_over_legacy_key_like_kiro_go() {
+        let keys = Arc::new(RwLock::new(vec![api_key_entry("sk-live", true)]));
+        let state = test_state("legacy-key").with_api_keys_runtime(keys);
+
+        assert_eq!(
+            authenticate_client_api_key(&state, "legacy-key"),
+            Err(ClientApiKeyAuthError::Invalid)
+        );
+    }
+
+    #[test]
+    fn record_api_key_usage_persists_counters_like_kiro_go() {
+        let dir = std::env::temp_dir().join(format!(
+            "xkiro-api-key-usage-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("kiro_api_keys.json");
+        let keys = Arc::new(RwLock::new(vec![api_key_entry("sk-live", true)]));
+        let state = test_state("")
+            .with_api_keys_runtime(keys)
+            .with_api_keys_path(path.clone());
+
+        state.record_api_key_usage(Some("id-sk-live"), 7, 0.5);
+        state.record_api_key_usage(Some("id-sk-live"), 0, 0.0);
+
+        let persisted: Vec<crate::admin::types::ApiKeyEntry> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let entry = &persisted[0];
+        assert_eq!(entry.tokens_used, 7);
+        assert_eq!(entry.credits_used, 0.5);
+        assert_eq!(entry.requests_count, 2);
+        assert!(entry.last_used_at.is_some());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn record_api_key_usage_empty_id_is_noop_like_kiro_go() {
+        let keys = Arc::new(RwLock::new(vec![api_key_entry("sk-live", true)]));
+        let state = test_state("").with_api_keys_runtime(keys.clone());
+
+        state.record_api_key_usage(Some(""), 100, 1.0);
+        state.record_api_key_usage(None, 100, 1.0);
+
+        let entry = &keys.read()[0];
+        assert_eq!(entry.tokens_used, 0);
+        assert_eq!(entry.credits_used, 0.0);
+        assert_eq!(entry.requests_count, 0);
+        assert!(entry.last_used_at.is_none());
     }
 }
 

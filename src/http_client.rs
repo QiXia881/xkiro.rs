@@ -75,7 +75,7 @@ pub fn build_client(
             proxy = proxy.basic_auth(username, password);
         }
 
-        builder = builder.proxy(proxy);
+        builder = builder.proxy(proxy).http1_only();
         tracing::debug!("HTTP Client 使用代理: {}", proxy_config.url);
     }
 
@@ -85,6 +85,11 @@ pub fn build_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn test_proxy_config_new() {
@@ -113,5 +118,120 @@ mod tests {
         let config = ProxyConfig::new("http://127.0.0.1:7890");
         let client = build_client(Some(&config), 30, TlsBackend::Rustls);
         assert!(client.is_ok());
+    }
+
+    #[tokio::test]
+    async fn explicit_proxy_routes_http_requests_like_kiro_go() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel();
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0_u8; 1024];
+            let n = stream.read(&mut buffer).unwrap();
+            let request = String::from_utf8_lossy(&buffer[..n]).to_string();
+            tx.send(request).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nproxied",
+                )
+                .unwrap();
+        });
+
+        let proxy = ProxyConfig::new(format!("http://{proxy_addr}"));
+        let client = build_client(Some(&proxy), 5, TlsBackend::Rustls).unwrap();
+        let body = client
+            .get("http://example.invalid/kiro-proxy-check")
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+
+        let request = rx.recv().unwrap();
+        server.join().unwrap();
+
+        assert_eq!(body, "proxied");
+        assert!(request.starts_with("GET http://example.invalid/kiro-proxy-check "));
+    }
+
+    #[tokio::test]
+    async fn environment_proxy_child_request_like_kiro_go_auth_client() {
+        if std::env::var_os("XKIRO_ENV_PROXY_CHILD").is_none() {
+            return;
+        }
+        let body = build_client(None, 5, TlsBackend::Rustls)
+            .unwrap()
+            .get("http://example.invalid/kiro-env-proxy-check")
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert_eq!(body, "proxied");
+    }
+
+    #[test]
+    fn environment_proxy_routes_http_requests_like_kiro_go_auth_client() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel();
+
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut buffer = [0_u8; 1024];
+                        let n = stream.read(&mut buffer).unwrap();
+                        let request = String::from_utf8_lossy(&buffer[..n]).to_string();
+                        tx.send(Some(request)).unwrap();
+                        stream
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nproxied",
+                            )
+                            .unwrap();
+                        return;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            tx.send(None).unwrap();
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("proxy accept failed: {e}"),
+                }
+            }
+        });
+
+        let proxy_url = format!("http://{proxy_addr}");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("environment_proxy_child_request_like_kiro_go_auth_client")
+            .arg("--test-threads=1")
+            .env("XKIRO_ENV_PROXY_CHILD", "1")
+            .env("HTTP_PROXY", &proxy_url)
+            .env("http_proxy", &proxy_url)
+            .env("ALL_PROXY", &proxy_url)
+            .env("all_proxy", &proxy_url)
+            .env_remove("NO_PROXY")
+            .env_remove("no_proxy")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child test failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let request = rx.recv_timeout(Duration::from_secs(6)).unwrap().unwrap();
+        server.join().unwrap();
+
+        assert!(request.starts_with("GET http://example.invalid/kiro-env-proxy-check "));
     }
 }

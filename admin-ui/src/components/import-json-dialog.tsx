@@ -10,7 +10,7 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { useCredentials, useAddCredential, useDeleteCredential } from '@/hooks/use-credentials'
-import { getCredentialBalance, setCredentialDisabled } from '@/api/credentials'
+import { getCredentialBalance, importKiroGoCredential, setCredentialDisabled } from '@/api/credentials'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
 
 interface ImportJsonDialogProps {
@@ -19,23 +19,52 @@ interface ImportJsonDialogProps {
 }
 
 interface CredentialInput {
+  id?: string | number
+  accessToken?: string
   refreshToken?: string
   provider?: string
   clientId?: string
   clientSecret?: string
+  tokenEndpoint?: string
+  issuerUrl?: string
+  scopes?: string
+  startUrl?: string
+  clientIdHash?: string
+  idToken?: string
+  ssoSessionId?: string
+  email?: string
+  profileArn?: string
+  userId?: string | null
   region?: string
   authRegion?: string
   apiRegion?: string
   priority?: number
+  weight?: number
   concurrency?: number | null
   machineId?: string
   kiroApiKey?: string
   authMethod?: string
   endpoint?: string
+  overageStatus?: string
+  enabled?: boolean
+  disabled?: boolean
   proxyUrl?: string
   proxyUsername?: string
   proxyPassword?: string
 }
+
+const EXTERNAL_IDP_ALIASES = new Set([
+  'external_idp',
+  'azuread',
+  'azure',
+  'entra',
+  'entra-id',
+  'entra_id',
+  'microsoft',
+  'm365',
+  'office365',
+  'external',
+])
 
 // 下拉可选 provider（仅 OAuth 凭据用于分类，api_key 无 provider 概念）
 type ProviderChoice = 'Google' | 'Github' | 'Enterprise'
@@ -46,6 +75,40 @@ function providerToAuthMethod(provider: string): 'social' | 'idc' {
   const p = provider.trim().toLowerCase()
   if (p === 'enterprise' || p === 'builderid' || p === 'builder-id' || p === 'idc') return 'idc'
   return 'social'
+}
+
+function isExternalIdpInput(cred: CredentialInput): boolean {
+  const authMethod = cred.authMethod?.trim().toLowerCase()
+  const provider = cred.provider?.trim().toLowerCase()
+  return Boolean(
+    (authMethod && EXTERNAL_IDP_ALIASES.has(authMethod))
+      || (provider && EXTERNAL_IDP_ALIASES.has(provider))
+      || cred.tokenEndpoint?.trim()
+      || cred.issuerUrl?.trim()
+      || cred.scopes?.trim()
+  )
+}
+
+function shouldUseKiroGoImport(cred: CredentialInput, authMethod: string): boolean {
+  return Boolean(
+    authMethod === 'external_idp'
+      || cred.accessToken?.trim()
+      || cred.tokenEndpoint?.trim()
+      || cred.issuerUrl?.trim()
+      || cred.scopes?.trim()
+      || cred.provider?.trim()
+      || cred.startUrl?.trim()
+      || cred.clientIdHash?.trim()
+      || cred.idToken?.trim()
+      || cred.ssoSessionId?.trim()
+      || cred.userId?.trim()
+      || cred.id !== undefined
+      || cred.email?.trim()
+      || cred.profileArn?.trim()
+      || cred.overageStatus?.trim()
+      || cred.enabled !== undefined
+      || cred.disabled !== undefined
+  )
 }
 
 // 是否 api_key 凭据（api_key 跳过 provider 选择）
@@ -289,6 +352,7 @@ export function ImportJsonDialog({ open, onOpenChange }: ImportJsonDialogProps) 
               authMethod: 'api_key',
               kiroApiKey: cred.kiroApiKey?.trim(),
               priority: cred.priority || 0,
+              weight: cred.weight || 0,
               concurrency: cred.concurrency ?? null,
               authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
               apiRegion: cred.apiRegion?.trim() || undefined,
@@ -333,12 +397,16 @@ export function ImportJsonDialog({ open, onOpenChange }: ImportJsonDialogProps) 
           const rawAuthMethod = cred.authMethod?.trim()
           if (rawAuthMethod) {
             const lower = rawAuthMethod.toLowerCase()
-            if (!['social', 'idc', 'api_key'].includes(lower)) {
+            if (!['social', 'idc', 'api_key'].includes(lower) && !EXTERNAL_IDP_ALIASES.has(lower)) {
               throw new Error(`未知的 authMethod: ${rawAuthMethod}`)
             }
           }
           const authMethod = rawAuthMethod
-            ? (rawAuthMethod.toLowerCase() === 'idc' ? 'idc' : 'social')
+            ? (EXTERNAL_IDP_ALIASES.has(rawAuthMethod.toLowerCase())
+                ? 'external_idp'
+                : rawAuthMethod.toLowerCase() === 'idc' ? 'idc' : 'social')
+            : isExternalIdpInput(cred)
+              ? 'external_idp'
             : cred.provider?.trim()
               ? providerToAuthMethod(cred.provider)
               : clientId && clientSecret ? 'idc' : 'social'
@@ -347,21 +415,56 @@ export function ImportJsonDialog({ open, onOpenChange }: ImportJsonDialogProps) 
             throw new Error('idc 模式需要同时提供 clientId 和 clientSecret')
           }
 
-          const addedCred = await addCredential({
-            refreshToken: token,
-            authMethod,
-            authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
-            apiRegion: cred.apiRegion?.trim() || undefined,
-            clientId,
-            clientSecret,
-            priority: cred.priority || 0,
-            concurrency: cred.concurrency ?? null,
-            machineId: cred.machineId?.trim() || undefined,
-            endpoint: cred.endpoint?.trim() || undefined,
-            proxyUrl: cred.proxyUrl?.trim() || undefined,
-            proxyUsername: cred.proxyUsername?.trim() || undefined,
-            proxyPassword: cred.proxyPassword?.trim() || undefined,
-          })
+          const addedCred = shouldUseKiroGoImport(cred, authMethod)
+            ? await importKiroGoCredential({
+                id: cred.id,
+                accessToken: cred.accessToken?.trim() || undefined,
+                refreshToken: token,
+                clientId,
+                clientSecret,
+                authMethod,
+                provider: cred.provider?.trim() || undefined,
+                region: cred.authRegion?.trim() || cred.region?.trim() || undefined,
+                authRegion: cred.authRegion?.trim() || undefined,
+                apiRegion: cred.apiRegion?.trim() || undefined,
+                tokenEndpoint: cred.tokenEndpoint?.trim() || undefined,
+                issuerUrl: cred.issuerUrl?.trim() || undefined,
+                scopes: cred.scopes?.trim() || undefined,
+                startUrl: cred.startUrl?.trim() || undefined,
+                clientIdHash: cred.clientIdHash?.trim() || undefined,
+                idToken: cred.idToken?.trim() || undefined,
+                ssoSessionId: cred.ssoSessionId?.trim() || undefined,
+                priority: cred.priority || 0,
+                weight: cred.weight || 0,
+                concurrency: cred.concurrency ?? undefined,
+                email: cred.email?.trim() || undefined,
+                profileArn: cred.profileArn?.trim() || undefined,
+                userId: cred.userId ?? undefined,
+                machineId: cred.machineId?.trim() || undefined,
+                endpoint: cred.endpoint?.trim() || undefined,
+                proxyUrl: cred.proxyUrl?.trim() || undefined,
+                proxyUsername: cred.proxyUsername?.trim() || undefined,
+                proxyPassword: cred.proxyPassword?.trim() || undefined,
+                overageStatus: cred.overageStatus?.trim() || undefined,
+                enabled: cred.enabled,
+                disabled: cred.disabled,
+              })
+            : await addCredential({
+                refreshToken: token,
+                authMethod,
+                authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
+                apiRegion: cred.apiRegion?.trim() || undefined,
+                clientId,
+                clientSecret,
+                priority: cred.priority || 0,
+                weight: cred.weight || 0,
+                concurrency: cred.concurrency ?? null,
+                machineId: cred.machineId?.trim() || undefined,
+                endpoint: cred.endpoint?.trim() || undefined,
+                proxyUrl: cred.proxyUrl?.trim() || undefined,
+                proxyUsername: cred.proxyUsername?.trim() || undefined,
+                proxyPassword: cred.proxyPassword?.trim() || undefined,
+              })
           addedCredId = addedCred.credentialId
 
           let balance

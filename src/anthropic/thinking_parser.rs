@@ -191,7 +191,10 @@ mod tests {
     #[test]
     fn test_find_real_thinking_end_tag_basic() {
         assert_eq!(find_real_thinking_end_tag("</thinking>\n\n"), Some(0));
-        assert_eq!(find_real_thinking_end_tag("content</thinking>\n\n"), Some(7));
+        assert_eq!(
+            find_real_thinking_end_tag("content</thinking>\n\n"),
+            Some(7)
+        );
         assert_eq!(
             find_real_thinking_end_tag("some text</thinking>\n\nmore text"),
             Some(9)

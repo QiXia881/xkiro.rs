@@ -16,10 +16,7 @@ pub fn atomic_write_string<P: AsRef<Path>>(path: P, content: &str) -> std::io::R
 
 /// 同 `atomic_write_string`，但在 rename 前对临时文件 chmod 0o600（Unix）。
 /// 防同主机其他用户读取凭据 / 配置等敏感文件。
-pub fn atomic_write_string_secure<P: AsRef<Path>>(
-    path: P,
-    content: &str,
-) -> std::io::Result<()> {
+pub fn atomic_write_string_secure<P: AsRef<Path>>(path: P, content: &str) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

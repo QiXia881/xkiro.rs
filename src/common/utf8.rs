@@ -3,7 +3,7 @@
 //! 目前标准库的 `str::floor_char_boundary()` 仍是 nightly-only。
 //! 为了在 stable 上安全按字节索引截断 UTF-8 字符串，这里提供等价实现。
 
-#![allow(dead_code)] // 工具模块，函数将在后续 stream/compressor 合并中被调用
+#![allow(dead_code)]
 
 /// 返回不大于 `idx` 的最大 UTF-8 字符边界（byte index）。
 ///

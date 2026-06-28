@@ -58,13 +58,8 @@
 }
 
 @layer base {
-  /* fluid root font-size：1024px→16px、2560px→20px 之间线性插值
-     公式：clamp(min, intercept + slope*100vw, max)
-     slope = (20-16)/(2560-1024) ≈ 0.0026 → 0.26vw
-     intercept = 16 - 0.26vw*1024px ≈ 13.34px
-     比例 1.25×（16→20），WCAG 1.4.4 允许 200% zoom ✓ */
   html {
-    font-size: clamp(16px, 13.34px + 0.26vw, 20px);
+    font-size: 16px;
   }
   * {
     @apply border-border;

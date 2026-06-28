@@ -3,12 +3,14 @@
 use std::convert::Infallible;
 
 use crate::kiro::model::events::{Event, MeteringEvent};
-use crate::kiro::model::requests::kiro::KiroRequest;
+use crate::kiro::model::requests::conversation::{HistoryUserMessage, Message as KiroMessage};
+use crate::kiro::model::requests::kiro::{InferenceConfig, KiroRequest};
+use crate::kiro::models::AvailableModel;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::token;
 use anyhow::Error;
 use axum::{
-    Json as JsonExtractor,
+    Extension, Json as JsonExtractor,
     body::Body,
     extract::State,
     http::{StatusCode, header},
@@ -22,27 +24,23 @@ use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::interval;
 use uuid::Uuid;
 
-use super::converter::{ConversionError, convert_request, extract_session_id};
-use super::middleware::AppState;
+use super::converter::{
+    ConversionError, convert_request_with_thinking_suffix, extract_session_id,
+    generate_thinking_prefix,
+};
+use super::middleware::{AppState, MatchedApiKeyId};
 use super::stream::{BufferedStreamContext, CacheUsageBreakdown, SseEvent, StreamContext};
 use super::types::{
-    CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
-    OutputConfig, SystemMessage, Thinking,
+    CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model,
+    ModelCapabilities, ModelInfo, ModelInfoCapabilities, ModelInfoMeta, ModelModalities,
+    ModelsResponse, OutputConfig, SystemMessage, Thinking,
 };
 use super::websearch;
 use crate::model::config::SystemPromptPosition;
 use crate::model::runtime::SharedPromptConfig;
 
-/// 自适应压缩：最大迭代次数（避免极端输入导致过长 CPU 消耗）
-const ADAPTIVE_COMPRESSION_MAX_ITERS: usize = 32;
-/// tool_result 二次压缩的最低阈值（字符数）
-const ADAPTIVE_MIN_TOOL_RESULT_MAX_CHARS: usize = 512;
-/// tool_use input 二次压缩的最低阈值（字符数）
-const ADAPTIVE_MIN_TOOL_USE_INPUT_MAX_CHARS: usize = 256;
-/// 历史截断默认保留消息数（与 compressor.rs 的 preserve_count 保持一致）
-const ADAPTIVE_HISTORY_PRESERVE_MESSAGES: usize = 2;
-/// 消息内容二次压缩的最低阈值（字符数）
-const ADAPTIVE_MIN_MESSAGE_CONTENT_MAX_CHARS: usize = 8192;
+const PAYLOAD_TRUNCATION_MIN_RECENT_MESSAGES: usize = 4;
+const PAYLOAD_TRUNCATION_PLACEHOLDER: &str = "[Earlier conversation history was truncated to fit the model's input limit. Older messages and tool activity have been omitted.]";
 
 // ============================================================================
 // Cache usage 工具集（按 BK 严格对齐）
@@ -65,6 +63,8 @@ struct CacheUsageContext {
 
 /// 流式请求上下文（聚合 cache_tracker 相关参数，避免函数签名爆炸）
 struct StreamRequestContext<'a> {
+    app_state: AppState,
+    api_key_id: Option<String>,
     cache_tracker: Option<&'a std::sync::Arc<crate::anthropic::cache_tracker::CacheTracker>>,
     cache_profile: Option<&'a crate::anthropic::cache_tracker::CacheProfile>,
     request_body: &'a str,
@@ -73,18 +73,31 @@ struct StreamRequestContext<'a> {
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     user_id: Option<&'a str>,
+    claude_format: String,
 }
 
 /// 非流式请求上下文（同上）
 struct NonStreamRequestContext<'a> {
+    app_state: AppState,
+    api_key_id: Option<String>,
     request_body: &'a str,
     model: &'a str,
     input_tokens: i32,
     thinking_enabled: bool,
+    thinking_display_omitted: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     user_id: Option<&'a str>,
     cache_tracker: Option<&'a std::sync::Arc<crate::anthropic::cache_tracker::CacheTracker>>,
     cache_profile: Option<&'a crate::anthropic::cache_tracker::CacheProfile>,
+    claude_format: String,
+}
+
+#[derive(Debug, Clone)]
+struct NonStreamToolUseState {
+    tool_use_id: String,
+    name: String,
+    input_buffer: String,
+    generated_id: bool,
 }
 
 /// 从 payload + 总输入 token 构造 cache 画像
@@ -165,16 +178,198 @@ fn inject_credit_usage_fields(usage: &mut serde_json::Value, metering: &Metering
     usage["credit_unit_plural"] = json!(metering.unit_plural);
 }
 
-/// 自适应二次压缩结果，用于触发后回填日志/调试信息
+fn handle_non_stream_tool_use_event(
+    tool_use: crate::kiro::model::events::ToolUseEvent,
+    current: &mut Option<NonStreamToolUseState>,
+    output: &mut Vec<serde_json::Value>,
+    tool_name_map: &std::collections::HashMap<String, String>,
+) {
+    let incoming_id = tool_use.tool_use_id.clone();
+    let incoming_name = tool_use.name.clone();
+
+    if !incoming_id.is_empty() && !incoming_name.is_empty() {
+        match current {
+            None => {
+                *current = Some(NonStreamToolUseState {
+                    tool_use_id: incoming_id,
+                    name: incoming_name,
+                    input_buffer: String::new(),
+                    generated_id: false,
+                });
+            }
+            Some(state) if state.tool_use_id != incoming_id => {
+                if state.generated_id && state.name == incoming_name {
+                    state.tool_use_id = incoming_id;
+                    state.generated_id = false;
+                } else {
+                    finish_non_stream_tool_use(current, output, tool_name_map);
+                    *current = Some(NonStreamToolUseState {
+                        tool_use_id: incoming_id,
+                        name: incoming_name,
+                        input_buffer: String::new(),
+                        generated_id: false,
+                    });
+                }
+            }
+            Some(_) => {}
+        }
+    } else if !incoming_name.is_empty() {
+        match current {
+            None => {
+                *current = Some(NonStreamToolUseState {
+                    tool_use_id: crate::kiro::model::events::ToolUseEvent::generate_fallback_id(),
+                    name: incoming_name,
+                    input_buffer: String::new(),
+                    generated_id: true,
+                });
+            }
+            Some(state) if state.name != incoming_name => {
+                finish_non_stream_tool_use(current, output, tool_name_map);
+                *current = Some(NonStreamToolUseState {
+                    tool_use_id: crate::kiro::model::events::ToolUseEvent::generate_fallback_id(),
+                    name: incoming_name,
+                    input_buffer: String::new(),
+                    generated_id: true,
+                });
+            }
+            Some(_) => {}
+        }
+    }
+
+    if let Some(state) = current.as_mut() {
+        tool_use.apply_input_to_buffer(&mut state.input_buffer);
+    }
+
+    if tool_use.stop {
+        finish_non_stream_tool_use(current, output, tool_name_map);
+    }
+}
+
+fn finish_non_stream_tool_use(
+    current: &mut Option<NonStreamToolUseState>,
+    output: &mut Vec<serde_json::Value>,
+    tool_name_map: &std::collections::HashMap<String, String>,
+) {
+    let Some(state) = current.take() else {
+        return;
+    };
+    if state.name.is_empty() {
+        return;
+    }
+
+    let input: serde_json::Value = if state.input_buffer.is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::from_str(&state.input_buffer).unwrap_or_else(|e| {
+            tracing::warn!(
+                "工具输入 JSON 解析失败: {}, tool_use_id: {}",
+                e,
+                state.tool_use_id
+            );
+            serde_json::json!({})
+        })
+    };
+
+    let original_name = tool_name_map
+        .get(&state.name)
+        .cloned()
+        .unwrap_or_else(|| state.name.clone());
+
+    output.push(json!({
+        "type": "tool_use",
+        "id": state.tool_use_id,
+        "name": original_name,
+        "input": input
+    }));
+}
+
+fn append_non_stream_assistant_delta(
+    text_content: &mut String,
+    raw_content: &str,
+    previous: &mut String,
+) {
+    let delta = super::stream::normalize_chunk(raw_content, previous);
+    text_content.push_str(&delta);
+}
+
+fn append_non_stream_reasoning_delta(
+    thinking_content: &mut String,
+    raw_text: &str,
+    previous: &mut String,
+) {
+    let delta = super::stream::normalize_chunk(raw_text, previous);
+    if !delta.is_empty() {
+        thinking_content.push_str(&delta);
+    }
+}
+
+fn build_non_stream_content_blocks(
+    text_content: &str,
+    raw_thinking_content: &str,
+    mut tool_uses: Vec<serde_json::Value>,
+    thinking_enabled: bool,
+    thinking_display_omitted: bool,
+    claude_format: &str,
+) -> Vec<serde_json::Value> {
+    let mut content = Vec::new();
+
+    if thinking_enabled {
+        let (extracted_thinking, mut final_text) =
+            super::stream::extract_thinking_from_complete_text(text_content);
+        let mut response_thinking = raw_thinking_content.to_string();
+        if response_thinking.is_empty()
+            && let Some(extracted) = extracted_thinking
+        {
+            response_thinking = extracted;
+        }
+
+        if thinking_display_omitted && !response_thinking.is_empty() {
+            content.push(json!({
+                "type": "thinking",
+                "thinking": "",
+                "signature": super::stream::THINKING_SIGNATURE_PLACEHOLDER,
+            }));
+        } else if !response_thinking.is_empty() {
+            match claude_format {
+                "think" => {
+                    final_text = format!("<think>{}</think>{}", response_thinking, final_text);
+                }
+                "reasoning_content" => {
+                    final_text = format!("{}{}", response_thinking, final_text);
+                }
+                _ => {
+                    content.push(json!({
+                        "type": "thinking",
+                        "thinking": response_thinking,
+                        "signature": super::stream::THINKING_SIGNATURE_PLACEHOLDER,
+                    }));
+                }
+            }
+        }
+
+        if !final_text.is_empty() {
+            content.push(json!({
+                "type": "text",
+                "text": final_text
+            }));
+        }
+    } else if !text_content.is_empty() {
+        content.push(json!({
+            "type": "text",
+            "text": text_content
+        }));
+    }
+
+    content.append(&mut tool_uses);
+    content
+}
+
 #[derive(Debug, Default, Clone, Copy)]
-struct AdaptiveCompressionOutcome {
-    initial_bytes: usize,
-    final_bytes: usize,
-    iters: usize,
-    additional_history_turns_removed: usize,
-    final_tool_result_max_chars: usize,
-    final_tool_use_input_max_chars: usize,
-    final_message_content_max_chars: usize,
+pub(crate) struct PayloadTruncationOutcome {
+    pub(crate) initial_bytes: usize,
+    pub(crate) final_bytes: usize,
+    pub(crate) removed_history_messages: usize,
+    pub(crate) inserted_placeholder: bool,
 }
 
 // ============================================================================
@@ -245,239 +440,175 @@ fn is_credential_queue_timeout_error(err: &Error) -> bool {
     s.contains("credential queue wait timeout")
 }
 
+fn anthropic_inference_config(req: &MessagesRequest) -> Option<InferenceConfig> {
+    let max_tokens = (req.max_tokens > 0).then_some(req.max_tokens);
+    let temperature = req.temperature.filter(|v| *v > 0.0);
+    let top_p = req.top_p.filter(|v| *v > 0.0);
 
-/// 计算 KiroRequest 中所有图片 base64 数据的总字节数。
-///
-/// 该统计用于归因请求体大小（图片 base64 往往占用大量 bytes）。
-/// 注意：上游存在请求体大小硬限制（约 5MiB），因此图片也必须控制体积；
-/// `max_request_body_bytes` 的校验以实际序列化后的总字节数为准。
-fn total_image_bytes(kiro_request: &KiroRequest) -> usize {
-    let state = &kiro_request.conversation_state;
-    let mut total = 0usize;
-
-    // currentMessage 中的图片
-    for img in &state.current_message.user_input_message.images {
-        total += img.source.bytes.len();
+    if max_tokens.is_none() && temperature.is_none() && top_p.is_none() {
+        return None;
     }
 
-    // 历史消息中的图片
-    for msg in &state.history {
-        if let crate::kiro::model::requests::conversation::Message::User(user_msg) = msg {
-            for img in &user_msg.user_input_message.images {
-                total += img.source.bytes.len();
-            }
-        }
-    }
-
-    total
+    Some(InferenceConfig {
+        max_tokens,
+        temperature,
+        top_p,
+    })
 }
 
-/// 自适应二次压缩：按 5 层降级策略将 request_body 缩到 max_body 以内。
-///
-/// 本函数会在第一轮 `compressor::compress` 之后再做一次兜底压缩；
-/// 每轮调整一项参数后重新跑压缩管道并重新序列化。
-///
-/// 触发条件：`max_body > 0 && request_body.len() > max_body && base_config.enabled`
-///
-/// 5 层降级（按顺序尝试）：
-/// 1. tool_result_max_chars × 0.75
-/// 2. tool_use_input_max_chars × 0.75
-/// 3. compress_long_messages_pass × 0.75（截断超长 user 消息内容）
-/// 4. remove_history_images（保留 current_message 图片）
-/// 5. 成对移除最老的 user+assistant 历史消息（保留前 2 条）
-fn adaptive_shrink_request_body(
+pub(crate) fn truncate_payload_to_body_limit(
     kiro_request: &mut KiroRequest,
-    base_config: &crate::model::config::CompressionConfig,
     max_body: usize,
     request_body: &mut String,
-) -> Result<Option<AdaptiveCompressionOutcome>, serde_json::Error> {
-    if max_body == 0 || request_body.len() <= max_body || !base_config.enabled {
+    has_system_priming: bool,
+) -> Result<Option<PayloadTruncationOutcome>, serde_json::Error> {
+    if max_body == 0 || request_body.len() <= max_body {
         return Ok(None);
     }
 
-    let mut outcome = AdaptiveCompressionOutcome {
-        initial_bytes: request_body.len(),
-        final_bytes: request_body.len(),
-        iters: 0,
-        additional_history_turns_removed: 0,
-        final_tool_result_max_chars: base_config.tool_result_max_chars,
-        final_tool_use_input_max_chars: base_config.tool_use_input_max_chars,
-        final_message_content_max_chars: 0,
-    };
-
-    let mut adaptive_config = base_config.clone();
-    let mut history_images_removed = false;
-
-    // 是否存在任何 tool_result / tools（否则降低阈值只会浪费迭代次数）
-    let has_any_tool_results_or_tools = {
-        let state = &kiro_request.conversation_state;
-        if !state
-            .current_message
-            .user_input_message
-            .user_input_message_context
-            .tool_results
-            .is_empty()
-            || !state
-                .current_message
-                .user_input_message
-                .user_input_message_context
-                .tools
-                .is_empty()
-        {
-            true
-        } else {
-            state.history.iter().any(|msg| match msg {
-                crate::kiro::model::requests::conversation::Message::User(u) => {
-                    !u.user_input_message
-                        .user_input_message_context
-                        .tool_results
-                        .is_empty()
-                        || !u
-                            .user_input_message
-                            .user_input_message_context
-                            .tools
-                            .is_empty()
-                }
-                _ => false,
-            })
-        }
-    };
-
-    // 是否存在任何 tool_use（否则降低阈值只会浪费迭代次数）
-    let has_any_tool_uses = kiro_request
+    let initial_bytes = request_body.len();
+    let current_model_id = kiro_request
         .conversation_state
-        .history
-        .iter()
-        .any(|msg| match msg {
-            crate::kiro::model::requests::conversation::Message::Assistant(a) => a
-                .assistant_response_message
-                .tool_uses
-                .as_ref()
-                .is_some_and(|t| !t.is_empty()),
-            _ => false,
-        });
+        .current_message
+        .user_input_message
+        .model_id
+        .clone();
 
-    // 是否存在历史图片（否则无需尝试图片降级）
-    let has_history_images = kiro_request
-        .conversation_state
-        .history
-        .iter()
-        .any(|msg| match msg {
-            crate::kiro::model::requests::conversation::Message::User(u) => {
-                !u.user_input_message.images.is_empty()
-            }
-            _ => false,
-        });
-
-    // 扫描所有用户消息，找到最大 content 字符数作为初始 message_content_max_chars
-    let max_content_chars = {
-        let mut max_chars = kiro_request
-            .conversation_state
-            .current_message
-            .user_input_message
-            .content
-            .chars()
-            .count();
-        for msg in &kiro_request.conversation_state.history {
-            if let crate::kiro::model::requests::conversation::Message::User(u) = msg {
-                max_chars = max_chars.max(u.user_input_message.content.chars().count());
-            }
-        }
-        max_chars
+    let history = std::mem::take(&mut kiro_request.conversation_state.history);
+    let priming_count = if has_system_priming {
+        system_priming_count(&history)
+    } else {
+        0
     };
-    let mut message_content_max_chars =
-        (max_content_chars * 3 / 4).max(ADAPTIVE_MIN_MESSAGE_CONTENT_MAX_CHARS);
+    let (priming, conversation) = history.split_at(priming_count);
+    let priming = priming.to_vec();
+    let conversation = conversation.to_vec();
 
-    for _ in 0..ADAPTIVE_COMPRESSION_MAX_ITERS {
-        if request_body.len() <= max_body {
+    let placeholder = KiroMessage::User(HistoryUserMessage::new(
+        PAYLOAD_TRUNCATION_PLACEHOLDER,
+        current_model_id,
+    ));
+    let entry_sizes: Vec<usize> = conversation
+        .iter()
+        .map(serialized_history_entry_size)
+        .collect::<Result<_, _>>()?;
+
+    kiro_request.conversation_state.history = priming.clone();
+    let base_size =
+        serde_json::to_string(kiro_request)?.len() + serialized_history_entry_size(&placeholder)?;
+
+    let mut keep_from = conversation.len();
+    let mut running = base_size;
+    for i in (0..conversation.len()).rev() {
+        running += entry_sizes[i];
+        let kept = conversation.len() - i;
+        if running > max_body && kept > PAYLOAD_TRUNCATION_MIN_RECENT_MESSAGES {
             break;
         }
-
-        let mut changed = false;
-
-        if has_any_tool_results_or_tools
-            && adaptive_config.tool_result_max_chars > ADAPTIVE_MIN_TOOL_RESULT_MAX_CHARS
-        {
-            let next = (adaptive_config.tool_result_max_chars * 3 / 4)
-                .max(ADAPTIVE_MIN_TOOL_RESULT_MAX_CHARS);
-            if next < adaptive_config.tool_result_max_chars {
-                adaptive_config.tool_result_max_chars = next;
-                changed = true;
-            }
-        } else if has_any_tool_uses
-            && adaptive_config.tool_use_input_max_chars > ADAPTIVE_MIN_TOOL_USE_INPUT_MAX_CHARS
-        {
-            let next = (adaptive_config.tool_use_input_max_chars * 3 / 4)
-                .max(ADAPTIVE_MIN_TOOL_USE_INPUT_MAX_CHARS);
-            if next < adaptive_config.tool_use_input_max_chars {
-                adaptive_config.tool_use_input_max_chars = next;
-                changed = true;
-            }
-        } else {
-            // 单条 user content 超过 max_body 时，移除历史也救不了，必须截断超长内容
-            let max_single_user_content_bytes = {
-                let state = &kiro_request.conversation_state;
-                let mut max_bytes = state.current_message.user_input_message.content.len();
-                for msg in &state.history {
-                    if let crate::kiro::model::requests::conversation::Message::User(u) = msg {
-                        max_bytes = max_bytes.max(u.user_input_message.content.len());
-                    }
-                }
-                max_bytes
-            };
-
-            let history = &mut kiro_request.conversation_state.history;
-            if (max_single_user_content_bytes > max_body
-                || history.len() <= ADAPTIVE_HISTORY_PRESERVE_MESSAGES + 2)
-                && message_content_max_chars >= ADAPTIVE_MIN_MESSAGE_CONTENT_MAX_CHARS
-            {
-                // 第三层：截断超长消息内容
-                let saved = super::compressor::compress_long_messages_pass(
-                    &mut kiro_request.conversation_state,
-                    message_content_max_chars,
-                );
-                if saved > 0 {
-                    changed = true;
-                }
-                outcome.final_message_content_max_chars = message_content_max_chars;
-                message_content_max_chars =
-                    (message_content_max_chars * 3 / 4).max(ADAPTIVE_MIN_MESSAGE_CONTENT_MAX_CHARS);
-            } else if !history_images_removed && has_history_images {
-                // 第四层：仅清除历史图片，保留 current_message 图片
-                let removed = kiro_request.conversation_state.remove_history_images();
-                if removed > 0 {
-                    history_images_removed = true;
-                    changed = true;
-                }
-            } else if history.len() > ADAPTIVE_HISTORY_PRESERVE_MESSAGES + 2 {
-                // 第五层：成对移除最老 user+assistant 消息
-                let preserve = ADAPTIVE_HISTORY_PRESERVE_MESSAGES;
-                let min_len = preserve + 2;
-                let removable = history.len().saturating_sub(min_len);
-                let mut remove_msgs = removable.min(16);
-                remove_msgs -= remove_msgs % 2;
-                if remove_msgs > 0 {
-                    history.drain(preserve..preserve + remove_msgs);
-                    outcome.additional_history_turns_removed += remove_msgs / 2;
-                    changed = true;
-                }
-            }
-        }
-
-        if !changed {
-            break;
-        }
-
-        super::compressor::compress(&mut kiro_request.conversation_state, &adaptive_config);
-        *request_body = serde_json::to_string(kiro_request)?;
-        outcome.iters += 1;
-        outcome.final_bytes = request_body.len();
+        keep_from = i;
     }
 
-    outcome.final_tool_result_max_chars = adaptive_config.tool_result_max_chars;
-    outcome.final_tool_use_input_max_chars = adaptive_config.tool_use_input_max_chars;
+    let mut tail = drop_leading_assistant(conversation[keep_from..].to_vec());
+    let removed_history_messages = keep_from;
+    let inserted_placeholder = removed_history_messages > 0;
 
-    Ok(Some(outcome))
+    let mut rebuilt =
+        Vec::with_capacity(priming.len() + usize::from(inserted_placeholder) + tail.len());
+    rebuilt.extend(priming);
+    if inserted_placeholder {
+        rebuilt.push(placeholder);
+    }
+    rebuilt.append(&mut tail);
+    kiro_request.conversation_state.history = rebuilt;
+
+    *request_body = serde_json::to_string(kiro_request)?;
+
+    if request_body.len() > max_body {
+        truncate_current_message_to_fit(kiro_request, max_body)?;
+        *request_body = serde_json::to_string(kiro_request)?;
+    }
+
+    Ok(Some(PayloadTruncationOutcome {
+        initial_bytes,
+        final_bytes: request_body.len(),
+        removed_history_messages,
+        inserted_placeholder,
+    }))
+}
+
+fn system_priming_count(history: &[KiroMessage]) -> usize {
+    if history.len() < 2 {
+        return 0;
+    }
+    match (&history[0], &history[1]) {
+        (KiroMessage::User(_), KiroMessage::Assistant(a))
+            if a.assistant_response_message
+                .content
+                .trim()
+                .eq_ignore_ascii_case("I will follow these instructions.") =>
+        {
+            2
+        }
+        _ => 0,
+    }
+}
+
+fn serialized_history_entry_size(entry: &KiroMessage) -> Result<usize, serde_json::Error> {
+    Ok(serde_json::to_string(entry)?.len() + 1)
+}
+
+fn drop_leading_assistant(mut tail: Vec<KiroMessage>) -> Vec<KiroMessage> {
+    let first_user = tail
+        .iter()
+        .position(|msg| matches!(msg, KiroMessage::User(_)))
+        .unwrap_or(tail.len());
+    if first_user > 0 {
+        tail.drain(0..first_user);
+    }
+    tail
+}
+
+fn truncate_current_message_to_fit(
+    kiro_request: &mut KiroRequest,
+    max_body: usize,
+) -> Result<(), serde_json::Error> {
+    let current_len = kiro_request
+        .conversation_state
+        .current_message
+        .user_input_message
+        .content
+        .len();
+    let body_len = serde_json::to_string(kiro_request)?.len();
+    let overhead = body_len.saturating_sub(current_len);
+    let budget = max_body.saturating_sub(overhead);
+    let content = &mut kiro_request
+        .conversation_state
+        .current_message
+        .user_input_message
+        .content;
+    truncate_string_to_byte_budget(content, budget);
+    Ok(())
+}
+
+fn truncate_string_to_byte_budget(content: &mut String, budget: usize) {
+    if content.len() <= budget {
+        return;
+    }
+    if budget == 0 {
+        content.clear();
+        content.push('.');
+        return;
+    }
+    let cut = content
+        .char_indices()
+        .map(|(idx, _)| idx)
+        .take_while(|idx| *idx <= budget)
+        .last()
+        .unwrap_or(0);
+    content.truncate(cut);
+    if content.is_empty() {
+        content.push('.');
+    }
 }
 
 /// 将 KiroProvider 错误映射为 HTTP 响应（按 BK 完整分类）
@@ -664,184 +795,256 @@ fn strip_empty_text_content_blocks(messages: &mut [super::types::Message]) -> us
 /// GET /v1/models
 ///
 /// 返回可用的模型列表
-pub async fn get_models() -> impl IntoResponse {
+pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
     tracing::info!("Received GET /v1/models request");
 
-    let models = vec![
-        Model {
-            id: "claude-opus-4-8".to_string(),
-            object: "model".to_string(),
-            created: 1779897600, // May 28, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.8".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 128_000,
-            context_length: None,
-            max_completion_tokens: None,
-            thinking: None,
-        },
-        Model {
-            id: "claude-opus-4-8-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1779897600, // May 28, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.8 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 128_000,
-            context_length: None,
-            max_completion_tokens: None,
-            thinking: None,
-        },
-        Model {
-            id: "claude-opus-4-6".to_string(),
-            object: "model".to_string(),
-            created: 1770163200, // Feb 4, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.6".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-            context_length: None,
-            max_completion_tokens: None,
-            thinking: None,
-        },
-        Model {
-            id: "claude-opus-4-6-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1770163200, // Feb 4, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.6 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-            context_length: None,
-            max_completion_tokens: None,
-            thinking: None,
-        },
-        Model {
-            id: "claude-opus-4-7".to_string(),
-            object: "model".to_string(),
-            created: 1772992800, // Mar 7, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.7".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-            context_length: None,
-            max_completion_tokens: None,
-            thinking: None,
-        },
-        Model {
-            id: "claude-opus-4-7-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1772992800, // Mar 7, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.7 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-            context_length: None,
-            max_completion_tokens: None,
-            thinking: None,
-        },
-        Model {
-            id: "claude-sonnet-4-6".to_string(),
-            object: "model".to_string(),
-            created: 1771286400, // Feb 17, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.6".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-            context_length: None,
-            max_completion_tokens: None,
-            thinking: None,
-        },
-        Model {
-            id: "claude-sonnet-4-6-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1771286400, // Feb 17, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.6 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-            context_length: None,
-            max_completion_tokens: None,
-            thinking: None,
-        },
-        Model {
-            id: "claude-opus-4-5-20251101".to_string(),
-            object: "model".to_string(),
-            created: 1763942400, // Nov 24, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-            context_length: None,
-            max_completion_tokens: None,
-            thinking: None,
-        },
-        Model {
-            id: "claude-opus-4-5-20251101-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1763942400, // Nov 24, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-            context_length: None,
-            max_completion_tokens: None,
-            thinking: None,
-        },
-        Model {
-            id: "claude-sonnet-4-5-20250929".to_string(),
-            object: "model".to_string(),
-            created: 1759104000, // Sep 29, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-            context_length: None,
-            max_completion_tokens: None,
-            thinking: None,
-        },
-        Model {
-            id: "claude-sonnet-4-5-20250929-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1759104000, // Sep 29, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-            context_length: None,
-            max_completion_tokens: None,
-            thinking: None,
-        },
-        Model {
-            id: "claude-haiku-4-5-20251001".to_string(),
-            object: "model".to_string(),
-            created: 1760486400, // Oct 15, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Haiku 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-            context_length: None,
-            max_completion_tokens: None,
-            thinking: None,
-        },
-        Model {
-            id: "claude-haiku-4-5-20251001-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1760486400, // Oct 15, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Haiku 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-            context_length: None,
-            max_completion_tokens: None,
-            thinking: None,
-        },
-    ];
+    let thinking_suffix = state.thinking_config.read().suffix.clone();
+    let mut cached = state.models_cache.read().clone();
+    if cached.is_empty() {
+        refresh_models_cache(&state).await;
+        cached = state.models_cache.read().clone();
+    }
+
+    let mut models = build_anthropic_models_response(&cached, &thinking_suffix);
+    if models.is_empty() {
+        models = fallback_anthropic_models(&thinking_suffix);
+    }
+    models.extend(alias_models());
 
     Json(ModelsResponse {
         object: "list".to_string(),
         data: models,
     })
+}
+
+fn default_models_response(thinking_suffix: &str) -> Vec<Model> {
+    let mut models = fallback_anthropic_models(thinking_suffix);
+    models.extend(alias_models());
+    models
+}
+
+async fn refresh_models_cache(state: &AppState) {
+    let Some(provider) = &state.kiro_provider else {
+        return;
+    };
+
+    let token_manager = provider.token_manager();
+    let snapshot = token_manager.snapshot();
+    let mut aggregated = Vec::new();
+
+    for entry in snapshot.entries {
+        if entry.disabled || entry.auth_method.as_deref() == Some("api_key") {
+            continue;
+        }
+
+        match token_manager
+            .list_available_models_for(entry.id, None)
+            .await
+        {
+            Ok(response) => {
+                aggregated = merge_unique_models(aggregated, response.available_models);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    credential_id = entry.id,
+                    error = %err,
+                    "[ModelsCache] Failed to refresh models"
+                );
+            }
+        }
+    }
+
+    if !aggregated.is_empty() {
+        tracing::info!("[ModelsCache] Cached {} models", aggregated.len());
+        *state.models_cache.write() = aggregated;
+    }
+}
+
+fn alias_models() -> [Model; 3] {
+    [
+        build_model_info("auto", "kiro-proxy", true),
+        build_model_info("gpt-4o", "kiro-proxy", true),
+        build_model_info("gpt-4", "kiro-proxy", true),
+    ]
+}
+
+fn fallback_anthropic_models(thinking_suffix: &str) -> Vec<Model> {
+    [
+        "claude-sonnet-4.6",
+        "claude-opus-4.6",
+        "claude-opus-4.7",
+        "claude-sonnet-4.5",
+        "claude-sonnet-4",
+        "claude-haiku-4.5",
+        "claude-opus-4.5",
+    ]
+    .into_iter()
+    .flat_map(|id| {
+        [
+            build_model_info(id, "anthropic", true),
+            build_model_info(format!("{id}{thinking_suffix}"), "anthropic", true),
+        ]
+    })
+    .collect()
+}
+
+fn build_anthropic_models_response(cached: &[AvailableModel], thinking_suffix: &str) -> Vec<Model> {
+    if cached.is_empty() {
+        return Vec::new();
+    }
+
+    cached
+        .iter()
+        .flat_map(|model| {
+            let supports_image = model_supports_image(&model.supported_input_types);
+            [
+                build_model_info(&model.model_id, "anthropic", supports_image),
+                build_model_info(
+                    format!("{}{}", model.model_id, thinking_suffix),
+                    "anthropic",
+                    supports_image,
+                ),
+            ]
+        })
+        .collect()
+}
+
+fn merge_unique_models(
+    existing: Vec<AvailableModel>,
+    incoming: Vec<AvailableModel>,
+) -> Vec<AvailableModel> {
+    if incoming.is_empty() {
+        return existing;
+    }
+
+    let mut merged = existing;
+    let mut index_by_id = std::collections::HashMap::with_capacity(merged.len());
+    for (index, model) in merged.iter().enumerate() {
+        let key = model.model_id.trim().to_lowercase();
+        if !key.is_empty() {
+            index_by_id.insert(key, index);
+        }
+    }
+
+    for model in incoming {
+        let key = model.model_id.trim().to_lowercase();
+        if key.is_empty() {
+            continue;
+        }
+
+        if let Some(index) = index_by_id.get(&key).copied() {
+            merged[index] = merge_model_info(merged[index].clone(), model);
+            continue;
+        }
+
+        index_by_id.insert(key, merged.len());
+        merged.push(model);
+    }
+
+    merged
+}
+
+fn merge_model_info(mut base: AvailableModel, extra: AvailableModel) -> AvailableModel {
+    if base.model_name.is_empty() {
+        base.model_name = extra.model_name;
+    }
+    if base.description.is_empty() {
+        base.description = extra.description;
+    }
+    if base.provider.is_none() {
+        base.provider = extra.provider;
+    }
+    if base.context_window.is_none() {
+        base.context_window = extra.context_window;
+    }
+    if base.is_default.is_none() {
+        base.is_default = extra.is_default;
+    }
+    if base.rate_multiplier.is_none() {
+        base.rate_multiplier = extra.rate_multiplier;
+    }
+    if base.rate_unit.is_none() {
+        base.rate_unit = extra.rate_unit;
+    }
+    if base.prompt_caching.is_none() {
+        base.prompt_caching = extra.prompt_caching;
+    }
+    if base.token_limits.is_none() {
+        base.token_limits = extra.token_limits;
+    }
+    base.supported_input_types =
+        merge_string_lists(base.supported_input_types, extra.supported_input_types);
+    base.capabilities = merge_string_lists(base.capabilities, extra.capabilities);
+    base
+}
+
+fn merge_string_lists(base: Vec<String>, extra: Vec<String>) -> Vec<String> {
+    if extra.is_empty() {
+        return base;
+    }
+
+    let mut seen = std::collections::HashSet::with_capacity(base.len() + extra.len());
+    let mut merged = Vec::with_capacity(base.len() + extra.len());
+
+    for item in base.into_iter().chain(extra) {
+        let key = item.trim().to_lowercase();
+        if key.is_empty() || !seen.insert(key) {
+            continue;
+        }
+        merged.push(item);
+    }
+
+    merged
+}
+
+fn model_supports_image(input_types: &[String]) -> bool {
+    input_types.iter().any(|input_type| {
+        let lower = input_type.to_lowercase();
+        lower.contains("image") || lower.contains("vision")
+    })
+}
+
+fn build_model_info(
+    id: impl Into<String>,
+    owned_by: impl Into<String>,
+    supports_image: bool,
+) -> Model {
+    let mut input_modalities = vec!["text".to_string()];
+    if supports_image {
+        input_modalities.push("image".to_string());
+    }
+
+    Model {
+        id: id.into(),
+        object: "model".to_string(),
+        owned_by: owned_by.into(),
+        supports_image,
+        input_modalities: input_modalities.clone(),
+        modalities: ModelModalities {
+            input: input_modalities,
+            output: vec!["text".to_string()],
+        },
+        capabilities: ModelCapabilities {
+            vision: supports_image,
+            image: supports_image,
+            image_vision: supports_image,
+        },
+        info: ModelInfo {
+            meta: ModelInfoMeta {
+                capabilities: ModelInfoCapabilities {
+                    vision: supports_image,
+                    image_vision: supports_image,
+                },
+            },
+        },
+        created: None,
+        display_name: None,
+        model_type: None,
+        max_tokens: None,
+        context_length: None,
+        max_completion_tokens: None,
+        thinking: None,
+    }
 }
 
 /// 请求预处理结果，由 [`prepare_request`] 返回
@@ -862,11 +1065,13 @@ fn prepare_request(
 ) -> Result<PreparedRequest, Response> {
     let compression = state.compression_config.read().clone();
     let prompt_filter = state.prompt_filter_config.read().clone();
-    let conversion_result = match convert_request(
+    let thinking_suffix = state.thinking_config.read().suffix.clone();
+    let conversion_result = match convert_request_with_thinking_suffix(
         payload,
         &compression,
         &prompt_filter,
-        state.truncation_recovery_notice_enabled(),
+        false,
+        &thinking_suffix,
     ) {
         Ok(result) => result,
         Err(e) => {
@@ -890,17 +1095,11 @@ fn prepare_request(
         }
     };
 
-    // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
-    let mut conversation_state = conversion_result.conversation_state;
-
-    // 多层压缩
-    if compression.enabled {
-        let stats = super::compressor::compress(&mut conversation_state, &compression);
-        tracing::debug!("压缩统计: {:?}", stats);
-    }
-
+    let has_system_priming = conversion_result.has_system_priming;
+    let conversation_state = conversion_result.conversation_state;
     let mut kiro_request = KiroRequest {
         conversation_state,
+        inference_config: anthropic_inference_config(&payload),
         profile_arn: None,
     };
 
@@ -921,13 +1120,12 @@ fn prepare_request(
 
     // 请求体大小预检（上游存在硬性请求体大小限制；按实际序列化后的总字节数判断）
     let max_body = compression.max_request_body_bytes;
-    if max_body > 0 && request_body.len() > max_body && compression.enabled {
-        // 自适应二次压缩：按 request_body_bytes 迭代截断，尽量把请求缩到阈值内
-        match adaptive_shrink_request_body(
+    if max_body > 0 && request_body.len() > max_body {
+        match truncate_payload_to_body_limit(
             &mut kiro_request,
-            &compression,
             max_body,
             &mut request_body,
+            has_system_priming,
         ) {
             Ok(Some(outcome)) => {
                 tracing::warn!(
@@ -935,17 +1133,14 @@ fn prepare_request(
                     initial_bytes = outcome.initial_bytes,
                     final_bytes = outcome.final_bytes,
                     threshold = max_body,
-                    iters = outcome.iters,
-                    additional_history_turns_removed = outcome.additional_history_turns_removed,
-                    final_tool_result_max_chars = outcome.final_tool_result_max_chars,
-                    final_tool_use_input_max_chars = outcome.final_tool_use_input_max_chars,
-                    final_message_content_max_chars = outcome.final_message_content_max_chars,
-                    "请求体超过阈值，已执行自适应二次压缩"
+                    removed_history_messages = outcome.removed_history_messages,
+                    inserted_placeholder = outcome.inserted_placeholder,
+                    "请求体超过阈值，已按兼容策略截断历史"
                 );
             }
             Ok(None) => {}
             Err(e) => {
-                tracing::error!("自适应二次压缩序列化失败: {}", e);
+                tracing::error!("兼容策略历史截断序列化失败: {}", e);
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ErrorResponse::new(
@@ -958,21 +1153,17 @@ fn prepare_request(
         }
     }
 
-    // 压缩后再次检查（输出 image_bytes/non-image bytes 便于排查）
-    let final_img_bytes = total_image_bytes(&kiro_request);
-    let final_effective_len = request_body.len().saturating_sub(final_img_bytes);
+    // Kiro-Go 风格截断后仍超限，说明当前消息/工具/图片本身已超过上游限制。
     if max_body > 0 && request_body.len() > max_body {
         tracing::warn!(
             conversation_id = kiro_request.conversation_state.conversation_id.as_str(),
             request_body_bytes = request_body.len(),
-            image_bytes = final_img_bytes,
-            effective_bytes = final_effective_len,
             threshold = max_body,
-            "请求体超过安全阈值，拒绝发送"
+            "兼容策略截断后请求体仍超过安全阈值，拒绝发送"
         );
         #[cfg(feature = "sensitive-logs")]
         tracing::error!(
-            "自适应压缩仍超限，完整请求体（用于诊断）: {}",
+            "兼容策略截断后仍超限，完整请求体（用于诊断）: {}",
             truncate_base64_in_request_body(&request_body)
         );
         return Err((
@@ -980,10 +1171,8 @@ fn prepare_request(
             Json(ErrorResponse::new(
                 "invalid_request_error",
                 format!(
-                    "Request too large ({} bytes total; images {} bytes; non-image {} bytes; limit {}). Reduce conversation history/tool output or number/size of images.",
+                    "Request too large ({} bytes total; limit {}). Reduce current message/tool output or number/size of images.",
                     request_body.len(),
-                    final_img_bytes,
-                    final_effective_len,
                     max_body
                 ),
             )),
@@ -1014,10 +1203,7 @@ fn prepare_request(
 
     let tool_name_map = conversion_result.tool_name_map;
 
-    let raw_user_id = payload
-        .metadata
-        .as_ref()
-        .and_then(|m| m.user_id.as_deref());
+    let raw_user_id = payload.metadata.as_ref().and_then(|m| m.user_id.as_deref());
     // 提取 session_id 作为亲和 key；裸 user_id 是机器哈希常量，不能作 key
     let user_id = raw_user_id.and_then(extract_session_id);
 
@@ -1035,6 +1221,7 @@ fn prepare_request(
 /// 创建消息（对话）
 pub async fn post_messages(
     State(state): State<AppState>,
+    Extension(matched_api_key): Extension<MatchedApiKeyId>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
     tracing::info!(
@@ -1079,6 +1266,13 @@ pub async fn post_messages(
             }
         }
     }
+    if let Some(message) = validate_messages_request_shape(&payload) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("invalid_request_error", message)),
+        )
+            .into_response();
+    }
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
         Some(p) => p.clone(),
@@ -1095,8 +1289,8 @@ pub async fn post_messages(
         }
     };
 
-    // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
-    override_thinking_from_model_name(&mut payload);
+    let thinking_suffix = state.thinking_config.read().suffix.clone();
+    override_thinking_from_model_name(&mut payload, &thinking_suffix);
 
     // 注入用户配置的系统提示（preset + 自定义）
     inject_system_prompt(&mut payload, &state.prompt_runtime);
@@ -1131,13 +1325,16 @@ pub async fn post_messages(
 
     // 读 prompt-cache 快照 + 按 accounting_enabled 构造 cache_profile（BK 模式）
     let prompt_cache = state.prompt_cache_snapshot();
-    let cache_profile = prompt_cache.accounting_enabled.then(|| {
-        build_cache_profile(prompt_cache.tracker.as_ref(), &payload, prep.input_tokens)
-    });
+    let claude_format = state.thinking_config.read().claude_format.clone();
+    let cache_profile = prompt_cache
+        .accounting_enabled
+        .then(|| build_cache_profile(prompt_cache.tracker.as_ref(), &payload, prep.input_tokens));
 
     if payload.stream {
         // 流式响应
         let stream_request = StreamRequestContext {
+            app_state: state.clone(),
+            api_key_id: matched_api_key.0.clone(),
             cache_tracker: prompt_cache
                 .accounting_enabled
                 .then_some(&prompt_cache.tracker),
@@ -1148,24 +1345,188 @@ pub async fn post_messages(
             thinking_enabled: prep.thinking_enabled,
             tool_name_map: prep.tool_name_map.clone(),
             user_id,
+            claude_format: claude_format.clone(),
         };
         handle_stream_request(provider, stream_request).await
     } else {
         // 非流式响应
         let non_stream_request = NonStreamRequestContext {
+            app_state: state.clone(),
+            api_key_id: matched_api_key.0,
             request_body: &prep.request_body,
             model: &payload.model,
             input_tokens: prep.input_tokens,
             thinking_enabled: prep.thinking_enabled,
+            thinking_display_omitted: payload.thinking.as_ref().is_some_and(|t| {
+                t.is_enabled() && t.effective_display().eq_ignore_ascii_case("omitted")
+            }),
             tool_name_map: prep.tool_name_map,
             user_id,
             cache_tracker: prompt_cache
                 .accounting_enabled
                 .then_some(&prompt_cache.tracker),
             cache_profile: cache_profile.as_ref(),
+            claude_format,
         };
         handle_non_stream_request(provider, non_stream_request).await
     }
+}
+
+fn validate_messages_request_shape(req: &MessagesRequest) -> Option<&'static str> {
+    if req.messages.is_empty() {
+        return Some("messages must not be empty");
+    }
+    if let Some(message) = validate_thinking_config(req.thinking.as_ref(), req.max_tokens) {
+        return Some(message);
+    }
+
+    let mut has_user_context = false;
+    let mut last_role = "";
+    for msg in &req.messages {
+        let role = msg.role.trim();
+        if role.is_empty() {
+            continue;
+        }
+        last_role = role;
+        if role == "user" && anthropic_user_has_context(&msg.content) {
+            has_user_context = true;
+        }
+    }
+
+    if last_role == "assistant" {
+        return Some("assistant-prefill final message is not supported; last message must be user");
+    }
+    if !has_user_context {
+        return Some("at least one non-empty user message is required");
+    }
+
+    None
+}
+
+fn validate_thinking_config(
+    thinking: Option<&crate::anthropic::types::Thinking>,
+    max_tokens: i32,
+) -> Option<&'static str> {
+    let thinking = thinking?;
+
+    match thinking.thinking_type.trim().to_lowercase().as_str() {
+        "enabled" => {
+            if max_tokens == 0 {
+                return Some("thinking.type enabled cannot be used with max_tokens=0");
+            }
+            let Some(budget_tokens) = thinking.budget_tokens else {
+                return Some("thinking.budget_tokens is required when thinking.type is enabled");
+            };
+            if budget_tokens <= 0 {
+                return Some("thinking.budget_tokens is required when thinking.type is enabled");
+            }
+            if budget_tokens < 1024 {
+                return Some("thinking.budget_tokens must be at least 1024");
+            }
+            if max_tokens > 0 && budget_tokens >= max_tokens {
+                return Some("thinking.budget_tokens must be less than max_tokens");
+            }
+        }
+        "adaptive" => {
+            if thinking.budget_tokens.is_some() {
+                return Some(
+                    "thinking.budget_tokens is not supported when thinking.type is adaptive",
+                );
+            }
+        }
+        "disabled" => {
+            if thinking.budget_tokens.is_some() {
+                return Some(
+                    "thinking.budget_tokens is not supported when thinking.type is disabled",
+                );
+            }
+        }
+        _ => return Some("thinking.type must be one of: enabled, adaptive, disabled"),
+    }
+
+    if let Some(display) = thinking.display.as_deref() {
+        let display = display.trim().to_lowercase();
+        if display != "summarized" && display != "omitted" {
+            return Some("thinking.display must be one of: summarized, omitted");
+        }
+        if thinking
+            .thinking_type
+            .trim()
+            .eq_ignore_ascii_case("disabled")
+        {
+            return Some("thinking.display is not supported when thinking.type is disabled");
+        }
+    }
+
+    None
+}
+
+fn anthropic_user_has_context(content: &serde_json::Value) -> bool {
+    match content {
+        serde_json::Value::String(text) => !text.trim().is_empty(),
+        serde_json::Value::Array(blocks) => blocks.iter().any(anthropic_content_block_has_context),
+        serde_json::Value::Object(_) => anthropic_content_block_has_context(content),
+        _ => false,
+    }
+}
+
+fn anthropic_content_block_has_context(block: &serde_json::Value) -> bool {
+    let Some(obj) = block.as_object() else {
+        return false;
+    };
+    match obj.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+        "text" | "input_text" => obj
+            .get("text")
+            .and_then(|v| v.as_str())
+            .is_some_and(|text| !text.trim().is_empty()),
+        "image" | "image_url" | "input_image" | "file" | "input_file" => {
+            anthropic_block_has_inline_image(block)
+        }
+        "tool_result" => true,
+        _ => false,
+    }
+}
+
+fn anthropic_block_has_inline_image(block: &serde_json::Value) -> bool {
+    let Some(obj) = block.as_object() else {
+        return false;
+    };
+    if let Some(source) = obj.get("source").filter(|v| v.is_object()) {
+        return anthropic_block_has_inline_image(source)
+            || source
+                .get("data")
+                .and_then(|v| v.as_str())
+                .is_some_and(is_inline_image_payload)
+            || source
+                .get("url")
+                .and_then(|v| v.as_str())
+                .is_some_and(is_inline_image_payload);
+    }
+    for key in ["data", "url", "b64_json", "image_base64"] {
+        if obj
+            .get(key)
+            .and_then(|v| v.as_str())
+            .is_some_and(is_inline_image_payload)
+        {
+            return true;
+        }
+    }
+    match obj.get("image_url") {
+        Some(serde_json::Value::String(raw)) => is_inline_image_payload(raw),
+        Some(serde_json::Value::Object(map)) => map
+            .get("url")
+            .and_then(|v| v.as_str())
+            .is_some_and(is_inline_image_payload),
+        _ => false,
+    }
+}
+
+fn is_inline_image_payload(raw: &str) -> bool {
+    let raw = raw.trim();
+    !raw.is_empty()
+        && !raw.contains("[Image")
+        && !raw.starts_with("http://")
+        && !raw.starts_with("https://")
 }
 
 /// 处理流式请求
@@ -1205,12 +1566,13 @@ async fn handle_stream_request(
     });
 
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_thinking(
+    let mut ctx = StreamContext::new_with_thinking_format(
         context.model,
         context.input_tokens,
         final_cache_usage,
         context.thinking_enabled,
         context.tool_name_map,
+        context.claude_format,
     );
 
     // 生成初始事件
@@ -1229,6 +1591,8 @@ async fn handle_stream_request(
         glb_permit,
         tm,
         credential_id,
+        context.app_state,
+        context.api_key_id,
     );
 
     // 返回 SSE 响应
@@ -1258,6 +1622,8 @@ fn create_sse_stream(
     glb_permit: Option<OwnedSemaphorePermit>,
     tm: std::sync::Arc<crate::kiro::token_manager::MultiTokenManager>,
     credential_id: u64,
+    app_state: AppState,
+    api_key_id: Option<String>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发送初始事件
     let initial_stream = stream::iter(
@@ -1270,8 +1636,8 @@ fn create_sse_stream(
     let body_stream = response.bytes_stream();
 
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), cred_permit, glb_permit, tm, credential_id),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, cred_permit, glb_permit, tm, credential_id)| async move {
+        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), cred_permit, glb_permit, tm, credential_id, app_state, api_key_id),
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, cred_permit, glb_permit, tm, credential_id, app_state, api_key_id)| async move {
             if finished {
                 return None;
             }
@@ -1291,6 +1657,19 @@ fn create_sse_stream(
                             for result in decoder.decode_iter() {
                                 match result {
                                     Ok(frame) => {
+                                        // 对齐 Kiro-Go: 从帧中提取 token 使用量（比估算更准确）
+                                        if let Some(usage) = crate::kiro::model::events::extract_token_usage_from_frame_with_current(
+                                            &frame,
+                                            None,
+                                            Some(i64::from(ctx.output_tokens)),
+                                        ) {
+                                            if let Some(input) = usage.input_tokens {
+                                                ctx.context_input_tokens = Some(input as i32);
+                                            }
+                                            if let Some(output) = usage.output_tokens {
+                                                ctx.set_actual_output_tokens(output as i32);
+                                            }
+                                        }
                                         if let Ok(event) = Event::from_frame(frame) {
                                             let sse_events = ctx.process_kiro_event(&event);
                                             events.extend(sse_events);
@@ -1308,7 +1687,7 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, cred_permit, glb_permit, tm, credential_id)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, cred_permit, glb_permit, tm, credential_id, app_state, api_key_id)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
@@ -1323,7 +1702,7 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, None, None, tm, credential_id)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, None, None, tm, credential_id, app_state, api_key_id)))
                         }
                         None => {
                             // 上游正常结束 → 立即释放 permit
@@ -1333,11 +1712,15 @@ fn create_sse_stream(
                                 tm.apply_credit_usage(credential_id, m.usage);
                             }
                             let final_events = ctx.generate_final_events();
+                            let credits = ctx.metering.as_ref().map(|m| m.usage).unwrap_or(0.0);
+                            let tokens = i64::from(ctx.final_input_tokens())
+                                + i64::from(ctx.final_output_tokens());
+                            app_state.record_api_key_usage(api_key_id.as_deref(), tokens, credits);
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, None, None, tm, credential_id)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, None, None, tm, credential_id, app_state, api_key_id)))
                         }
                     }
                 }
@@ -1345,7 +1728,7 @@ fn create_sse_stream(
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, cred_permit, glb_permit, tm, credential_id)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, cred_permit, glb_permit, tm, credential_id, app_state, api_key_id)))
                 }
             }
         },
@@ -1411,113 +1794,64 @@ async fn handle_non_stream_request(
     }
 
     let mut text_content = String::new();
+    let mut raw_thinking_content = String::new();
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
     let mut has_tool_use = false;
     let mut stop_reason = "end_turn".to_string();
     // 从 contextUsageEvent 计算的实际输入 tokens
     let mut context_input_tokens: Option<i32> = None;
+    // 从事件 payload 中提取的输出 tokens（比估算更准确）
+    let mut _actual_output_tokens: Option<i32> = None;
     // 从 meteringEvent 透传的 credit usage，仅用于最终 usage 字段
     let mut metering: Option<MeteringEvent> = None;
 
-    // 收集工具调用的增量 JSON
-    let mut tool_json_buffers: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
+    let mut current_tool_use: Option<NonStreamToolUseState> = None;
+    let mut last_assistant_content = String::new();
+    let mut last_reasoning_content = String::new();
 
     for result in decoder.decode_iter() {
         match result {
             Ok(frame) => {
+                // 对齐 Kiro-Go: 从帧 payload 中提取 token 使用量
+                if let Some(usage) =
+                    crate::kiro::model::events::extract_token_usage_from_frame_with_current(
+                        &frame,
+                        None,
+                        _actual_output_tokens.map(i64::from),
+                    )
+                {
+                    if let Some(input) = usage.input_tokens {
+                        context_input_tokens = Some(input as i32);
+                    }
+                    if let Some(output) = usage.output_tokens {
+                        // 累积输出 token（比估算更准确）
+                        _actual_output_tokens = Some(output as i32);
+                    }
+                }
                 if let Ok(event) = Event::from_frame(frame) {
                     match event {
                         Event::AssistantResponse(resp) => {
-                            text_content.push_str(&resp.content);
+                            append_non_stream_assistant_delta(
+                                &mut text_content,
+                                &resp.content,
+                                &mut last_assistant_content,
+                            );
+                        }
+                        Event::ReasoningContent(resp) => {
+                            append_non_stream_reasoning_delta(
+                                &mut raw_thinking_content,
+                                &resp.text,
+                                &mut last_reasoning_content,
+                            );
                         }
                         Event::ToolUse(tool_use) => {
                             has_tool_use = true;
-
-                            // 累积工具的 JSON 输入
-                            let buffer = tool_json_buffers
-                                .entry(tool_use.tool_use_id.clone())
-                                .or_insert_with(String::new);
-                            buffer.push_str(&tool_use.input);
-
-                            // 如果是完整的工具调用，添加到列表
-                            if tool_use.stop {
-                                let input: serde_json::Value = if buffer.is_empty() {
-                                    serde_json::json!({})
-                                } else {
-                                    serde_json::from_str(buffer).unwrap_or_else(|e| {
-                                        // 检测是否为截断导致的解析失败
-                                        if let Some(truncation_info) =
-                                            super::truncation::detect_truncation(
-                                                &tool_use.name,
-                                                &tool_use.tool_use_id,
-                                                buffer,
-                                            )
-                                        {
-                                            let soft_msg =
-                                                super::truncation::build_soft_failure_result(
-                                                    &truncation_info,
-                                                );
-                                            tracing::warn!(
-                                                tool_use_id = %tool_use.tool_use_id,
-                                                truncation_type = %truncation_info.truncation_type,
-                                                "检测到工具调用截断: {}", soft_msg
-                                            );
-                                        }
-                                        tracing::warn!(
-                                            "工具输入 JSON 解析失败: {}, tool_use_id: {}",
-                                            e,
-                                            tool_use.tool_use_id
-                                        );
-                                        serde_json::json!({})
-                                    })
-                                };
-
-                                // 解析成功后，对已知 critical 工具检测 MissingFields
-                                if !buffer.is_empty() {
-                                    let required = super::truncation::required_fields_for(
-                                        &tool_use.name,
-                                    );
-                                    if !required.is_empty() {
-                                        if let Some(info) =
-                                            super::truncation::detect_truncation_with_required(
-                                                &tool_use.name,
-                                                &tool_use.tool_use_id,
-                                                buffer,
-                                                required,
-                                            )
-                                        {
-                                            if info.truncation_type
-                                                == super::truncation::TruncationType::MissingFields
-                                            {
-                                                let soft_msg =
-                                                    super::truncation::build_soft_failure_result(
-                                                        &info,
-                                                    );
-                                                tracing::warn!(
-                                                    tool_use_id = %tool_use.tool_use_id,
-                                                    truncation_type = %info.truncation_type,
-                                                    "工具调用缺少必填字段（疑似截断）: {}",
-                                                    soft_msg
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-
-                                let original_name = context
-                                    .tool_name_map
-                                    .get(&tool_use.name)
-                                    .cloned()
-                                    .unwrap_or_else(|| tool_use.name.clone());
-
-                                tool_uses.push(json!({
-                                    "type": "tool_use",
-                                    "id": tool_use.tool_use_id,
-                                    "name": original_name,
-                                    "input": input
-                                }));
-                            }
+                            handle_non_stream_tool_use_event(
+                                tool_use,
+                                &mut current_tool_use,
+                                &mut tool_uses,
+                                &context.tool_name_map,
+                            );
                         }
                         Event::ContextUsage(context_usage) => {
                             // 从上下文使用百分比计算实际的 input_tokens
@@ -1559,6 +1893,11 @@ async fn handle_non_stream_request(
             }
         }
     }
+    finish_non_stream_tool_use(
+        &mut current_tool_use,
+        &mut tool_uses,
+        &context.tool_name_map,
+    );
 
     // 确定 stop_reason
     if has_tool_use && stop_reason == "end_turn" {
@@ -1568,8 +1907,7 @@ async fn handle_non_stream_request(
     // Bracket-style 工具调用回退：仅在结构化 toolUseEvent 未出现工具调用、
     // 且文本里包含 `[Called name with args: {...}]` 模式时才扫描，避免误伤普通文本。
     if !has_tool_use {
-        let bracket_calls =
-            super::bracket_tool_parser::parse_bracket_tool_calls(&text_content);
+        let bracket_calls = super::bracket_tool_parser::parse_bracket_tool_calls(&text_content);
         if !bracket_calls.is_empty() {
             tracing::info!(
                 count = bracket_calls.len(),
@@ -1597,43 +1935,19 @@ async fn handle_non_stream_request(
         }
     }
 
-    // 构建响应内容
-    let mut content: Vec<serde_json::Value> = Vec::new();
-
-    if context.thinking_enabled {
-        // 从完整文本中提取 thinking 块
-        let (thinking, remaining_text) =
-            super::stream::extract_thinking_from_complete_text(&text_content);
-
-        if let Some(thinking_text) = thinking {
-            // signature 占位：thinking 模式下客户端要求 thinking 块带非空 signature
-            // 字段，否则下一轮回传时 SDK 本地校验会拒绝（"must be passed back"）
-            content.push(json!({
-                "type": "thinking",
-                "thinking": thinking_text,
-                "signature": super::stream::THINKING_SIGNATURE_PLACEHOLDER,
-            }));
-        }
-
-        if !remaining_text.is_empty() {
-            content.push(json!({
-                "type": "text",
-                "text": remaining_text
-            }));
-        }
-    } else if !text_content.is_empty() {
-        content.push(json!({
-            "type": "text",
-            "text": text_content
-        }));
-    }
-
-    content.extend(tool_uses);
+    let content = build_non_stream_content_blocks(
+        &text_content,
+        &raw_thinking_content,
+        tool_uses,
+        context.thinking_enabled,
+        context.thinking_display_omitted,
+        &context.claude_format,
+    );
 
     // 估算输出 tokens
     let output_tokens = token::estimate_output_tokens(&content);
 
-    // xkiro 独有：优先使用 contextUsageEvent 的上游值，无则回落估算（保留 BK 没有的能力）
+    // Kiro-Go 语义：优先使用上游 real input tokens，无则回落请求侧估算。
     let final_input_tokens = context_input_tokens.unwrap_or(context.input_tokens);
     // BK 模式：billed = final - cache_creation - cache_read（用 saturating_sub 防负）
     let billed_input_tokens = final_cache_context
@@ -1688,6 +2002,12 @@ async fn handle_non_stream_request(
         })
     };
 
+    context.app_state.record_api_key_usage(
+        context.api_key_id.as_deref(),
+        i64::from(final_input_tokens) + i64::from(output_tokens),
+        metering.as_ref().map(|m| m.usage).unwrap_or(0.0),
+    );
+
     (StatusCode::OK, Json(response_body)).into_response()
 }
 
@@ -1729,13 +2049,17 @@ fn inject_system_prompt(payload: &mut MessagesRequest, shared: &SharedPromptConf
 /// 2. **`*-thinking` 后缀**：强制开启 thinking
 ///    - Opus 4.6/4.7 → `adaptive`（带 `effort: high`、`display: summarized`）
 ///    - 其他模型 → `enabled`，budget_tokens=20000
-fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
+pub(crate) fn override_thinking_from_model_name(
+    payload: &mut MessagesRequest,
+    thinking_suffix: &str,
+) {
     let model_lower = payload.model.to_lowercase();
+    let suffix_lower = thinking_suffix.to_lowercase();
     let is_opus = model_lower.contains("opus");
     let is_opus_4_7 = is_opus && (model_lower.contains("4-7") || model_lower.contains("4.7"));
     let is_opus_4_6 = is_opus && (model_lower.contains("4-6") || model_lower.contains("4.6"));
     let is_opus_4_6_or_newer = is_opus_4_6 || is_opus_4_7;
-    let has_thinking_suffix = model_lower.contains("thinking");
+    let has_thinking_suffix = !suffix_lower.is_empty() && model_lower.ends_with(&suffix_lower);
 
     // Case 1: Opus 4.7 不支持 enabled，自动降级 adaptive；不论有无后缀
     if is_opus_4_7 {
@@ -1777,7 +2101,11 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
 
     payload.thinking = Some(Thinking {
         thinking_type: thinking_type.to_string(),
-        budget_tokens: 20000,
+        budget_tokens: if thinking_type == "enabled" {
+            Some(20000)
+        } else {
+            None
+        },
         display: if thinking_type == "adaptive" {
             Some("summarized".to_string())
         } else {
@@ -1796,24 +2124,94 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
 ///
 /// 计算消息的 token 数量
 pub async fn count_tokens(
+    State(state): State<AppState>,
     JsonExtractor(payload): JsonExtractor<CountTokensRequest>,
-) -> impl IntoResponse {
+) -> Response {
     tracing::info!(
         model = %payload.model,
         message_count = %payload.messages.len(),
         "Received POST /v1/messages/count_tokens request"
     );
 
+    if let Some(message) = validate_thinking_config(payload.thinking.as_ref(), payload.max_tokens) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("invalid_request_error", message)),
+        )
+            .into_response();
+    }
+
+    let thinking_suffix = state.thinking_config.read().suffix.clone();
+    let effective = effective_count_tokens_request(payload, &thinking_suffix);
+
     let total_tokens = token::count_all_tokens(
-        payload.model,
-        payload.system,
-        payload.messages,
-        payload.tools,
+        effective.model,
+        effective.system,
+        effective.messages,
+        effective.tools,
     ) as i32;
 
     Json(CountTokensResponse {
         input_tokens: total_tokens.max(1) as i32,
     })
+    .into_response()
+}
+
+fn effective_count_tokens_request(
+    payload: CountTokensRequest,
+    thinking_suffix: &str,
+) -> CountTokensRequest {
+    let mut effective = MessagesRequest {
+        model: payload.model,
+        max_tokens: payload.max_tokens,
+        temperature: None,
+        top_p: None,
+        messages: payload.messages,
+        stream: false,
+        system: payload.system,
+        tools: payload.tools,
+        tool_choice: None,
+        thinking: payload.thinking,
+        output_config: payload.output_config,
+        metadata: None,
+    };
+    override_thinking_from_model_name(&mut effective, thinking_suffix);
+
+    if let Some(prefix) = generate_thinking_prefix(&effective) {
+        effective.system = Some(match effective.system.take() {
+            Some(mut system) if !system.is_empty() => {
+                if !system
+                    .iter()
+                    .any(|block| block.text.contains("<thinking_mode>"))
+                {
+                    system.insert(
+                        0,
+                        SystemMessage {
+                            text: prefix,
+                            block_type: Some("text".to_string()),
+                            cache_control: None,
+                        },
+                    );
+                }
+                system
+            }
+            _ => vec![SystemMessage {
+                text: prefix,
+                block_type: Some("text".to_string()),
+                cache_control: None,
+            }],
+        });
+    }
+
+    CountTokensRequest {
+        model: effective.model,
+        max_tokens: effective.max_tokens,
+        messages: effective.messages,
+        system: effective.system,
+        tools: effective.tools,
+        thinking: effective.thinking,
+        output_config: effective.output_config,
+    }
 }
 
 /// POST /cc/v1/messages
@@ -1823,6 +2221,7 @@ pub async fn count_tokens(
 /// - message_start 中的 input_tokens 是从 contextUsageEvent 计算的准确值
 pub async fn post_messages_cc(
     State(state): State<AppState>,
+    Extension(matched_api_key): Extension<MatchedApiKeyId>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
     tracing::info!(
@@ -1832,6 +2231,14 @@ pub async fn post_messages_cc(
         message_count = %payload.messages.len(),
         "Received POST /cc/v1/messages request"
     );
+
+    if let Some(message) = validate_messages_request_shape(&payload) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("invalid_request_error", message)),
+        )
+            .into_response();
+    }
 
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
@@ -1849,8 +2256,8 @@ pub async fn post_messages_cc(
         }
     };
 
-    // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
-    override_thinking_from_model_name(&mut payload);
+    let thinking_suffix = state.thinking_config.read().suffix.clone();
+    override_thinking_from_model_name(&mut payload, &thinking_suffix);
 
     // 注入用户配置的系统提示（preset + 自定义）
     inject_system_prompt(&mut payload, &state.prompt_runtime);
@@ -1884,9 +2291,10 @@ pub async fn post_messages_cc(
     let user_id = prep.user_id.as_deref();
 
     let prompt_cache = state.prompt_cache_snapshot();
-    let cache_profile = prompt_cache.accounting_enabled.then(|| {
-        build_cache_profile(prompt_cache.tracker.as_ref(), &payload, prep.input_tokens)
-    });
+    let claude_format = state.thinking_config.read().claude_format.clone();
+    let cache_profile = prompt_cache
+        .accounting_enabled
+        .then(|| build_cache_profile(prompt_cache.tracker.as_ref(), &payload, prep.input_tokens));
 
     if payload.stream {
         // 流式响应（缓冲模式）
@@ -1898,22 +2306,35 @@ pub async fn post_messages_cc(
             prep.thinking_enabled,
             prep.tool_name_map,
             user_id,
-            prompt_cache.accounting_enabled.then_some(&prompt_cache.tracker),
+            prompt_cache
+                .accounting_enabled
+                .then_some(&prompt_cache.tracker),
             cache_profile.as_ref(),
+            claude_format.clone(),
+            state.clone(),
+            matched_api_key.0.clone(),
         )
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && prep.thinking_enabled;
         let non_stream_request = NonStreamRequestContext {
+            app_state: state.clone(),
+            api_key_id: matched_api_key.0,
             request_body: &prep.request_body,
             model: &payload.model,
             input_tokens: prep.input_tokens,
             thinking_enabled: extract_thinking,
+            thinking_display_omitted: payload.thinking.as_ref().is_some_and(|t| {
+                t.is_enabled() && t.effective_display().eq_ignore_ascii_case("omitted")
+            }),
             tool_name_map: prep.tool_name_map,
             user_id,
-            cache_tracker: prompt_cache.accounting_enabled.then_some(&prompt_cache.tracker),
+            cache_tracker: prompt_cache
+                .accounting_enabled
+                .then_some(&prompt_cache.tracker),
             cache_profile: cache_profile.as_ref(),
+            claude_format,
         };
         handle_non_stream_request(provider, non_stream_request).await
     }
@@ -1933,6 +2354,9 @@ async fn handle_stream_request_buffered(
     user_id: Option<&str>,
     cache_tracker: Option<&std::sync::Arc<crate::anthropic::cache_tracker::CacheTracker>>,
     cache_profile: Option<&crate::anthropic::cache_tracker::CacheProfile>,
+    claude_format: String,
+    app_state: AppState,
+    api_key_id: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let mut api_result = match provider.call_api_stream(request_body, user_id).await {
@@ -1967,17 +2391,27 @@ async fn handle_stream_request_buffered(
     let _credential_id = api_result.credential_id;
 
     // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(
+    let ctx = BufferedStreamContext::new_with_format(
         model,
         estimated_input_tokens,
         thinking_enabled,
         tool_name_map,
         final_cache_usage,
+        claude_format,
     );
 
     // 创建缓冲 SSE 流
     let tm = provider.token_manager().clone();
-    let stream = create_buffered_sse_stream(response, ctx, _cred_permit, _glb_permit, tm, _credential_id);
+    let stream = create_buffered_sse_stream(
+        response,
+        ctx,
+        _cred_permit,
+        _glb_permit,
+        tm,
+        _credential_id,
+        app_state,
+        api_key_id,
+    );
 
     // 返回 SSE 响应
     Response::builder()
@@ -2003,6 +2437,8 @@ fn create_buffered_sse_stream(
     glb_permit: Option<OwnedSemaphorePermit>,
     tm: std::sync::Arc<crate::kiro::token_manager::MultiTokenManager>,
     credential_id: u64,
+    app_state: AppState,
+    api_key_id: Option<String>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let body_stream = response.bytes_stream();
 
@@ -2017,8 +2453,10 @@ fn create_buffered_sse_stream(
             glb_permit,
             tm,
             credential_id,
+            app_state,
+            api_key_id,
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, cred_permit, glb_permit, tm, credential_id)| async move {
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, cred_permit, glb_permit, tm, credential_id, app_state, api_key_id)| async move {
             if finished {
                 return None;
             }
@@ -2033,7 +2471,7 @@ fn create_buffered_sse_stream(
                     _ = ping_interval.tick() => {
                         tracing::trace!("发送 ping 保活事件（缓冲模式）");
                         let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, cred_permit, glb_permit, tm, credential_id)));
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, cred_permit, glb_permit, tm, credential_id, app_state, api_key_id)));
                     }
 
                     // 然后处理数据流
@@ -2048,6 +2486,19 @@ fn create_buffered_sse_stream(
                                 for result in decoder.decode_iter() {
                                     match result {
                                         Ok(frame) => {
+                                            // 对齐 Kiro-Go: 从帧中提取 token 使用量
+                                            if let Some(usage) = crate::kiro::model::events::extract_token_usage_from_frame_with_current(
+                                                &frame,
+                                                None,
+                                                Some(i64::from(ctx.inner.output_tokens)),
+                                            ) {
+                                                if let Some(input) = usage.input_tokens {
+                                                    ctx.inner.context_input_tokens = Some(input as i32);
+                                                }
+                                                if let Some(output) = usage.output_tokens {
+                                                    ctx.inner.set_actual_output_tokens(output as i32);
+                                                }
+                                            }
                                             if let Ok(event) = Event::from_frame(frame) {
                                                 // 缓冲事件（复用 StreamContext 的处理逻辑）
                                                 ctx.process_and_buffer(&event);
@@ -2073,7 +2524,7 @@ fn create_buffered_sse_stream(
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, None, None, tm, credential_id)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, None, None, tm, credential_id, app_state, api_key_id)));
                             }
                             None => {
                                 // 上游正常结束 → 立即释放 permit
@@ -2083,11 +2534,15 @@ fn create_buffered_sse_stream(
                                     tm.apply_credit_usage(credential_id, m.usage);
                                 }
                                 let all_events = ctx.finish_and_get_all_events();
+                                let credits = ctx.metering().map(|m| m.usage).unwrap_or(0.0);
+                                let tokens = i64::from(ctx.final_input_tokens())
+                                    + i64::from(ctx.final_output_tokens());
+                                app_state.record_api_key_usage(api_key_id.as_deref(), tokens, credits);
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, None, None, tm, credential_id)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, None, None, tm, credential_id, app_state, api_key_id)));
                             }
                         }
                     }
@@ -2207,8 +2662,615 @@ mod tests {
     use super::*;
     use crate::anthropic::types::{Message, SystemMessage};
     use crate::kiro::model::requests::conversation::{
-        ConversationState, CurrentMessage, KiroImage, Message as KiroMessage, UserInputMessage,
+        ConversationState, CurrentMessage, Message as KiroMessage, UserInputMessage,
     };
+    use crate::kiro::models::AvailableModel;
+
+    fn test_state_with_compression(
+        compression: crate::model::config::CompressionConfig,
+    ) -> AppState {
+        AppState::new(
+            "test-key",
+            false,
+            false,
+            std::sync::Arc::new(parking_lot::RwLock::new(
+                crate::anthropic::middleware::PromptCacheRuntime::new(300, false),
+            )),
+            crate::anthropic::middleware::ThinkingRuntimeConfig {
+                suffix: "-thinking".to_string(),
+                openai_format: "reasoning_content".to_string(),
+                claude_format: "thinking".to_string(),
+            },
+        )
+        .with_compression_config(std::sync::Arc::new(parking_lot::RwLock::new(compression)))
+    }
+
+    fn available_model_fixture(id: &str, input_types: &[&str]) -> AvailableModel {
+        AvailableModel {
+            model_id: id.to_string(),
+            model_name: String::new(),
+            description: String::new(),
+            provider: None,
+            capabilities: Vec::new(),
+            context_window: None,
+            is_default: None,
+            rate_multiplier: None,
+            rate_unit: None,
+            prompt_caching: None,
+            supported_input_types: input_types.iter().map(|v| (*v).to_string()).collect(),
+            token_limits: None,
+        }
+    }
+
+    fn tool_use_event(
+        name: &str,
+        tool_use_id: &str,
+        input: &str,
+        stop: bool,
+    ) -> crate::kiro::model::events::ToolUseEvent {
+        crate::kiro::model::events::ToolUseEvent {
+            name: name.to_string(),
+            tool_use_id: tool_use_id.to_string(),
+            input: input.to_string(),
+            input_is_json_object: false,
+            stop,
+        }
+    }
+
+    fn tool_use_object_event(
+        name: &str,
+        tool_use_id: &str,
+        input: serde_json::Value,
+        stop: bool,
+    ) -> crate::kiro::model::events::ToolUseEvent {
+        crate::kiro::model::events::ToolUseEvent {
+            name: name.to_string(),
+            tool_use_id: tool_use_id.to_string(),
+            input: input.to_string(),
+            input_is_json_object: true,
+            stop,
+        }
+    }
+
+    #[test]
+    fn non_stream_tool_use_flushes_without_stop_like_kiro_go() {
+        let mut current = None;
+        let mut output = Vec::new();
+        let names = std::collections::HashMap::new();
+
+        handle_non_stream_tool_use_event(
+            tool_use_event("exec_command", "call_1", "{\"cmd\":\"pwd\"}", false),
+            &mut current,
+            &mut output,
+            &names,
+        );
+        finish_non_stream_tool_use(&mut current, &mut output, &names);
+
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["id"], "call_1");
+        assert_eq!(output[0]["name"], "exec_command");
+        assert_eq!(output[0]["input"], serde_json::json!({"cmd": "pwd"}));
+    }
+
+    #[test]
+    fn non_stream_tool_use_adopts_late_real_id_like_kiro_go() {
+        let mut current = None;
+        let mut output = Vec::new();
+        let names = std::collections::HashMap::new();
+
+        handle_non_stream_tool_use_event(
+            tool_use_event("exec_command", "", "{\"cmd\":", false),
+            &mut current,
+            &mut output,
+            &names,
+        );
+        handle_non_stream_tool_use_event(
+            tool_use_event("exec_command", "call_real", "\"pwd\"}", true),
+            &mut current,
+            &mut output,
+            &names,
+        );
+
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["id"], "call_real");
+        assert_eq!(output[0]["input"], serde_json::json!({"cmd": "pwd"}));
+    }
+
+    #[test]
+    fn non_stream_tool_use_object_input_replaces_buffer_like_kiro_go() {
+        let mut current = None;
+        let mut output = Vec::new();
+        let names = std::collections::HashMap::new();
+
+        handle_non_stream_tool_use_event(
+            tool_use_event("exec_command", "", "{\"cmd\":\"old", false),
+            &mut current,
+            &mut output,
+            &names,
+        );
+        handle_non_stream_tool_use_event(
+            tool_use_object_event(
+                "exec_command",
+                "call_real",
+                serde_json::json!({"cmd": "pwd"}),
+                true,
+            ),
+            &mut current,
+            &mut output,
+            &names,
+        );
+
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["id"], "call_real");
+        assert_eq!(output[0]["input"], serde_json::json!({"cmd": "pwd"}));
+    }
+
+    #[test]
+    fn non_stream_tool_use_name_change_flushes_previous_like_kiro_go() {
+        let mut current = None;
+        let mut output = Vec::new();
+        let names = std::collections::HashMap::new();
+
+        handle_non_stream_tool_use_event(
+            tool_use_event("first_tool", "", "{\"a\":1}", false),
+            &mut current,
+            &mut output,
+            &names,
+        );
+        handle_non_stream_tool_use_event(
+            tool_use_event("second_tool", "", "{\"b\":2}", true),
+            &mut current,
+            &mut output,
+            &names,
+        );
+
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0]["name"], "first_tool");
+        assert_eq!(output[0]["input"], serde_json::json!({"a": 1}));
+        assert_eq!(output[1]["name"], "second_tool");
+        assert_eq!(output[1]["input"], serde_json::json!({"b": 2}));
+    }
+
+    #[test]
+    fn non_stream_assistant_text_normalizes_cumulative_chunks_like_kiro_go() {
+        let mut text = String::new();
+        let mut previous = String::new();
+
+        append_non_stream_assistant_delta(&mut text, "hello", &mut previous);
+        append_non_stream_assistant_delta(&mut text, "hello world", &mut previous);
+        append_non_stream_assistant_delta(&mut text, "hello world", &mut previous);
+
+        assert_eq!(text, "hello world");
+    }
+
+    #[test]
+    fn non_stream_reasoning_text_normalizes_cumulative_chunks_like_kiro_go() {
+        let mut thinking = String::new();
+        let mut previous = String::new();
+
+        append_non_stream_reasoning_delta(&mut thinking, "think", &mut previous);
+        append_non_stream_reasoning_delta(&mut thinking, "think more", &mut previous);
+
+        assert_eq!(thinking, "think more");
+    }
+
+    #[test]
+    fn non_stream_omitted_thinking_emits_empty_block_like_kiro_go() {
+        let content = build_non_stream_content_blocks(
+            "final answer",
+            "private reasoning",
+            Vec::new(),
+            true,
+            true,
+            "thinking",
+        );
+
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "");
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "final answer");
+    }
+
+    #[test]
+    fn non_stream_omitted_thinking_extracts_assistant_tag_without_leaking() {
+        let content = build_non_stream_content_blocks(
+            "<thinking>private reasoning</thinking>\n\nfinal answer",
+            "",
+            Vec::new(),
+            true,
+            true,
+            "thinking",
+        );
+
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "");
+        assert_eq!(content[1]["text"], "final answer");
+    }
+
+    #[test]
+    fn non_stream_think_format_keeps_reasoning_in_text_like_kiro_go() {
+        let content = build_non_stream_content_blocks(
+            "final answer",
+            "visible reasoning",
+            Vec::new(),
+            true,
+            false,
+            "think",
+        );
+
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(
+            content[0]["text"],
+            "<think>visible reasoning</think>final answer"
+        );
+    }
+
+    #[test]
+    fn test_build_model_info_matches_kiro_go_image_shape() {
+        let model = build_model_info("claude-sonnet-4.6", "anthropic", true);
+
+        assert_eq!(model.id, "claude-sonnet-4.6");
+        assert_eq!(model.object, "model");
+        assert_eq!(model.owned_by, "anthropic");
+        assert!(model.supports_image);
+        assert_eq!(model.input_modalities, vec!["text", "image"]);
+        assert_eq!(model.modalities.input, vec!["text", "image"]);
+        assert_eq!(model.modalities.output, vec!["text"]);
+        assert!(model.capabilities.vision);
+        assert!(model.capabilities.image);
+        assert!(model.capabilities.image_vision);
+        assert!(model.info.meta.capabilities.vision);
+        assert!(model.info.meta.capabilities.image_vision);
+        assert!(model.created.is_none());
+        assert!(model.display_name.is_none());
+
+        let json = serde_json::to_value(&model).unwrap();
+        assert!(json.get("created").is_none());
+        assert!(json.get("display_name").is_none());
+        assert!(json.get("max_tokens").is_none());
+        assert_eq!(json["supports_image"], true);
+        assert_eq!(
+            json["modalities"]["input"],
+            serde_json::json!(["text", "image"])
+        );
+    }
+
+    #[test]
+    fn test_default_models_response_generates_thinking_variants_and_aliases() {
+        let models = default_models_response("-thinking");
+        let ids: std::collections::HashSet<_> = models.iter().map(|m| m.id.as_str()).collect();
+
+        assert!(ids.contains("claude-sonnet-4.6"));
+        assert!(ids.contains("claude-sonnet-4.6-thinking"));
+        assert!(ids.contains("claude-opus-4.7"));
+        assert!(ids.contains("claude-opus-4.7-thinking"));
+        assert!(ids.contains("auto"));
+        assert!(ids.contains("gpt-4o"));
+        assert!(ids.contains("gpt-4"));
+    }
+
+    #[test]
+    fn test_merge_unique_models_preserves_union_across_accounts() {
+        let base = vec![available_model_fixture("claude-sonnet-4.5", &["TEXT"])];
+        let incoming = vec![
+            available_model_fixture("claude-sonnet-4.5", &["image"]),
+            available_model_fixture("claude-opus-4-7", &["text"]),
+        ];
+
+        let merged = merge_unique_models(base, incoming);
+
+        assert_eq!(merged.len(), 2);
+        assert!(model_supports_image(&merged[0].supported_input_types));
+        assert_eq!(merged[1].model_id, "claude-opus-4-7");
+    }
+
+    #[test]
+    fn test_build_anthropic_models_response_uses_supported_input_types() {
+        let cached = vec![
+            available_model_fixture("text-only", &["TEXT"]),
+            available_model_fixture("vision-model", &["vision"]),
+        ];
+
+        let models = build_anthropic_models_response(&cached, "-thinking");
+        let text_only = models.iter().find(|m| m.id == "text-only").unwrap();
+        let vision = models.iter().find(|m| m.id == "vision-model").unwrap();
+        let vision_thinking = models
+            .iter()
+            .find(|m| m.id == "vision-model-thinking")
+            .unwrap();
+
+        assert!(!text_only.supports_image);
+        assert_eq!(text_only.input_modalities, vec!["text"]);
+        assert!(vision.supports_image);
+        assert_eq!(vision.input_modalities, vec!["text", "image"]);
+        assert!(vision_thinking.supports_image);
+    }
+
+    fn messages_req(value: serde_json::Value) -> MessagesRequest {
+        serde_json::from_value(value).expect("messages request fixture should parse")
+    }
+
+    #[test]
+    fn test_validate_messages_request_shape_rejects_assistant_prefill() {
+        let req = messages_req(serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 100,
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "prefill"}
+            ]
+        }));
+
+        assert_eq!(
+            validate_messages_request_shape(&req),
+            Some("assistant-prefill final message is not supported; last message must be user")
+        );
+    }
+
+    #[test]
+    fn test_validate_messages_request_shape_rejects_empty_messages() {
+        let req = messages_req(serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 100,
+            "messages": []
+        }));
+
+        assert_eq!(
+            validate_messages_request_shape(&req),
+            Some("messages must not be empty")
+        );
+    }
+
+    #[test]
+    fn test_validate_messages_request_shape_rejects_without_user_context() {
+        let req = messages_req(serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 100,
+            "messages": [
+                {"role": "user", "content": "   "}
+            ]
+        }));
+
+        assert_eq!(
+            validate_messages_request_shape(&req),
+            Some("at least one non-empty user message is required")
+        );
+    }
+
+    #[test]
+    fn test_validate_messages_request_shape_accepts_tool_result_user_context() {
+        let req = messages_req(serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 100,
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "tool_1", "name": "read", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tool_1", "content": "done"}
+                ]}
+            ]
+        }));
+
+        assert_eq!(validate_messages_request_shape(&req), None);
+    }
+
+    #[test]
+    fn test_validate_messages_request_shape_accepts_inline_image_context() {
+        let req = messages_req(serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 100,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}
+                }]
+            }]
+        }));
+
+        assert_eq!(validate_messages_request_shape(&req), None);
+    }
+
+    #[test]
+    fn test_validate_messages_request_shape_rejects_invalid_thinking_type_like_kiro_go() {
+        let req = messages_req(serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 4096,
+            "thinking": {"type": "auto"},
+            "messages": [{"role": "user", "content": "hello"}]
+        }));
+
+        assert_eq!(
+            validate_messages_request_shape(&req),
+            Some("thinking.type must be one of: enabled, adaptive, disabled")
+        );
+    }
+
+    #[test]
+    fn test_validate_messages_request_shape_rejects_enabled_thinking_budget_below_minimum() {
+        let req = messages_req(serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 4096,
+            "thinking": {"type": "enabled", "budget_tokens": 512},
+            "messages": [{"role": "user", "content": "hello"}]
+        }));
+
+        assert_eq!(
+            validate_messages_request_shape(&req),
+            Some("thinking.budget_tokens must be at least 1024")
+        );
+    }
+
+    #[test]
+    fn test_validate_messages_request_shape_rejects_enabled_thinking_budget_at_max_tokens() {
+        let req = messages_req(serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 4096,
+            "thinking": {"type": "enabled", "budget_tokens": 4096},
+            "messages": [{"role": "user", "content": "hello"}]
+        }));
+
+        assert_eq!(
+            validate_messages_request_shape(&req),
+            Some("thinking.budget_tokens must be less than max_tokens")
+        );
+    }
+
+    #[test]
+    fn test_validate_messages_request_shape_rejects_enabled_thinking_with_zero_max_tokens() {
+        let req = messages_req(serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 0,
+            "thinking": {"type": "enabled", "budget_tokens": 2048},
+            "messages": [{"role": "user", "content": "hello"}]
+        }));
+
+        assert_eq!(
+            validate_messages_request_shape(&req),
+            Some("thinking.type enabled cannot be used with max_tokens=0")
+        );
+    }
+
+    #[test]
+    fn test_validate_messages_request_shape_rejects_invalid_thinking_display_like_kiro_go() {
+        let req = messages_req(serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 4096,
+            "thinking": {"type": "adaptive", "display": "verbose"},
+            "messages": [{"role": "user", "content": "hello"}]
+        }));
+
+        assert_eq!(
+            req.thinking.as_ref().unwrap().display.as_deref(),
+            Some("verbose")
+        );
+        assert_eq!(
+            validate_messages_request_shape(&req),
+            Some("thinking.display must be one of: summarized, omitted")
+        );
+    }
+
+    #[test]
+    fn test_validate_messages_request_shape_rejects_disabled_thinking_display_like_kiro_go() {
+        let req = messages_req(serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 4096,
+            "thinking": {"type": "disabled", "display": "summarized"},
+            "messages": [{"role": "user", "content": "hello"}]
+        }));
+
+        assert_eq!(
+            validate_messages_request_shape(&req),
+            Some("thinking.display is not supported when thinking.type is disabled")
+        );
+    }
+
+    #[test]
+    fn test_validate_messages_request_shape_allows_large_enabled_budget_without_rust_clamp() {
+        let req = messages_req(serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 300000,
+            "thinking": {"type": "enabled", "budget_tokens": 200000},
+            "messages": [{"role": "user", "content": "hello"}]
+        }));
+
+        assert_eq!(req.thinking.as_ref().unwrap().budget_tokens, Some(200000));
+        assert_eq!(validate_messages_request_shape(&req), None);
+    }
+
+    #[test]
+    fn test_validate_messages_request_shape_rejects_adaptive_thinking_budget_like_kiro_go() {
+        let req = messages_req(serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 4096,
+            "thinking": {"type": "adaptive", "budget_tokens": 20000},
+            "messages": [{"role": "user", "content": "hello"}]
+        }));
+
+        assert_eq!(
+            validate_messages_request_shape(&req),
+            Some("thinking.budget_tokens is not supported when thinking.type is adaptive")
+        );
+    }
+
+    #[test]
+    fn test_validate_messages_request_shape_rejects_disabled_thinking_budget_like_kiro_go() {
+        let req = messages_req(serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 4096,
+            "thinking": {"type": "disabled", "budget_tokens": 1},
+            "messages": [{"role": "user", "content": "hello"}]
+        }));
+
+        assert_eq!(
+            validate_messages_request_shape(&req),
+            Some("thinking.budget_tokens is not supported when thinking.type is disabled")
+        );
+    }
+
+    #[test]
+    fn test_count_tokens_effective_request_includes_thinking_prefix_like_kiro_go() {
+        let payload: CountTokensRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-opus-4-6",
+            "max_tokens": 4096,
+            "thinking": {"type": "adaptive", "display": "summarized"},
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+
+        let base_tokens = token::count_all_tokens(
+            payload.model.clone(),
+            payload.system.clone(),
+            payload.messages.clone(),
+            payload.tools.clone(),
+        );
+        let effective = effective_count_tokens_request(payload, "-thinking");
+        let effective_tokens = token::count_all_tokens(
+            effective.model,
+            effective.system.clone(),
+            effective.messages,
+            effective.tools,
+        );
+
+        let system = effective.system.expect("thinking should inject system");
+        assert!(
+            system[0]
+                .text
+                .contains("<thinking_mode>adaptive</thinking_mode>")
+        );
+        assert!(effective_tokens > base_tokens);
+    }
+
+    #[test]
+    fn test_count_tokens_effective_request_honors_thinking_model_suffix() {
+        let payload: CountTokensRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-4-5-thinking",
+            "max_tokens": 4096,
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+
+        let effective = effective_count_tokens_request(payload, "-thinking");
+
+        assert_eq!(
+            effective.thinking.as_ref().and_then(|t| t.budget_tokens),
+            Some(20000)
+        );
+        assert!(
+            effective
+                .system
+                .as_ref()
+                .unwrap()
+                .first()
+                .unwrap()
+                .text
+                .contains("<thinking_mode>enabled</thinking_mode>")
+        );
+    }
 
     fn sample_messages_request() -> MessagesRequest {
         // 生成一个超过 1024 tokens 的 system message 用于测试缓存
@@ -2218,19 +3280,15 @@ mod tests {
         MessagesRequest {
             model: "claude-sonnet-4-thinking".to_string(),
             max_tokens: 1024,
-            messages: vec![
-                Message {
-                    role: "user".to_string(),
-                    content: serde_json::json!([
-                        {"type": "text", "text": "hello raw"},
-                        {"type": "text", "text": ""}
-                    ]),
-                },
-                Message {
-                    role: "assistant".to_string(),
-                    content: serde_json::json!("prefill that convert will drop"),
-                },
-            ],
+            temperature: None,
+            top_p: None,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {"type": "text", "text": "hello raw"},
+                    {"type": "text", "text": ""}
+                ]),
+            }],
             stream: false,
             system: Some(vec![SystemMessage {
                 text: very_long_text,
@@ -2256,21 +3314,23 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_context_uses_raw_system_tokens() {
+    fn test_cache_context_uses_kiro_go_cache_profile_tokens() {
         let payload = sample_messages_request();
 
         let cache_tracker =
             crate::anthropic::cache_tracker::CacheTracker::new(std::time::Duration::from_secs(300));
 
-        // 计算实际的 system message tokens
         let system_text = &payload.system.as_ref().unwrap()[0].text;
-        let expected = token::count_tokens(system_text) as i32;
+        let raw_system_tokens = token::count_tokens(system_text) as i32;
 
-        let cache_profile = build_cache_profile(&cache_tracker, &payload, expected);
+        let cache_profile = build_cache_profile(&cache_tracker, &payload, raw_system_tokens);
         let cache_context = compute_cache_usage(&cache_tracker, 0, &cache_profile);
 
-        // 验证 cache_creation_input_tokens 等于 system message 的 token 数
-        assert_eq!(cache_context.cache_creation_input_tokens, expected);
+        assert!(cache_profile.total_input_tokens() >= raw_system_tokens);
+        assert_eq!(
+            cache_context.cache_creation_input_tokens,
+            cache_profile.total_input_tokens()
+        );
         assert_eq!(cache_context.cache_read_input_tokens, 0);
     }
 
@@ -2305,23 +3365,22 @@ mod tests {
     }
 
     #[test]
-    fn test_non_stream_usage_uses_estimated_input_tokens_as_base() {
+    fn test_non_stream_usage_prefers_kiro_go_real_input_tokens() {
         let estimated_input_tokens = 1493;
         let upstream_context_input_tokens = 3106;
         let cache_creation_input_tokens = 9;
         let cache_read_input_tokens = 1480;
 
-        let final_input_tokens = estimated_input_tokens;
+        let final_input_tokens =
+            Some(upstream_context_input_tokens).unwrap_or(estimated_input_tokens);
         let billed = billed_input_tokens(
             final_input_tokens,
             cache_creation_input_tokens,
             cache_read_input_tokens,
         );
 
-        assert_eq!(final_input_tokens, 1493);
-        assert_eq!(upstream_context_input_tokens, 3106);
-        assert_eq!(billed, 4);
-        assert_ne!(final_input_tokens, upstream_context_input_tokens);
+        assert_eq!(final_input_tokens, 3106);
+        assert_eq!(billed, 1617);
     }
 
     #[test]
@@ -2345,6 +3404,29 @@ mod tests {
         assert_eq!(usage["cache_read_input_tokens"], 8);
         assert_eq!(usage["cache_creation"]["ephemeral_5m_input_tokens"], 3);
         assert_eq!(usage["cache_creation"]["ephemeral_1h_input_tokens"], 4);
+    }
+
+    #[test]
+    fn test_build_claude_usage_map_includes_cache_fields_like_kiro_go() {
+        let cache_context = CacheUsageContext {
+            cache_creation_input_tokens: 30,
+            cache_read_input_tokens: 20,
+            cache_creation_5m_input_tokens: 10,
+            cache_creation_1h_input_tokens: 20,
+        };
+        let mut usage = serde_json::json!({
+            "input_tokens": billed_input_tokens(100, cache_context.cache_creation_input_tokens, cache_context.cache_read_input_tokens),
+            "output_tokens": 50
+        });
+
+        inject_cache_usage_fields(&mut usage, cache_context);
+
+        assert_eq!(usage["input_tokens"], 50);
+        assert_eq!(usage["output_tokens"], 50);
+        assert_eq!(usage["cache_creation_input_tokens"], 30);
+        assert_eq!(usage["cache_read_input_tokens"], 20);
+        assert_eq!(usage["cache_creation"]["ephemeral_5m_input_tokens"], 10);
+        assert_eq!(usage["cache_creation"]["ephemeral_1h_input_tokens"], 20);
     }
 
     #[test]
@@ -2392,37 +3474,190 @@ mod tests {
     }
 
     #[test]
-    fn test_adaptive_shrink_removes_only_history_images() {
-        let big = "A".repeat(20_000);
+    fn test_truncate_payload_to_body_limit_preserves_current_and_marks_history_gap() {
+        let mut history = vec![
+            KiroMessage::user("system prompt", "model"),
+            KiroMessage::assistant("I will follow these instructions."),
+        ];
+        let big = "old context ".repeat(700);
+        for i in 0..12 {
+            history.push(KiroMessage::user(format!("old user {i}: {big}"), "model"));
+            history.push(KiroMessage::assistant(format!("old assistant {i}: {big}")));
+        }
+        history.push(KiroMessage::user("recent user 1", "model"));
+        history.push(KiroMessage::assistant("recent assistant 1"));
+        history.push(KiroMessage::user("recent user 2", "model"));
+        history.push(KiroMessage::assistant("recent assistant 2"));
+
         let mut kiro_request = KiroRequest {
-            conversation_state: ConversationState::new("conv-1")
-                .with_current_message(CurrentMessage::new(
-                    UserInputMessage::new("current", "model")
-                        .with_images(vec![KiroImage::from_base64("png", big.clone())]),
-                ))
-                .with_history(vec![KiroMessage::user("history", "model")]),
+            conversation_state: ConversationState::new("conv-truncate")
+                .with_current_message(CurrentMessage::new(UserInputMessage::new(
+                    "FINAL current message",
+                    "model",
+                )))
+                .with_history(history),
+            inference_config: None,
             profile_arn: None,
         };
-        if let KiroMessage::User(user) = &mut kiro_request.conversation_state.history[0] {
-            user.user_input_message.images = vec![KiroImage::from_base64("png", big.clone())];
-        }
+        let mut body = serde_json::to_string(&kiro_request).unwrap();
 
-        let removed = kiro_request.conversation_state.remove_history_images();
+        let outcome = truncate_payload_to_body_limit(&mut kiro_request, 4_000, &mut body, true)
+            .unwrap()
+            .expect("oversized payload should be truncated");
 
-        assert_eq!(removed, 1);
+        assert!(body.len() <= 4_000);
+        assert!(outcome.removed_history_messages > 0);
+        assert!(outcome.inserted_placeholder);
         assert_eq!(
             kiro_request
                 .conversation_state
                 .current_message
                 .user_input_message
-                .images
-                .len(),
-            1
+                .content,
+            "FINAL current message"
         );
-        assert!(match &kiro_request.conversation_state.history[0] {
-            KiroMessage::User(user) => user.user_input_message.images.is_empty(),
+
+        let history = &kiro_request.conversation_state.history;
+        assert!(matches!(history[0], KiroMessage::User(_)));
+        assert!(matches!(history[1], KiroMessage::Assistant(_)));
+        assert!(history.iter().any(|msg| {
+            match msg {
+                KiroMessage::User(user) => user
+                    .user_input_message
+                    .content
+                    .contains("Earlier conversation history was truncated"),
+                _ => false,
+            }
+        }));
+        assert!(history.iter().any(|msg| match msg {
+            KiroMessage::User(user) => user.user_input_message.content == "recent user 2",
             _ => false,
+        }));
+    }
+
+    #[test]
+    fn test_truncate_payload_does_not_infer_system_priming_from_ordinary_turn_like_kiro_go() {
+        let big = "ordinary context ".repeat(700);
+        let mut history = vec![
+            KiroMessage::user(format!("ordinary user: {big}"), "model"),
+            KiroMessage::assistant("I will follow these instructions."),
+        ];
+        for i in 0..10 {
+            history.push(KiroMessage::user(format!("old user {i}: {big}"), "model"));
+            history.push(KiroMessage::assistant(format!("old assistant {i}: {big}")));
+        }
+        history.push(KiroMessage::user("recent user", "model"));
+        history.push(KiroMessage::assistant("recent assistant"));
+
+        let mut kiro_request = KiroRequest {
+            conversation_state: ConversationState::new("conv-truncate")
+                .with_current_message(CurrentMessage::new(UserInputMessage::new(
+                    "FINAL current message",
+                    "model",
+                )))
+                .with_history(history),
+            inference_config: None,
+            profile_arn: None,
+        };
+        let mut body = serde_json::to_string(&kiro_request).unwrap();
+
+        let outcome = truncate_payload_to_body_limit(&mut kiro_request, 4_000, &mut body, false)
+            .unwrap()
+            .expect("oversized payload should be truncated");
+
+        assert!(outcome.removed_history_messages > 0);
+        let history = &kiro_request.conversation_state.history;
+        assert!(
+            matches!(history.first(), Some(KiroMessage::User(user)) if user.user_input_message.content.contains("Earlier conversation history was truncated"))
+        );
+        assert!(!history.iter().any(|msg| {
+            match msg {
+                KiroMessage::User(user) => user
+                    .user_input_message
+                    .content
+                    .starts_with("ordinary user:"),
+                _ => false,
+            }
+        }));
+    }
+
+    #[test]
+    fn test_prepare_request_truncates_payload_when_compression_disabled_like_kiro_go() {
+        let mut compression = crate::model::config::CompressionConfig::default();
+        compression.max_request_body_bytes = 50_000;
+        let state = test_state_with_compression(compression);
+
+        let big = "old context ".repeat(700);
+        let mut messages = Vec::new();
+        for i in 0..12 {
+            messages.push(Message {
+                role: "user".to_string(),
+                content: serde_json::Value::String(format!("old user {i}: {big}")),
+            });
+            messages.push(Message {
+                role: "assistant".to_string(),
+                content: serde_json::Value::String(format!("old assistant {i}: {big}")),
+            });
+        }
+        messages.push(Message {
+            role: "user".to_string(),
+            content: serde_json::Value::String("FINAL current message".to_string()),
         });
+
+        let payload = MessagesRequest {
+            model: "claude-sonnet-4.6".to_string(),
+            max_tokens: 1024,
+            temperature: None,
+            top_p: None,
+            messages,
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let prepared = prepare_request(&state, &payload).expect("prepare");
+
+        assert!(prepared.request_body.len() <= 50_000);
+        assert!(
+            prepared
+                .request_body
+                .contains(PAYLOAD_TRUNCATION_PLACEHOLDER)
+        );
+        assert!(prepared.request_body.contains("FINAL current message"));
+    }
+
+    #[test]
+    fn test_prepare_request_serializes_anthropic_inference_config_like_kiro_go() {
+        let state = test_state_with_compression(crate::model::config::CompressionConfig::default());
+        let payload = MessagesRequest {
+            model: "claude-sonnet-4.6".to_string(),
+            max_tokens: 123,
+            temperature: Some(0.7),
+            top_p: Some(0.9),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::Value::String("hello".to_string()),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let prepared = prepare_request(&state, &payload).expect("prepare");
+        let body: serde_json::Value =
+            serde_json::from_str(&prepared.request_body).expect("request body json");
+
+        assert_eq!(body["inferenceConfig"]["maxTokens"], 123);
+        assert_eq!(body["inferenceConfig"]["temperature"], 0.7);
+        assert_eq!(body["inferenceConfig"]["topP"], 0.9);
     }
 
     #[test]
@@ -2448,10 +3683,16 @@ mod tests {
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
-    fn make_req(model: &str, thinking: Option<Thinking>, output_config: Option<OutputConfig>) -> MessagesRequest {
+    fn make_req(
+        model: &str,
+        thinking: Option<Thinking>,
+        output_config: Option<OutputConfig>,
+    ) -> MessagesRequest {
         MessagesRequest {
             model: model.to_string(),
             max_tokens: 1024,
+            temperature: None,
+            top_p: None,
             messages: vec![],
             stream: false,
             system: None,
@@ -2469,12 +3710,12 @@ mod tests {
             "claude-opus-4-7",
             Some(Thinking {
                 thinking_type: "enabled".to_string(),
-                budget_tokens: 20000,
+                budget_tokens: Some(20000),
                 display: None,
             }),
             None,
         );
-        override_thinking_from_model_name(&mut req);
+        override_thinking_from_model_name(&mut req, "-thinking");
         let t = req.thinking.as_ref().unwrap();
         assert_eq!(t.thinking_type, "adaptive");
         assert_eq!(t.display.as_deref(), Some("summarized"));
@@ -2484,7 +3725,7 @@ mod tests {
     #[test]
     fn test_override_thinking_opus_4_7_no_thinking_does_nothing() {
         let mut req = make_req("claude-opus-4-7", None, None);
-        override_thinking_from_model_name(&mut req);
+        override_thinking_from_model_name(&mut req, "-thinking");
         assert!(req.thinking.is_none());
         assert!(req.output_config.is_none());
     }
@@ -2492,10 +3733,10 @@ mod tests {
     #[test]
     fn test_override_thinking_opus_4_7_thinking_suffix_forces_adaptive() {
         let mut req = make_req("claude-opus-4-7-thinking", None, None);
-        override_thinking_from_model_name(&mut req);
+        override_thinking_from_model_name(&mut req, "-thinking");
         let t = req.thinking.as_ref().unwrap();
         assert_eq!(t.thinking_type, "adaptive");
-        assert_eq!(t.budget_tokens, 20000);
+        assert_eq!(t.budget_tokens, None);
         assert_eq!(t.display.as_deref(), Some("summarized"));
         assert_eq!(req.output_config.as_ref().unwrap().effort, "high");
     }
@@ -2503,7 +3744,7 @@ mod tests {
     #[test]
     fn test_override_thinking_opus_4_6_thinking_suffix_keeps_adaptive() {
         let mut req = make_req("claude-opus-4-6-thinking", None, None);
-        override_thinking_from_model_name(&mut req);
+        override_thinking_from_model_name(&mut req, "-thinking");
         let t = req.thinking.as_ref().unwrap();
         assert_eq!(t.thinking_type, "adaptive");
         assert_eq!(t.display.as_deref(), Some("summarized"));
@@ -2513,7 +3754,7 @@ mod tests {
     #[test]
     fn test_override_thinking_sonnet_thinking_suffix_uses_enabled() {
         let mut req = make_req("claude-sonnet-4-5-thinking", None, None);
-        override_thinking_from_model_name(&mut req);
+        override_thinking_from_model_name(&mut req, "-thinking");
         let t = req.thinking.as_ref().unwrap();
         assert_eq!(t.thinking_type, "enabled");
         assert_eq!(t.display, None);
@@ -2526,12 +3767,12 @@ mod tests {
             "claude-opus-4-7",
             Some(Thinking {
                 thinking_type: "adaptive".to_string(),
-                budget_tokens: 20000,
+                budget_tokens: None,
                 display: Some("omitted".to_string()),
             }),
             None,
         );
-        override_thinking_from_model_name(&mut req);
+        override_thinking_from_model_name(&mut req, "-thinking");
         assert_eq!(req.thinking.unwrap().display.as_deref(), Some("omitted"));
     }
 }
