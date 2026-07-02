@@ -34,7 +34,7 @@ pub struct AssistantResponseEvent {
     #[serde(default)]
     pub content: String,
 
-    /// 捕获其他未使用的字段，确保反序列化兼容性
+    /// 捕获其他未使用的字段，确保反序列化容错
     #[serde(flatten)]
     #[serde(skip_serializing)]
     #[allow(dead_code)]

@@ -11,9 +11,11 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { CredentialLoginSummary } from '@/components/credential-login-summary'
 import { completeIamSsoLogin, startIamSsoLogin } from '@/api/credentials'
-import type { StartIamSsoLoginResponse } from '@/types/api'
+import type { CredentialLoginDetails, StartIamSsoLoginResponse } from '@/types/api'
 import { extractErrorMessage } from '@/lib/utils'
+import { CREDENTIAL_AUTH_LABELS, formatCredentialAuthLabel } from '@/lib/credential-metadata'
 
 interface IdcLoginDialogProps {
   open: boolean
@@ -32,12 +34,16 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess }: IdcLoginDialog
   const [isCompleting, setIsCompleting] = useState(false)
   const [session, setSession] = useState<StartIamSsoLoginResponse | null>(null)
   const [credentialId, setCredentialId] = useState<number | null>(null)
+  const [credentialAuthLabel, setCredentialAuthLabel] = useState('')
+  const [credentialDetails, setCredentialDetails] = useState<CredentialLoginDetails | null>(null)
 
   const reset = () => {
     setStep('form')
     setSession(null)
     setCallbackUrl('')
     setCredentialId(null)
+    setCredentialAuthLabel('')
+    setCredentialDetails(null)
     setIsStarting(false)
     setIsCompleting(false)
   }
@@ -51,11 +57,11 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess }: IdcLoginDialog
     const trimmedRegion = region.trim()
     const trimmedStartUrl = startUrl.trim()
     if (!trimmedRegion) {
-      toast.error('请填写 AWS Region')
+      toast.error('请填写 AWS 区域')
       return
     }
     if (!trimmedStartUrl) {
-      toast.error('请填写 IAM Identity Center 的 SSO Start URL')
+      toast.error(`请填写 ${CREDENTIAL_AUTH_LABELS.iamIdentityCenter} 的 SSO Start URL`)
       return
     }
 
@@ -101,14 +107,18 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess }: IdcLoginDialog
     setIsCompleting(true)
     try {
       const response = await completeIamSsoLogin(session.sessionId, trimmedCallbackUrl)
-      if (!response.success || !response.account?.id) {
+      const details = response.details
+      if (!response.success || !details?.id) {
         toast.error('授权完成失败')
         return
       }
-      setCredentialId(response.account.id)
+      const authLabel = formatCredentialAuthLabel(details.provider, details.authMethod)
+      setCredentialId(details.id)
+      setCredentialAuthLabel(authLabel)
+      setCredentialDetails(details)
       setStep('done')
       onSuccess()
-      toast.success(`登录成功，已添加凭据 #${response.account.id}`)
+      toast.success(`登录成功，已添加${authLabel ? ` ${authLabel}` : ''} 凭据 #${details.id}`)
     } catch (error) {
       toast.error('完成登录失败：' + extractErrorMessage(error))
     } finally {
@@ -120,16 +130,16 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess }: IdcLoginDialog
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle>IAM Identity Center 登录</DialogTitle>
+          <DialogTitle>{CREDENTIAL_AUTH_LABELS.iamIdentityCenter} 登录</DialogTitle>
           <DialogDescription>
-            使用 AWS IAM Identity Center 授权码流程添加企业账号。
+            使用 {CREDENTIAL_AUTH_LABELS.iamIdentityCenter} 授权码流程添加企业凭据。
           </DialogDescription>
         </DialogHeader>
 
         {step === 'form' && (
           <div className="space-y-4 py-2">
             <div className="space-y-1.5">
-              <label htmlFor="idc-region" className="text-sm font-medium">AWS Region</label>
+              <label htmlFor="idc-region" className="text-sm font-medium">AWS 区域</label>
               <Input
                 id="idc-region"
                 placeholder="us-east-1"
@@ -181,7 +191,11 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess }: IdcLoginDialog
           <div className="flex flex-col items-center gap-3 py-4">
             <CheckCircle className="h-10 w-10 text-green-500" />
             <p className="text-sm font-medium">登录成功</p>
-            <p className="text-xs text-muted-foreground">凭据 #{credentialId} 已添加并启用</p>
+            <CredentialLoginSummary
+              credentialId={credentialId}
+              authLabel={credentialAuthLabel}
+              details={credentialDetails}
+            />
           </div>
         )}
 

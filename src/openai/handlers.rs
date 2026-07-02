@@ -24,6 +24,7 @@ use tokio::time::interval;
 
 use crate::anthropic::converter::{
     ConversionError, convert_request_with_thinking_suffix, extract_session_id,
+    map_model_with_thinking_suffix,
 };
 use crate::anthropic::middleware::{AppState, MatchedApiKeyId};
 use crate::anthropic::websearch;
@@ -35,8 +36,8 @@ use crate::kiro::provider::KiroProvider;
 use crate::token;
 
 use super::converter::{
-    chat_completions_to_messages_request, parse_responses_input_messages,
-    responses_openai_messages_to_messages_request,
+    chat_completions_to_messages_request, openai_image_part_to_block,
+    parse_responses_input_messages, responses_openai_messages_to_messages_request,
 };
 use super::responses_store::{StoredResponseDoc, expand_previous_response_history, save_response};
 use super::stream::{OpenAIChatStream, OpenAIResponsesStream};
@@ -208,6 +209,7 @@ struct PreparedRequest {
     input_tokens: i32,
     user_id: Option<String>,
     model: String,
+    thinking_enabled: bool,
     openai_thinking_format: String,
 }
 
@@ -217,12 +219,12 @@ fn prepare_kiro_request(
     fallback_input_tokens: Option<i32>,
     inference_config: Option<InferenceConfig>,
 ) -> Result<PreparedRequest, Response> {
-    let model = payload.model.clone();
     let openai_thinking_format = state.thinking_config.read().openai_format.clone();
 
     let compression = state.compression_config.read().clone();
     let prompt_filter = state.prompt_filter_config.read().clone();
     let thinking_suffix = state.thinking_config.read().suffix.clone();
+    let model = map_model_with_thinking_suffix(&payload.model, &thinking_suffix);
     let conversion_result = match convert_request_with_thinking_suffix(
         &payload,
         &compression,
@@ -288,7 +290,7 @@ fn prepare_kiro_request(
                     threshold = max_body,
                     removed_history_messages = outcome.removed_history_messages,
                     inserted_placeholder = outcome.inserted_placeholder,
-                    "OpenAI 请求体超过阈值，已按兼容策略截断历史"
+                    "OpenAI 请求体超过阈值，已按安全截断策略截断历史"
                 );
             }
             Ok(None) => {}
@@ -305,6 +307,27 @@ fn prepare_kiro_request(
         }
     }
 
+    if max_body > 0 && request_body.len() > max_body {
+        tracing::warn!(
+            conversation_id = kiro_request.conversation_state.conversation_id.as_str(),
+            request_body_bytes = request_body.len(),
+            threshold = max_body,
+            "OpenAI 安全截断策略执行后请求体仍超过安全阈值，拒绝发送"
+        );
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(OpenAIErrorResponse::new(
+                "invalid_request_error",
+                format!(
+                    "Request too large ({} bytes total; limit {}). Reduce current message/tool output or number/size of images.",
+                    request_body.len(),
+                    max_body
+                ),
+            )),
+        )
+            .into_response());
+    }
+
     let input_tokens = fallback_input_tokens.unwrap_or_else(|| {
         token::count_all_tokens(
             payload.model.clone(),
@@ -313,6 +336,11 @@ fn prepare_kiro_request(
             payload.tools.clone(),
         ) as i32
     });
+    let thinking_enabled = payload
+        .thinking
+        .as_ref()
+        .map(|thinking| thinking.is_enabled())
+        .unwrap_or(false);
 
     let raw_user_id = payload.metadata.as_ref().and_then(|m| m.user_id.as_deref());
     let user_id = raw_user_id.and_then(extract_session_id);
@@ -323,6 +351,7 @@ fn prepare_kiro_request(
         input_tokens,
         user_id,
         model,
+        thinking_enabled,
         openai_thinking_format,
     })
 }
@@ -468,12 +497,16 @@ fn openai_chat_part_has_context(part: &serde_json::Value) -> bool {
     let Some(obj) = part.as_object() else {
         return false;
     };
+    if obj
+        .get("text")
+        .and_then(|v| v.as_str())
+        .is_some_and(|text| !text.trim().is_empty())
+    {
+        return true;
+    }
+
     match obj.get("type").and_then(|v| v.as_str()).unwrap_or("") {
-        "text" | "input_text" | "output_text" => obj
-            .get("text")
-            .and_then(|v| v.as_str())
-            .is_some_and(|text| !text.trim().is_empty()),
-        "image" | "image_url" | "input_image" | "file" | "input_file" => {
+        "" | "image" | "image_url" | "input_image" | "file" | "input_file" => {
             openai_chat_part_has_inline_image(part)
         }
         _ => false,
@@ -481,49 +514,7 @@ fn openai_chat_part_has_context(part: &serde_json::Value) -> bool {
 }
 
 fn openai_chat_part_has_inline_image(part: &serde_json::Value) -> bool {
-    let Some(obj) = part.as_object() else {
-        return false;
-    };
-    if let Some(file) = obj.get("file").filter(|v| v.is_object())
-        && openai_chat_part_has_inline_image(file)
-    {
-        return true;
-    }
-    if let Some(source) = obj.get("source").filter(|v| v.is_object())
-        && openai_chat_part_has_inline_image(source)
-    {
-        return true;
-    }
-    for key in ["url", "data", "b64_json", "image_base64"] {
-        if obj.get(key).and_then(|v| v.as_str()).is_some_and(|raw| {
-            let raw = raw.trim();
-            !raw.is_empty()
-                && !raw.contains("[Image")
-                && !raw.starts_with("http://")
-                && !raw.starts_with("https://")
-        }) {
-            return true;
-        }
-    }
-    match obj.get("image_url") {
-        Some(serde_json::Value::String(raw)) => {
-            let raw = raw.trim();
-            !raw.is_empty()
-                && !raw.contains("[Image")
-                && !raw.starts_with("http://")
-                && !raw.starts_with("https://")
-        }
-        Some(serde_json::Value::Object(map)) => {
-            map.get("url").and_then(|v| v.as_str()).is_some_and(|raw| {
-                let raw = raw.trim();
-                !raw.is_empty()
-                    && !raw.contains("[Image")
-                    && !raw.starts_with("http://")
-                    && !raw.starts_with("https://")
-            })
-        }
-        _ => false,
-    }
+    openai_image_part_to_block(part).is_some()
 }
 
 fn estimate_openai_chat_request_input_tokens(req: &ChatCompletionsRequest) -> i32 {
@@ -560,20 +551,28 @@ fn estimate_openai_chat_request_input_tokens(req: &ChatCompletionsRequest) -> i3
     total.min(i32::MAX as u64) as i32
 }
 
-fn estimate_openai_responses_request_input_tokens(req: &ResponsesRequest) -> i32 {
-    let mut total: u64 = 0;
-
-    if let Some(instructions) = &req.instructions {
-        total = total.saturating_add(token::count_tokens(instructions));
-    }
-    total = total.saturating_add(estimate_openai_content_tokens(Some(&req.input)));
-
+fn estimate_openai_responses_final_input_tokens(
+    req: &ResponsesRequest,
+    messages: &[super::types::ChatMessage],
+) -> i32 {
+    let chat_req = ChatCompletionsRequest {
+        model: req.model.clone(),
+        messages: messages.to_vec(),
+        stream: req.stream,
+        max_tokens: req.max_output_tokens,
+        temperature: req.temperature,
+        top_p: req.top_p,
+        stop: None,
+        tools: None,
+        tool_choice: req.tool_choice.clone(),
+        reasoning_effort: None,
+    };
+    let mut total = estimate_openai_chat_request_input_tokens(&chat_req) as u64;
     if let Some(tools) = &req.tools {
         for tool in tools {
             total = total.saturating_add(estimate_responses_tool_tokens(tool));
         }
     }
-
     total.min(i32::MAX as u64) as i32
 }
 
@@ -688,23 +687,32 @@ async fn handle_chat_stream(
     api_key_id: Option<String>,
 ) -> Response {
     let mut api_result = match provider
-        .call_api_stream(&prepared.request_body, prepared.user_id.as_deref())
+        .call_api_stream_with_client_affinity(
+            &prepared.request_body,
+            prepared.user_id.as_deref(),
+            api_key_id.as_deref(),
+        )
         .await
     {
         Ok(r) => r,
-        Err(e) => return map_provider_error(e),
+        Err(e) => {
+            app_state.record_gateway_failure();
+            return map_provider_error(e);
+        }
     };
 
-    let mut ctx = OpenAIChatStream::new(
+    let mut ctx = OpenAIChatStream::new_with_thinking(
         prepared.model,
         prepared.input_tokens,
         prepared.tool_name_map,
+        prepared.thinking_enabled,
         prepared.openai_thinking_format,
     );
     let initial = ctx.initial_chunk();
 
     let cred_permit = api_result._credential_permit.take();
     let glb_permit = api_result._global_permit.take();
+    let proxy_permit = api_result._proxy_permit.take();
     let tm = provider.token_manager().clone();
     let credential_id = api_result.credential_id;
 
@@ -714,6 +722,7 @@ async fn handle_chat_stream(
         initial,
         cred_permit,
         glb_permit,
+        proxy_permit,
         tm,
         credential_id,
         app_state,
@@ -735,6 +744,7 @@ fn create_chat_sse_stream(
     initial: Bytes,
     cred_permit: Option<OwnedSemaphorePermit>,
     glb_permit: Option<OwnedSemaphorePermit>,
+    proxy_permit: Option<OwnedSemaphorePermit>,
     tm: std::sync::Arc<crate::kiro::token_manager::MultiTokenManager>,
     credential_id: u64,
     app_state: AppState,
@@ -752,12 +762,13 @@ fn create_chat_sse_stream(
             interval(Duration::from_secs(PING_INTERVAL_SECS)),
             cred_permit,
             glb_permit,
+            proxy_permit,
             tm,
             credential_id,
             app_state,
             api_key_id,
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping, cred_permit, glb_permit, tm, credential_id, app_state, api_key_id)| async move {
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping, cred_permit, glb_permit, proxy_permit, tm, credential_id, app_state, api_key_id)| async move {
             if finished {
                 return None;
             }
@@ -779,25 +790,28 @@ fn create_chat_sse_stream(
                                     }
                                 }
                             }
-                            Some((stream::iter(bytes_out), (body_stream, ctx, decoder, false, ping, cred_permit, glb_permit, tm, credential_id, app_state, api_key_id)))
+                            Some((stream::iter(bytes_out), (body_stream, ctx, decoder, false, ping, cred_permit, glb_permit, proxy_permit, tm, credential_id, app_state, api_key_id)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
                             drop(cred_permit);
                             drop(glb_permit);
+                            drop(proxy_permit);
                             if let Some(m) = ctx.metering() {
                                 tm.apply_credit_usage(credential_id, m.usage);
                             }
+                            app_state.record_gateway_failure();
                             let final_bytes: Vec<Result<Bytes, Infallible>> = ctx
-                                .finish_events()
+                                .abort_events()
                                 .into_iter()
                                 .map(Ok)
                                 .collect();
-                            Some((stream::iter(final_bytes), (body_stream, ctx, decoder, true, ping, None, None, tm, credential_id, app_state, api_key_id)))
+                            Some((stream::iter(final_bytes), (body_stream, ctx, decoder, true, ping, None, None, None, tm, credential_id, app_state, api_key_id)))
                         }
                         None => {
                             drop(cred_permit);
                             drop(glb_permit);
+                            drop(proxy_permit);
                             if let Some(m) = ctx.metering() {
                                 tm.apply_credit_usage(credential_id, m.usage);
                             }
@@ -810,13 +824,13 @@ fn create_chat_sse_stream(
                                 .into_iter()
                                 .map(Ok)
                                 .collect();
-                            Some((stream::iter(final_bytes), (body_stream, ctx, decoder, true, ping, None, None, tm, credential_id, app_state, api_key_id)))
+                            Some((stream::iter(final_bytes), (body_stream, ctx, decoder, true, ping, None, None, None, tm, credential_id, app_state, api_key_id)))
                         }
                     }
                 }
                 _ = ping.tick() => {
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping, cred_permit, glb_permit, tm, credential_id, app_state, api_key_id)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping, cred_permit, glb_permit, proxy_permit, tm, credential_id, app_state, api_key_id)))
                 }
             }
         },
@@ -833,13 +847,23 @@ async fn handle_chat_non_stream(
     api_key_id: Option<String>,
 ) -> Response {
     let api_result = match provider
-        .call_api(&prepared.request_body, prepared.user_id.as_deref())
+        .call_api_with_client_affinity(
+            &prepared.request_body,
+            prepared.user_id.as_deref(),
+            api_key_id.as_deref(),
+        )
         .await
     {
         Ok(r) => r,
-        Err(e) => return map_provider_error(e),
+        Err(e) => {
+            app_state.record_gateway_failure();
+            return map_provider_error(e);
+        }
     };
 
+    let _cred_permit = api_result._credential_permit;
+    let _glb_permit = api_result._global_permit;
+    let _proxy_permit = api_result._proxy_permit;
     let body_bytes = match api_result.response.bytes().await {
         Ok(b) => b,
         Err(e) => {
@@ -854,10 +878,11 @@ async fn handle_chat_non_stream(
         }
     };
 
-    let mut ctx = OpenAIChatStream::new(
+    let mut ctx = OpenAIChatStream::new_with_thinking(
         prepared.model.clone(),
         prepared.input_tokens,
         prepared.tool_name_map,
+        prepared.thinking_enabled,
         prepared.openai_thinking_format.clone(),
     );
     let mut decoder = EventStreamDecoder::new();
@@ -872,6 +897,7 @@ async fn handle_chat_non_stream(
             }
         }
     }
+    let _ = ctx.flush_pending();
 
     if let Some(m) = ctx.metering() {
         provider
@@ -924,7 +950,12 @@ async fn handle_chat_non_stream(
         model: prepared.model,
         choices: vec![ChatChoice {
             index: 0,
-            message: build_chat_non_stream_message(text, reasoning_content, tool_calls),
+            message: build_chat_non_stream_message(
+                text,
+                reasoning_content,
+                tool_calls,
+                &prepared.openai_thinking_format,
+            ),
             finish_reason,
         }],
         usage: ChatUsage {
@@ -941,6 +972,7 @@ fn build_chat_non_stream_message(
     text: String,
     reasoning_content: String,
     tool_calls: Option<Vec<ChatToolCall>>,
+    thinking_format: &str,
 ) -> ChatChoiceMessage {
     if tool_calls.is_some() {
         return ChatChoiceMessage {
@@ -951,15 +983,34 @@ fn build_chat_non_stream_message(
         };
     }
 
+    if !reasoning_content.is_empty() {
+        return match thinking_format {
+            "thinking" => ChatChoiceMessage {
+                role: "assistant",
+                content: Some(format!("<thinking>{reasoning_content}</thinking>{text}")),
+                reasoning_content: None,
+                tool_calls: None,
+            },
+            "think" => ChatChoiceMessage {
+                role: "assistant",
+                content: Some(format!("<think>{reasoning_content}</think>{text}")),
+                reasoning_content: None,
+                tool_calls: None,
+            },
+            _ => ChatChoiceMessage {
+                role: "assistant",
+                content: Some(text),
+                reasoning_content: Some(reasoning_content),
+                tool_calls: None,
+            },
+        };
+    }
+
     ChatChoiceMessage {
         role: "assistant",
         content: Some(text),
-        reasoning_content: if reasoning_content.is_empty() {
-            None
-        } else {
-            Some(reasoning_content)
-        },
-        tool_calls,
+        reasoning_content: None,
+        tool_calls: None,
     }
 }
 
@@ -994,9 +1045,6 @@ pub async fn post_responses(
 
     let stream_flag = req.stream;
     let previous_response_id = req.previous_response_id.clone();
-    let responses_fallback_input_tokens = previous_response_id
-        .is_none()
-        .then(|| estimate_openai_responses_request_input_tokens(&req));
     let store_ctx = ResponsesStoreContext {
         store_dir: state.responses_store_dir.clone(),
         store: req.store.unwrap_or(true),
@@ -1056,6 +1104,11 @@ pub async fn post_responses(
         }
     };
     final_messages.extend(input_messages);
+
+    let responses_fallback_input_tokens = Some(estimate_openai_responses_final_input_tokens(
+        &req,
+        &final_messages,
+    ));
 
     let mut messages_request =
         match responses_openai_messages_to_messages_request(&req, final_messages) {
@@ -1120,19 +1173,27 @@ async fn handle_responses_stream(
     api_key_id: Option<String>,
 ) -> Response {
     let mut api_result = match provider
-        .call_api_stream(&prepared.request_body, prepared.user_id.as_deref())
+        .call_api_stream_with_client_affinity(
+            &prepared.request_body,
+            prepared.user_id.as_deref(),
+            api_key_id.as_deref(),
+        )
         .await
     {
         Ok(r) => r,
-        Err(e) => return map_provider_error(e),
+        Err(e) => {
+            app_state.record_gateway_failure();
+            return map_provider_error(e);
+        }
     };
 
-    let mut ctx = OpenAIResponsesStream::new(
+    let mut ctx = OpenAIResponsesStream::new_with_thinking(
         prepared.model,
         prepared.input_tokens,
         prepared.tool_name_map,
         store_ctx.previous_response_id.clone(),
         store_ctx.metadata.clone(),
+        prepared.thinking_enabled,
         prepared.openai_thinking_format,
     );
     ctx.set_instructions(store_ctx.instructions.clone());
@@ -1140,6 +1201,7 @@ async fn handle_responses_stream(
 
     let cred_permit = api_result._credential_permit.take();
     let glb_permit = api_result._global_permit.take();
+    let proxy_permit = api_result._proxy_permit.take();
     let tm = provider.token_manager().clone();
     let credential_id = api_result.credential_id;
 
@@ -1149,6 +1211,7 @@ async fn handle_responses_stream(
         initial,
         cred_permit,
         glb_permit,
+        proxy_permit,
         tm,
         credential_id,
         store_ctx,
@@ -1171,6 +1234,7 @@ fn create_responses_sse_stream(
     initial: Vec<Bytes>,
     cred_permit: Option<OwnedSemaphorePermit>,
     glb_permit: Option<OwnedSemaphorePermit>,
+    proxy_permit: Option<OwnedSemaphorePermit>,
     tm: std::sync::Arc<crate::kiro::token_manager::MultiTokenManager>,
     credential_id: u64,
     store_ctx: ResponsesStoreContext,
@@ -1194,13 +1258,14 @@ fn create_responses_sse_stream(
             interval(Duration::from_secs(PING_INTERVAL_SECS)),
             cred_permit,
             glb_permit,
+            proxy_permit,
             tm,
             credential_id,
             store_ctx,
             app_state,
             api_key_id,
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping, cred_permit, glb_permit, tm, credential_id, store_ctx, app_state, api_key_id)| async move {
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping, cred_permit, glb_permit, proxy_permit, tm, credential_id, store_ctx, app_state, api_key_id)| async move {
             if finished {
                 return None;
             }
@@ -1222,25 +1287,28 @@ fn create_responses_sse_stream(
                                     }
                                 }
                             }
-                            Some((stream::iter(bytes_out), (body_stream, ctx, decoder, false, ping, cred_permit, glb_permit, tm, credential_id, store_ctx, app_state, api_key_id)))
+                            Some((stream::iter(bytes_out), (body_stream, ctx, decoder, false, ping, cred_permit, glb_permit, proxy_permit, tm, credential_id, store_ctx, app_state, api_key_id)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
                             drop(cred_permit);
                             drop(glb_permit);
+                            drop(proxy_permit);
                             if let Some(m) = ctx.metering() {
                                 tm.apply_credit_usage(credential_id, m.usage);
                             }
+                            app_state.record_gateway_failure();
                             let final_bytes: Vec<Result<Bytes, Infallible>> = ctx
-                                .finish_events()
+                                .failed_events(e.to_string())
                                 .into_iter()
                                 .map(Ok)
                                 .collect();
-                            Some((stream::iter(final_bytes), (body_stream, ctx, decoder, true, ping, None, None, tm, credential_id, store_ctx, app_state, api_key_id)))
+                            Some((stream::iter(final_bytes), (body_stream, ctx, decoder, true, ping, None, None, None, tm, credential_id, store_ctx, app_state, api_key_id)))
                         }
                         None => {
                             drop(cred_permit);
                             drop(glb_permit);
+                            drop(proxy_permit);
                             if let Some(m) = ctx.metering() {
                                 tm.apply_credit_usage(credential_id, m.usage);
                             }
@@ -1248,6 +1316,11 @@ fn create_responses_sse_stream(
                             let tokens = i64::from(ctx.final_input_tokens())
                                 + i64::from(ctx.final_output_tokens());
                             app_state.record_api_key_usage(api_key_id.as_deref(), tokens, credits);
+                            let final_bytes: Vec<Result<Bytes, Infallible>> = ctx
+                                .finish_events()
+                                .into_iter()
+                                .map(Ok)
+                                .collect();
                             persist_response_if_needed(
                                 &store_ctx,
                                 ctx.response_id(),
@@ -1257,18 +1330,13 @@ fn create_responses_sse_stream(
                                 ctx.completed_output_items(),
                                 ctx.completed_usage(),
                             );
-                            let final_bytes: Vec<Result<Bytes, Infallible>> = ctx
-                                .finish_events()
-                                .into_iter()
-                                .map(Ok)
-                                .collect();
-                            Some((stream::iter(final_bytes), (body_stream, ctx, decoder, true, ping, None, None, tm, credential_id, store_ctx, app_state, api_key_id)))
+                            Some((stream::iter(final_bytes), (body_stream, ctx, decoder, true, ping, None, None, None, tm, credential_id, store_ctx, app_state, api_key_id)))
                         }
                     }
                 }
                 _ = ping.tick() => {
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping, cred_permit, glb_permit, tm, credential_id, store_ctx, app_state, api_key_id)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping, cred_permit, glb_permit, proxy_permit, tm, credential_id, store_ctx, app_state, api_key_id)))
                 }
             }
         },
@@ -1286,13 +1354,23 @@ async fn handle_responses_non_stream(
     api_key_id: Option<String>,
 ) -> Response {
     let api_result = match provider
-        .call_api(&prepared.request_body, prepared.user_id.as_deref())
+        .call_api_with_client_affinity(
+            &prepared.request_body,
+            prepared.user_id.as_deref(),
+            api_key_id.as_deref(),
+        )
         .await
     {
         Ok(r) => r,
-        Err(e) => return map_provider_error(e),
+        Err(e) => {
+            app_state.record_gateway_failure();
+            return map_provider_error(e);
+        }
     };
 
+    let _cred_permit = api_result._credential_permit;
+    let _glb_permit = api_result._global_permit;
+    let _proxy_permit = api_result._proxy_permit;
     let body_bytes = match api_result.response.bytes().await {
         Ok(b) => b,
         Err(e) => {
@@ -1307,12 +1385,13 @@ async fn handle_responses_non_stream(
         }
     };
 
-    let mut ctx = OpenAIResponsesStream::new(
+    let mut ctx = OpenAIResponsesStream::new_with_thinking(
         prepared.model.clone(),
         prepared.input_tokens,
         prepared.tool_name_map,
         store_ctx.previous_response_id.clone(),
         store_ctx.metadata.clone(),
+        prepared.thinking_enabled,
         prepared.openai_thinking_format,
     );
     ctx.set_instructions(store_ctx.instructions.clone());
@@ -1328,6 +1407,7 @@ async fn handle_responses_non_stream(
             }
         }
     }
+    let _ = ctx.flush_pending();
 
     if let Some(m) = ctx.metering() {
         provider
@@ -1602,7 +1682,7 @@ mod tests {
             false,
             false,
             std::sync::Arc::new(parking_lot::RwLock::new(
-                crate::anthropic::middleware::PromptCacheRuntime::new(300, false),
+                crate::anthropic::middleware::PromptCacheRuntime::new(300, false, 0.85),
             )),
             crate::anthropic::middleware::ThinkingRuntimeConfig {
                 suffix: "-thinking".to_string(),
@@ -1723,7 +1803,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_openai_chat_request_shape_rejects_image_placeholder_like_kiro_go() {
+    fn test_validate_openai_chat_request_shape_rejects_image_placeholder() {
         let req = chat_req(serde_json::json!({
             "model": "claude-sonnet-4.6",
             "messages": [{
@@ -1744,7 +1824,62 @@ mod tests {
     }
 
     #[test]
-    fn chat_non_stream_message_drops_text_and_reasoning_when_tool_calls_like_kiro_go() {
+    fn test_validate_openai_chat_request_shape_accepts_unknown_text_part() {
+        let req = chat_req(serde_json::json!({
+            "model": "claude-sonnet-4.6",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "custom_text",
+                    "text": "keep this text"
+                }]
+            }]
+        }));
+
+        assert_eq!(validate_openai_chat_request_shape(&req), None);
+    }
+
+    #[test]
+    fn test_validate_openai_chat_request_shape_rejects_invalid_inline_image() {
+        let req = chat_req(serde_json::json!({
+            "model": "claude-sonnet-4.6",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "input_image",
+                    "b64_json": "not-base64!!",
+                    "media_type": "image/png"
+                }]
+            }]
+        }));
+
+        assert_eq!(
+            validate_openai_chat_request_shape(&req),
+            Some("at least one non-empty user message is required")
+        );
+    }
+
+    #[test]
+    fn test_validate_openai_chat_request_shape_accepts_untyped_inline_image() {
+        let req = chat_req(serde_json::json!({
+            "model": "claude-sonnet-4.6",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "iVBORw0KGgo="
+                    }
+                }]
+            }]
+        }));
+
+        assert_eq!(validate_openai_chat_request_shape(&req), None);
+    }
+
+    #[test]
+    fn chat_non_stream_message_drops_text_and_reasoning_when_tool_calls() {
         let message = build_chat_non_stream_message(
             "partial text".to_string(),
             "hidden reasoning".to_string(),
@@ -1756,6 +1891,7 @@ mod tests {
                     arguments: "{\"q\":\"x\"}".to_string(),
                 },
             }]),
+            "thinking",
         );
 
         assert_eq!(message.content, None);
@@ -1779,6 +1915,7 @@ mod tests {
             "final text".to_string(),
             "hidden reasoning".to_string(),
             None,
+            "reasoning_content",
         );
 
         assert_eq!(message.content.as_deref(), Some("final text"));
@@ -1790,8 +1927,36 @@ mod tests {
     }
 
     #[test]
-    fn chat_non_stream_message_serializes_empty_content_without_tool_calls_like_kiro_go() {
-        let message = build_chat_non_stream_message(String::new(), String::new(), None);
+    fn chat_non_stream_message_formats_thinking_tags() {
+        let thinking = build_chat_non_stream_message(
+            "final text".to_string(),
+            "hidden reasoning".to_string(),
+            None,
+            "thinking",
+        );
+        assert_eq!(
+            thinking.content.as_deref(),
+            Some("<thinking>hidden reasoning</thinking>final text")
+        );
+        assert_eq!(thinking.reasoning_content, None);
+
+        let think = build_chat_non_stream_message(
+            "final text".to_string(),
+            "hidden reasoning".to_string(),
+            None,
+            "think",
+        );
+        assert_eq!(
+            think.content.as_deref(),
+            Some("<think>hidden reasoning</think>final text")
+        );
+        assert_eq!(think.reasoning_content, None);
+    }
+
+    #[test]
+    fn chat_non_stream_message_serializes_empty_content_without_tool_calls() {
+        let message =
+            build_chat_non_stream_message(String::new(), String::new(), None, "reasoning_content");
 
         let value = serde_json::to_value(&message).expect("message serializes");
         assert_eq!(value["content"], "");
@@ -1861,7 +2026,7 @@ mod tests {
     }
 
     #[test]
-    fn test_estimate_openai_chat_request_input_tokens_recurses_nested_content_like_kiro_go() {
+    fn test_estimate_openai_chat_request_input_tokens_recurses_nested_content() {
         let req = chat_req(serde_json::json!({
             "model": "claude-sonnet-4.6",
             "messages": [{
@@ -1881,11 +2046,12 @@ mod tests {
     }
 
     #[test]
-    fn test_estimate_openai_responses_request_input_tokens_counts_tools_and_instructions() {
+    fn test_estimate_openai_responses_final_input_tokens_counts_tools_and_instructions() {
         let base = responses_req(serde_json::json!({
             "model": "claude-sonnet-4.6",
             "input": "hello"
         }));
+        let base_messages = parse_responses_input_messages(&base.input).unwrap();
         let with_tools = responses_req(serde_json::json!({
             "model": "claude-sonnet-4.6",
             "instructions": "be concise",
@@ -1902,15 +2068,46 @@ mod tests {
                 }
             }]
         }));
+        let mut final_messages = vec![crate::openai::types::ChatMessage {
+            role: "system".to_string(),
+            content: Some(serde_json::Value::String("be concise".to_string())),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+        final_messages.extend(parse_responses_input_messages(&with_tools.input).unwrap());
 
         assert!(
-            estimate_openai_responses_request_input_tokens(&with_tools)
-                > estimate_openai_responses_request_input_tokens(&base)
+            estimate_openai_responses_final_input_tokens(&with_tools, &final_messages)
+                > estimate_openai_responses_final_input_tokens(&base, &base_messages)
         );
     }
 
     #[test]
-    fn test_estimate_openai_responses_request_input_tokens_counts_namespace_tools() {
+    fn test_estimate_openai_responses_final_input_tokens_uses_parsed_input() {
+        let req = responses_req(serde_json::json!({
+            "model": "claude-sonnet-4.6",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "hello"},
+                        {"type": "input_text", "text": "world"}
+                    ]
+                }
+            ]
+        }));
+        let messages = parse_responses_input_messages(&req.input).unwrap();
+
+        assert_eq!(
+            estimate_openai_responses_final_input_tokens(&req, &messages),
+            token::count_tokens("helloworld") as i32
+        );
+    }
+
+    #[test]
+    fn test_estimate_openai_responses_final_input_tokens_counts_namespace_tools() {
         let req = responses_req(serde_json::json!({
             "model": "claude-sonnet-4.6",
             "input": "hello",
@@ -1928,16 +2125,17 @@ mod tests {
             }]
         }));
         let expected_tool_tokens = estimate_responses_tool_tokens(&req.tools.as_ref().unwrap()[0]);
+        let messages = parse_responses_input_messages(&req.input).unwrap();
 
         assert!(expected_tool_tokens > 0);
         assert!(
-            estimate_openai_responses_request_input_tokens(&req)
+            estimate_openai_responses_final_input_tokens(&req, &messages)
                 >= token::count_tokens("hello") as i32 + expected_tool_tokens as i32
         );
     }
 
     #[test]
-    fn test_prepare_kiro_request_truncates_openai_payload_like_kiro_go() {
+    fn test_prepare_kiro_request_truncates_openai_payload() {
         let mut compression = crate::model::config::CompressionConfig::default();
         compression.max_request_body_bytes = 50_000;
         let state = test_state_with_compression(compression);
@@ -1975,7 +2173,35 @@ mod tests {
     }
 
     #[test]
-    fn test_prepare_kiro_request_serializes_openai_inference_config_like_kiro_go() {
+    fn test_prepare_kiro_request_rejects_when_openai_payload_still_oversized_after_truncation() {
+        let mut compression = crate::model::config::CompressionConfig::default();
+        compression.max_request_body_bytes = 64;
+        let state = test_state_with_compression(compression);
+
+        let req = chat_req(serde_json::json!({
+            "model": "claude-sonnet-4.6",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "oversized_tool",
+                    "description": "x".repeat(1024),
+                    "parameters": { "type": "object" }
+                }
+            }]
+        }));
+        let messages_request = chat_completions_to_messages_request(&req);
+
+        let err = match prepare_kiro_request(&state, messages_request, None, None) {
+            Ok(_) => panic!("still-oversized payload should be rejected locally"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_prepare_kiro_request_serializes_openai_inference_config() {
         let state = test_state_with_compression(crate::model::config::CompressionConfig::default());
         let req = chat_req(serde_json::json!({
             "model": "claude-sonnet-4.6",
@@ -1998,7 +2224,27 @@ mod tests {
     }
 
     #[test]
-    fn test_responses_continuation_keeps_new_instructions_like_kiro_go() {
+    fn test_prepare_kiro_request_reports_mapped_model() {
+        let state = test_state_with_compression(crate::model::config::CompressionConfig::default());
+        let req = chat_req(serde_json::json!({
+            "model": "claude-opus-4-8-thinking",
+            "messages": [{"role": "user", "content": "hello"}]
+        }));
+        let messages_request = chat_completions_to_messages_request(&req);
+
+        let prepared = prepare_kiro_request(&state, messages_request, None, None).expect("prepare");
+        let body: serde_json::Value =
+            serde_json::from_str(&prepared.request_body).expect("request body json");
+
+        assert_eq!(prepared.model, "claude-opus-4.8");
+        assert_eq!(
+            body["conversationState"]["currentMessage"]["userInputMessage"]["modelId"],
+            "claude-opus-4.8"
+        );
+    }
+
+    #[test]
+    fn test_responses_continuation_keeps_new_instructions() {
         let dir = std::env::temp_dir().join(format!(
             "xkiro-responses-continuation-test-{}",
             std::time::SystemTime::now()

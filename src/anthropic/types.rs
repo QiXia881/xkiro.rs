@@ -57,7 +57,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn authentication_error_message_matches_kiro_go_claude_route() {
+    fn authentication_error_message_matches_claude_route() {
         let response = ErrorResponse::authentication_error();
 
         assert_eq!(response.error.error_type, "authentication_error");
@@ -65,7 +65,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_input_schema_accepts_non_object_like_kiro_go() {
+    fn tool_input_schema_accepts_non_object() {
         let req: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model": "claude-sonnet-4.5",
             "max_tokens": 100,
@@ -80,6 +80,90 @@ mod tests {
 
         let tools = req.tools.expect("tools should be present");
         assert!(tools[0].input_schema.is_empty());
+    }
+
+    #[test]
+    fn count_tokens_request_accepts_missing_model_and_messages() {
+        let req: CountTokensRequest = serde_json::from_value(serde_json::json!({}))
+            .expect("count_tokens should accept ClaudeRequest zero-value shape");
+
+        assert_eq!(req.model, "");
+        assert_eq!(req.max_tokens, 0);
+        assert!(req.messages.is_empty());
+    }
+
+    #[test]
+    fn messages_request_accepts_missing_fields_as_zero_values() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({}))
+            .expect("messages should accept ClaudeRequest zero-value shape");
+
+        assert_eq!(req.model, "");
+        assert_eq!(req.max_tokens, 0);
+        assert!(req.messages.is_empty());
+    }
+
+    #[test]
+    fn messages_request_accepts_null_scalars_as_zero_values() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": null,
+            "max_tokens": null,
+            "messages": [
+                { "role": null, "content": null }
+            ],
+            "thinking": {
+                "type": null
+            },
+            "tools": [{
+                "name": null,
+                "description": null,
+                "input_schema": null
+            }]
+        }))
+        .expect("messages should accept null zero-value fields");
+
+        assert_eq!(req.model, "");
+        assert_eq!(req.max_tokens, 0);
+        assert_eq!(req.messages[0].role, "");
+        assert!(req.messages[0].content.is_null());
+        assert_eq!(req.thinking.as_ref().unwrap().thinking_type, "");
+        let tool = &req.tools.as_ref().unwrap()[0];
+        assert_eq!(tool.name, "");
+        assert_eq!(tool.description, "");
+        assert!(tool.input_schema.is_empty());
+    }
+
+    #[test]
+    fn count_tokens_request_accepts_null_model_and_messages() {
+        let req: CountTokensRequest = serde_json::from_value(serde_json::json!({
+            "model": null,
+            "max_tokens": null,
+            "messages": null
+        }))
+        .expect("count_tokens should accept null zero-value shape");
+
+        assert_eq!(req.model, "");
+        assert_eq!(req.max_tokens, 0);
+        assert!(req.messages.is_empty());
+    }
+
+    #[test]
+    fn thinking_helpers_trim_and_fold_case() {
+        let thinking = Thinking {
+            thinking_type: " Adaptive ".to_string(),
+            budget_tokens: None,
+            display: Some(" omitted ".to_string()),
+        };
+
+        assert_eq!(thinking.normalized_type(), "adaptive");
+        assert!(thinking.is_enabled());
+        assert_eq!(thinking.effective_display(), "omitted");
+
+        let empty_display = Thinking {
+            thinking_type: "enabled".to_string(),
+            budget_tokens: Some(1024),
+            display: Some("  ".to_string()),
+        };
+        assert_eq!(empty_display.effective_display(), "summarized");
     }
 }
 
@@ -154,7 +238,11 @@ pub struct ModelsResponse {
 /// Thinking 配置
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Thinking {
-    #[serde(rename = "type")]
+    #[serde(
+        rename = "type",
+        default,
+        deserialize_with = "deserialize_nullable_string"
+    )]
     pub thinking_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub budget_tokens: Option<i32>,
@@ -168,18 +256,26 @@ pub struct Thinking {
 }
 
 impl Thinking {
+    pub fn normalized_type(&self) -> String {
+        self.thinking_type.trim().to_lowercase()
+    }
+
     /// 是否启用了 thinking（enabled 或 adaptive）
     pub fn is_enabled(&self) -> bool {
-        self.thinking_type == "enabled" || self.thinking_type == "adaptive"
+        matches!(self.normalized_type().as_str(), "enabled" | "adaptive")
     }
 
     /// 有效 display 值（None 时回退 "summarized"，确保 Kiro 能吐 thinking 文本）
     pub fn effective_display(&self) -> &str {
-        self.display.as_deref().unwrap_or("summarized")
+        self.display
+            .as_deref()
+            .map(str::trim)
+            .filter(|display| !display.is_empty())
+            .unwrap_or("summarized")
     }
 }
 
-/// 保留客户端原始 `display` 值，边界校验层负责按 Kiro-Go 语义返回 400。
+/// 保留客户端原始 `display` 值，边界校验层负责返回 400。
 fn deserialize_display<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -211,12 +307,15 @@ pub struct Metadata {
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct MessagesRequest {
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub model: String,
+    #[serde(default, deserialize_with = "deserialize_nullable_i32")]
     pub max_tokens: i32,
     #[serde(default)]
     pub temperature: Option<f32>,
     #[serde(default)]
     pub top_p: Option<f32>,
+    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
     pub messages: Vec<Message>,
     #[serde(default)]
     pub stream: bool,
@@ -292,14 +391,17 @@ where
 /// 消息
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Message {
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub role: String,
     /// 可以是 string 或 ContentBlock 数组
+    #[serde(default)]
     pub content: serde_json::Value,
 }
 
 /// 系统消息
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SystemMessage {
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub text: String,
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub block_type: Option<String>,
@@ -318,10 +420,10 @@ pub struct Tool {
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub tool_type: Option<String>,
     /// 工具名称
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub name: String,
     /// 工具描述（普通工具必需，WebSearch 工具可选）
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub description: String,
     /// 输入参数 schema（普通工具必需，WebSearch 工具无此字段）
     #[serde(default, deserialize_with = "deserialize_input_schema")]
@@ -345,6 +447,28 @@ where
         return Ok(HashMap::new());
     };
     Ok(obj.into_iter().collect())
+}
+
+fn deserialize_nullable_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn deserialize_nullable_i32<'de, D>(deserializer: D) -> Result<i32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<i32>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn deserialize_nullable_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 impl Tool {
@@ -398,9 +522,11 @@ pub struct ImageSource {
 /// Token 计数请求
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CountTokensRequest {
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub model: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_i32")]
     pub max_tokens: i32,
+    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
     pub messages: Vec<Message>,
     #[serde(
         default,

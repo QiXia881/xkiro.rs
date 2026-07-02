@@ -24,7 +24,7 @@ use super::types::{ContentBlock, MessagesRequest};
 
 /// 规范化 JSON Schema，修复 MCP 工具定义中常见的类型问题
 ///
-/// 对齐 Kiro-Go `ensureObjectSchema()` + `cleanSchema()`:
+/// Schema 规范化规则:
 /// - 确保顶层 `type: "object"`
 /// - 递归删除 `additionalProperties`
 /// - 递归删除空 `required` 数组
@@ -47,12 +47,12 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     serde_json::Value::Object(obj)
 }
 
-/// 递归清洗 schema（对齐 Kiro-Go `cleanSchema()`）
+/// 递归清洗 schema
 ///
 /// - 删除 `additionalProperties`
 /// - `required` 为空数组或非数组时删除
 fn clean_schema(obj: &mut serde_json::Map<String, serde_json::Value>) {
-    // 对齐 Kiro-Go: 直接删除 additionalProperties
+    // 直接删除 additionalProperties
     obj.remove("additionalProperties");
 
     // required 必须是非空数组，否则删除
@@ -378,51 +378,6 @@ fn create_placeholder_tool(name: &str) -> Tool {
     }
 }
 
-/// Codex App / 其他客户端可能发 `developer` / `system` / 自定义角色，
-/// Kiro 后端只支持 `user` 和 `assistant`。把非这两个的角色统一改写为 `user`。
-///
-/// 全部已是 user/assistant → 返回 `Cow::Borrowed`，零拷贝。
-/// 否则克隆并改写。
-fn normalize_message_roles(
-    messages: &[super::types::Message],
-) -> std::borrow::Cow<'_, [super::types::Message]> {
-    let needs_normalize = messages
-        .iter()
-        .any(|m| m.role != "user" && m.role != "assistant");
-    if !needs_normalize {
-        return std::borrow::Cow::Borrowed(messages);
-    }
-
-    let mut converted = 0usize;
-    // 诊断：统计被归一化的 role 种类与数量，便于排查不同客户端/模型的请求差异。
-    // 注意：只记 role 种类直方图，不记 content —— content 含文件路径/工具输入等敏感数据，
-    // INFO 级别打 content 会造成代理日志泄露请求体。
-    let mut role_hist: std::collections::BTreeMap<String, usize> =
-        std::collections::BTreeMap::new();
-    let normalized: Vec<super::types::Message> = messages
-        .iter()
-        .map(|m| {
-            if m.role == "user" || m.role == "assistant" {
-                m.clone()
-            } else {
-                converted += 1;
-                let original = m.role.clone();
-                *role_hist.entry(original.clone()).or_insert(0) += 1;
-                let mut cloned = m.clone();
-                cloned.role = "user".to_string();
-                tracing::debug!(role = %original, "归一化未知 role 为 user");
-                cloned
-            }
-        })
-        .collect();
-    tracing::info!(
-        count = converted,
-        roles = %format!("{:?}", role_hist),
-        "Codex 兼容：未知 role → user"
-    );
-    std::borrow::Cow::Owned(normalized)
-}
-
 /// 将 Anthropic 请求转换为 Kiro 请求
 pub fn convert_request(
     req: &MessagesRequest,
@@ -448,18 +403,10 @@ pub fn convert_request_with_thinking_suffix(
         return Err(ConversionError::EmptyMessages);
     }
 
-    // 2.1. Codex App 兼容：把非 user/assistant 角色（developer/system/tool 等）
-    // 归一化为 user。Kiro 后端只接受 user/assistant，未知角色直接喂会被静默丢弃
-    // 或触发 "Improperly formed request"。下游的 user/assistant buffer 合并机制
-    // 会自动把连续 user 拼成一条，无需额外占位。参考 jwadow/kiro-gateway PR #64。
-    let normalized_messages = normalize_message_roles(&req.messages);
-    let source_messages: &[super::types::Message] = match &normalized_messages {
-        std::borrow::Cow::Borrowed(_) => &req.messages,
-        std::borrow::Cow::Owned(v) => v,
-    };
+    let source_messages: &[super::types::Message] = &req.messages;
 
-    // 2.5. Handler 已按 Kiro-Go 拒绝真实 assistant-final prefill。
-    // 转换层保留修剪能力，只用于内部归一化后仍混入的孤立 assistant 尾部。
+    // 2.5. Handler 已在边界拒绝真实 assistant-final prefill。
+    // 转换层保留修剪能力，兜底处理内部路径混入的孤立 assistant 尾部。
     let messages: &[_] = if source_messages.last().is_some_and(|m| m.role != "user") {
         tracing::info!("检测到末尾 assistant 消息（prefill），静默丢弃");
         let last_user_idx = source_messages
@@ -498,7 +445,7 @@ pub fn convert_request_with_thinking_suffix(
     }
 
     // 3. 生成会话 ID 和代理 ID
-    // 优先从 metadata.user_id 中提取 session UUID；否则对齐 Kiro-Go 基于首个真实 user anchor 稳定派生。
+    // 优先从 metadata.user_id 中提取 session UUID；否则基于首个真实 user anchor 稳定派生。
     let conversation_id = req
         .metadata
         .as_ref()
@@ -520,7 +467,7 @@ pub fn convert_request_with_thinking_suffix(
     let last_message = messages.last().unwrap();
     let (text_content, images, tool_results) = process_message_content(&last_message.content)?;
 
-    // 7. 转换工具定义：Claude 路径 sanitize+shorten，OpenAI 路径只 shorten，对齐 Kiro-Go。
+    // 7. 转换工具定义：Claude 路径 sanitize+shorten，OpenAI 路径只 shorten。
     let mut tool_name_map = HashMap::new();
     let preserve_tool_names = req
         .metadata
@@ -544,7 +491,7 @@ pub fn convert_request_with_thinking_suffix(
         },
     )?;
 
-    // 8. 清洗历史消息（对齐 Kiro-Go sanitizeKiroHistory）
+    // 8. 清洗历史消息
     // 只有当前 toolResults 正好回答最后一个 history assistant toolUse 时，才保留结构化结果。
     let current_tool_result_ids = collect_tool_result_ids(&tool_results);
     let keep_current_tool_results =
@@ -1085,17 +1032,17 @@ fn current_tool_results_match_last_assistant(
 
 /// Kiro API 工具名称最大长度限制
 ///
-/// 对齐 Kiro-Go `shortenToolName()` 阈值: 64 字节
+/// 工具名缩短阈值: 64 字节
 const TOOL_NAME_MAX_LEN: usize = 64;
 
 /// Kiro API 工具描述最大长度限制
 ///
-/// 对齐 Kiro-Go `maxToolDescLen = 10237`
+/// 工具描述最大长度: 10237 字符
 const MAX_TOOL_DESC_LEN: usize = 10237;
 
 /// 将工具名称标准化为 camelCase
 ///
-/// 对齐 Kiro-Go `sanitizeToolName()`:
+/// 工具名标准化规则:
 /// Kiro 工具名必须是纯 camelCase（无下划线和短横线）。
 /// 分隔符（_, -, 多下划线命名空间前缀）转换为 camelCase 边界。
 fn sanitize_tool_name(name: &str) -> String {
@@ -1133,7 +1080,7 @@ fn sanitize_tool_name(name: &str) -> String {
 
 /// 缩短超长工具名称
 ///
-/// 对齐 Kiro-Go `shortenToolName()`:
+/// 工具名缩短规则:
 /// - MCP 工具: mcp__server__tool → mcp__tool
 /// - 其他: 硬截断到 64 字节
 fn shorten_tool_name(name: &str) -> String {
@@ -1167,7 +1114,7 @@ fn truncate_to_utf8_boundary(value: &str, max_bytes: usize) -> &str {
 
 /// 工具名称处理：Claude 路径先 camelCase 标准化再缩短；OpenAI 路径只缩短。
 ///
-/// 对齐 Kiro-Go：`convertClaudeTools()` 使用 sanitize+shorten，`convertOpenAITools()` 只使用 shorten。
+/// Claude 工具名使用 sanitize+shorten，OpenAI 工具名只使用 shorten。
 fn map_tool_name(
     name: &str,
     tool_name_map: &mut HashMap<String, String>,
@@ -1187,7 +1134,7 @@ fn map_tool_name(
 
 /// 转换工具定义
 ///
-/// 对齐 Kiro-Go:
+/// 工具定义转换规则:
 /// - Claude 工具名先 sanitizeToolName（camelCase）再 shortenToolName（64 字节截断）
 /// - OpenAI 工具名只 shortenToolName（64 字节截断）
 /// - 描述硬截断到 10237 字符
@@ -1204,17 +1151,17 @@ fn convert_tools(
     tools
         .iter()
         .map(|t| {
-            // 对齐 Kiro-Go: 先 camelCase 标准化，再缩短超长名称
+            // 先 camelCase 标准化，再缩短超长名称。
             let sanitized_name = map_tool_name(&t.name, tool_name_map, preserve_tool_names);
 
-            // 对齐 Kiro-Go `normalizeToolDesc(desc, sanitized)`: 空描述用 sanitized 名称
+            // 空描述使用标准化后的工具名。
             let description = if t.description.trim().is_empty() {
                 format!("Tool: {}", sanitized_name)
             } else {
                 t.description.clone()
             };
 
-            // 对齐 Kiro-Go: 硬截断描述到 MAX_TOOL_DESC_LEN 字符
+            // 硬截断描述到 MAX_TOOL_DESC_LEN 字符。
             let final_description = if description.len() > MAX_TOOL_DESC_LEN {
                 format!("{}...", &description[..MAX_TOOL_DESC_LEN])
             } else {
@@ -1246,7 +1193,8 @@ pub(crate) fn generate_thinking_prefix(req: &MessagesRequest) -> Option<String> 
     let is_opus_4_7 = model_lower.contains("opus")
         && (model_lower.contains("4-7") || model_lower.contains("4.7"));
 
-    match t.thinking_type.as_str() {
+    let thinking_type = t.normalized_type();
+    match thinking_type.as_str() {
         "enabled" => Some(format!(
             "<thinking_mode>enabled</thinking_mode>\n<max_thinking_length>{}</max_thinking_length>",
             t.budget_tokens.unwrap_or(20000)
@@ -1304,7 +1252,7 @@ fn build_history(
     // 生成thinking前缀（如果需要）
     let thinking_prefix = generate_thinking_prefix(req);
 
-    // 1. 处理系统消息：Kiro-Go 只应用配置驱动的 applyPromptFilters，再拼接 thinking prefix。
+    // 1. 处理系统消息：只应用配置驱动的 applyPromptFilters，再拼接 thinking prefix。
     let base_system = req.system.as_ref().map(|system| {
         system
             .iter()
@@ -1384,7 +1332,7 @@ fn build_history(
                 history.push(Message::User(merged_user));
                 user_buffer.clear();
             }
-            // 对齐 KAM：只有 history 末尾是 User 时才允许接 assistant，
+            // 只有 history 末尾是 User 时才允许接 assistant，
             // 否则该 assistant 是孤立的（无前置 user），静默丢弃避免上游 400
             if !matches!(history.last(), Some(Message::User(_))) {
                 tracing::warn!("检测到无前置 user 的孤立 assistant 消息，已丢弃");
@@ -1413,10 +1361,6 @@ fn build_history(
     if !user_buffer.is_empty() {
         let merged_user = merge_user_messages(&user_buffer, model_id)?;
         history.push(Message::User(merged_user));
-
-        // 自动配对一个 "OK" 的 assistant 响应
-        let auto_assistant = HistoryAssistantMessage::new("OK");
-        history.push(Message::Assistant(auto_assistant));
     }
 
     Ok(BuildHistoryResult {
@@ -1425,7 +1369,7 @@ fn build_history(
     })
 }
 
-/// 清洗历史消息，对齐 Kiro-Go `sanitizeKiroHistory()`
+/// 清洗历史消息
 ///
 /// 核心逻辑：
 /// 1. 构建 tool_use_id → tool_name 映射表
@@ -1524,7 +1468,7 @@ pub fn sanitize_kiro_history(
                 let content_trimmed = arm.content.trim();
                 let has_tool_uses = arm.tool_uses.as_ref().is_some_and(|t| !t.is_empty());
                 // 空心 assistant（无内容或仅 "." 且无 tool_uses）→ 丢弃
-                // 对齐 Kiro-Go: "." 是 minimalFallbackUserContent 占位符
+                // "." 是 minimal fallback user content 占位符。
                 if (content_trimmed.is_empty() || content_trimmed == MINIMAL_FALLBACK_USER_CONTENT)
                     && !has_tool_uses
                 {
@@ -1558,7 +1502,7 @@ pub fn sanitize_kiro_history(
 
 /// 叙述 tool_results 为纯文本
 ///
-/// 对齐 Kiro-Go `narrateToolResults()`:
+/// Tool result 叙述规则:
 /// 格式: "Tool results:\n\n[tool_name] content\n\n[tool_name] content"
 /// 空内容: "[tool_name] (no output)"
 fn narrate_tool_results(
@@ -1567,9 +1511,9 @@ fn narrate_tool_results(
 ) -> String {
     let mut parts = Vec::new();
     for tr in tool_results {
-        // 对齐 Kiro-Go: 如果 tool_use_id 不在映射中，省略 [name] 前缀
+        // 如果 tool_use_id 不在映射中，省略 [name] 前缀。
         let tool_name_opt = tool_names.get(&tr.tool_use_id).map(|s| s.as_str());
-        // 提取文本内容（对齐 Kiro-Go: 跳过空白文本）
+        // 提取文本内容，跳过空白文本。
         let content_text: String = tr
             .content
             .iter()
@@ -1577,7 +1521,7 @@ fn narrate_tool_results(
             .filter(|s| !s.trim().is_empty())
             .collect::<Vec<_>>()
             .join("\n");
-        // 对齐 Kiro-Go: 有名称时用 [name] 前缀，无名称时省略前缀
+        // 有名称时用 [name] 前缀，无名称时省略前缀。
         match tool_name_opt {
             Some(name) => {
                 if content_text.is_empty() {
@@ -1656,12 +1600,12 @@ fn join_history_text(existing: &str, narrated: &str) -> String {
 
 /// 剥离被污染的工具调用文本
 ///
-/// 对齐 Kiro-Go `stripPollutedToolCallText()`:
+/// 清理历史 assistant 工具调用污染文本:
 /// - 移除 `[Called tool ...]` 模式（不仅在行首，也处理嵌入的情况）
 /// - 折叠 3+ 连续空行为 2 个空行
 fn strip_polluted_tool_call_text(content: &str) -> String {
     use std::sync::OnceLock;
-    // 对齐 Kiro-Go: 包级别静态编译的正则
+    // 包级别静态编译的正则。
     static POLLUTED_RE: OnceLock<regex::Regex> = OnceLock::new();
     static BLANK_RE: OnceLock<regex::Regex> = OnceLock::new();
 
@@ -1751,8 +1695,7 @@ fn convert_assistant_message(
                         }
                         "tool_use" => {
                             if let (Some(id), Some(name)) = (block.id, block.name) {
-                                // 对齐 KAM：input 必须是 JSON Object,
-                                // 客户端传 string/array/null 时回退 `{}`，
+                                // input 必须是 JSON Object；客户端传 string/array/null 时回退 `{}`，
                                 // 避免上游 400 "malformed message/tool sequences"
                                 let input = match block.input {
                                     Some(serde_json::Value::Object(_)) => block.input.unwrap(),
@@ -1838,20 +1781,26 @@ mod tests {
 
     #[test]
     fn test_normalize_schema_top_level_defaults() {
-        // 对齐 Kiro-Go: 只确保 type: "object"，不注入 properties/required/additionalProperties
+        // 只确保 type: "object"，不注入 properties/required/additionalProperties。
         let out = normalize_json_schema(serde_json::json!({}));
         assert_eq!(out["type"], "object");
-        assert!(out.get("properties").is_none(), "Kiro-Go 不注入 properties");
-        assert!(out.get("required").is_none(), "Kiro-Go 不注入 required");
+        assert!(
+            out.get("properties").is_none(),
+            "schema cleaner must not inject properties"
+        );
+        assert!(
+            out.get("required").is_none(),
+            "schema cleaner must not inject required"
+        );
         assert!(
             out.get("additionalProperties").is_none(),
-            "Kiro-Go 删除 additionalProperties"
+            "schema cleaner removes additionalProperties"
         );
     }
 
     #[test]
     fn test_normalize_schema_required_null_top_level() {
-        // 对齐 Kiro-Go: required: null → 删除
+        // required: null -> 删除
         let out = normalize_json_schema(serde_json::json!({
             "type": "object",
             "required": null
@@ -1861,7 +1810,7 @@ mod tests {
 
     #[test]
     fn test_normalize_schema_required_empty_array() {
-        // 对齐 Kiro-Go: required: [] → 删除
+        // required: [] -> 删除
         let out = normalize_json_schema(serde_json::json!({
             "type": "object",
             "required": []
@@ -1973,7 +1922,7 @@ mod tests {
 
     #[test]
     fn test_normalize_schema_additional_properties_always_removed() {
-        // 对齐 Kiro-Go: additionalProperties 无条件删除
+        // additionalProperties 无条件删除。
         let out = normalize_json_schema(serde_json::json!({
             "type": "object",
             "additionalProperties": {
@@ -2037,7 +1986,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sanitize_tool_name_matches_kiro_go_cases() {
+    fn test_sanitize_tool_name_camel_cases_expected_inputs() {
         assert_eq!(sanitize_tool_name("short_name"), "shortName");
         assert_eq!(sanitize_tool_name("FOO_BAR-baz"), "fOOBARBaz");
         assert_eq!(sanitize_tool_name("mcp__server__tool"), "mcpServerTool");
@@ -2122,7 +2071,7 @@ mod tests {
 
     #[test]
     fn test_convert_tools_hard_truncates_long_description() {
-        // 对齐 Kiro-Go: 描述超过 10237 字符时硬截断 + "..."
+        // 描述超过 10237 字符时硬截断 + "..."。
         let mut map = HashMap::new();
         let tools = Some(vec![make_tool("LongTool", &"x".repeat(11000))]);
         let out = convert_tools(&tools, &mut map, false);
@@ -2140,7 +2089,7 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_tools_preserves_web_search_like_kiro_go() {
+    fn test_convert_tools_preserves_web_search() {
         let mut map = HashMap::new();
         let mut web_search = make_tool("web_search", "");
         web_search.tool_type = Some("web_search_20250305".to_string());
@@ -2172,7 +2121,7 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_tools_non_object_schema_becomes_object_like_kiro_go() {
+    fn test_convert_tools_non_object_schema_becomes_object() {
         let mut map = HashMap::new();
         let tools = Some(vec![make_tool_with_schema(
             "BadSchema",
@@ -2258,7 +2207,7 @@ mod tests {
 
     #[test]
     fn test_convert_tools_threshold_boundary_plus_one_truncates() {
-        // 对齐 Kiro-Go: 超过 10237 字符时硬截断
+        // 超过 10237 字符时硬截断。
         let mut map = HashMap::new();
         let desc = "a".repeat(MAX_TOOL_DESC_LEN + 1);
         let tools = Some(vec![make_tool("Boundary", &desc)]);
@@ -2276,7 +2225,7 @@ mod tests {
 
     #[test]
     fn test_convert_tools_long_with_mcp_shortening() {
-        // 对齐 Kiro-Go: 先 camelCase 标准化，再缩短
+        // 先 camelCase 标准化，再缩短。
         // mcp__server__kkk... → sanitize → mcpServerKkk... → 缩短（非 MCP 前缀，硬截断）
         let mut map = HashMap::new();
         let long_name = format!("mcp__server__{}", "k".repeat(60));
@@ -2339,7 +2288,7 @@ mod tests {
     }
 
     #[test]
-    fn test_map_model_matches_kiro_go_parse_model_and_thinking() {
+    fn test_map_model_handles_aliases_and_thinking_suffix() {
         let cases = [
             ("claude-opus-4-8", "claude-opus-4.8"),
             ("claude-opus-4.8", "claude-opus-4.8"),
@@ -2373,7 +2322,7 @@ mod tests {
     }
 
     #[test]
-    fn test_map_model_honors_custom_thinking_suffix_like_kiro_go() {
+    fn test_map_model_honors_custom_thinking_suffix() {
         assert_eq!(
             map_model_with_thinking_suffix("claude-opus-4-8-think", "-think"),
             "claude-opus-4.8"
@@ -2385,7 +2334,7 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_request_honors_custom_thinking_suffix_like_kiro_go() {
+    fn test_convert_request_honors_custom_thinking_suffix() {
         let req = make_request_with_messages(serde_json::json!([
             {"role": "user", "content": "hello"}
         ]));
@@ -2408,7 +2357,7 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_request_does_not_run_legacy_xkiro_content_rewriter_like_kiro_go() {
+    fn test_convert_request_preserves_user_content_until_payload_truncation() {
         let req = make_request_with_messages(serde_json::json!([
             {"role": "user", "content": "line1\n\n\nline2"},
             {"role": "assistant", "content": "ok"},
@@ -2425,7 +2374,7 @@ mod tests {
 
         assert!(
             result.conversation_state.history.len() > 1,
-            "Kiro-Go conversion must not apply the old xkiro history rewriter"
+            "conversion must not apply the removed history rewriter"
         );
         assert!(
             result.conversation_state.history.iter().any(|msg| matches!(
@@ -2433,12 +2382,12 @@ mod tests {
                 Message::User(user)
                     if user.user_input_message.content.contains("line1\n\n\nline2")
             )),
-            "Kiro-Go conversion preserves user text until handler-level payload truncation"
+            "conversion preserves user text until handler-level payload truncation"
         );
     }
 
     #[test]
-    fn test_convert_request_does_not_run_legacy_xkiro_system_cleaner_like_kiro_go() {
+    fn test_convert_request_preserves_system_content_for_prompt_filtering() {
         let req: super::super::types::MessagesRequest = serde_json::from_value(serde_json::json!({
             "model": "claude-sonnet-4-6",
             "max_tokens": 100,
@@ -2463,7 +2412,7 @@ mod tests {
     }
 
     #[test]
-    fn test_context_window_size_matches_kiro_go() {
+    fn test_context_window_size_model_matrix() {
         let cases = [
             ("claude-opus-4.8", 1_000_000),
             ("claude-opus-4-8", 1_000_000),
@@ -2565,6 +2514,32 @@ mod tests {
             metadata: None,
         };
         let prefix = generate_thinking_prefix(&req).unwrap();
+        assert!(prefix.contains("<thinking_display>omitted</thinking_display>"));
+        assert!(!prefix.contains("IMPORTANT"));
+    }
+
+    #[test]
+    fn test_generate_thinking_prefix_trims_type_and_display() {
+        let req = MessagesRequest {
+            model: "claude-opus-4-7".to_string(),
+            max_tokens: 1024,
+            temperature: None,
+            top_p: None,
+            messages: vec![],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(crate::anthropic::types::Thinking {
+                thinking_type: " Adaptive ".to_string(),
+                budget_tokens: None,
+                display: Some(" omitted ".to_string()),
+            }),
+            output_config: None,
+            metadata: None,
+        };
+        let prefix = generate_thinking_prefix(&req).unwrap();
+        assert!(prefix.contains("<thinking_mode>adaptive</thinking_mode>"));
         assert!(prefix.contains("<thinking_display>omitted</thinking_display>"));
         assert!(!prefix.contains("IMPORTANT"));
     }
@@ -2700,7 +2675,7 @@ mod tests {
     }
 
     #[test]
-    fn test_shorten_tool_name_allows_kiro_go_hard_truncation_collision() {
+    fn test_shorten_tool_name_allows_hard_truncation_collision() {
         let prefix = "tool_name_that_is_very_long_and_exceeds_the_kiro_limit_with_same_prefix_";
         let name_a = format!("{prefix}a");
         let name_b = format!("{prefix}b");
@@ -2711,7 +2686,7 @@ mod tests {
 
     #[test]
     fn test_map_tool_name_short_passthrough() {
-        // 对齐 Kiro-Go: 所有名称先 camelCase 标准化
+        // 所有名称先 camelCase 标准化。
         let mut map = HashMap::new();
         let result = map_tool_name("short_name", &mut map, false);
         assert_eq!(result, "shortName", "应转为 camelCase");
@@ -3133,7 +3108,7 @@ mod tests {
     fn test_convert_request_without_metadata() {
         use super::super::types::Message as AnthropicMessage;
 
-        // 没有 metadata 时，对齐 Kiro-Go：真实 user anchor 派生稳定 conversationId。
+        // 没有 metadata 时，用真实 user anchor 派生稳定 conversationId。
         let req = MessagesRequest {
             model: "claude-sonnet-4-6".to_string(),
             max_tokens: 1024,
@@ -3173,7 +3148,7 @@ mod tests {
     }
 
     #[test]
-    fn test_conversation_id_stable_from_user_anchor_like_kiro_go() {
+    fn test_conversation_id_stable_from_user_anchor() {
         use super::super::types::{Message as AnthropicMessage, SystemMessage};
 
         let req_a = MessagesRequest {
@@ -3222,7 +3197,7 @@ mod tests {
     }
 
     #[test]
-    fn test_conversation_id_random_for_synthetic_anchor_like_kiro_go() {
+    fn test_conversation_id_random_for_synthetic_anchor() {
         use super::super::types::Message as AnthropicMessage;
 
         let req = MessagesRequest {
@@ -3283,7 +3258,7 @@ mod tests {
             .expect("应该有 tool_uses");
         assert_eq!(tool_uses.len(), 1);
         assert_eq!(tool_uses[0].tool_use_id, "toolu_01ABC");
-        // 对齐 Kiro-Go: 工具名被 camelCase 标准化
+        // 工具名被 camelCase 标准化。
         assert_eq!(tool_uses[0].name, "readFile");
     }
 
@@ -3432,15 +3407,15 @@ mod tests {
         assert!(found_tool_use, "合并后的 assistant 消息应包含 tool_use");
     }
 
-    // ----- extract_tool_result_content 对齐 Kiro-Go -----
+    // ----- extract_tool_result_content behavior -----
 
     #[test]
-    fn test_tool_result_none_is_empty_like_kiro_go() {
+    fn test_tool_result_none_is_empty() {
         assert_eq!(extract_tool_result_content(&None), "");
     }
 
     #[test]
-    fn test_tool_result_null_is_empty_like_kiro_go() {
+    fn test_tool_result_null_is_empty() {
         assert_eq!(
             extract_tool_result_content(&Some(serde_json::Value::Null)),
             ""
@@ -3448,7 +3423,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_result_string_is_preserved_like_kiro_go() {
+    fn test_tool_result_string_is_preserved() {
         let raw = "{\n  \"key\": \"value\"\n}";
         assert_eq!(
             extract_tool_result_content(&Some(serde_json::json!(raw))),
@@ -3457,7 +3432,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_result_empty_array_is_empty_like_kiro_go() {
+    fn test_tool_result_empty_array_is_empty() {
         assert_eq!(
             extract_tool_result_content(&Some(serde_json::json!([]))),
             ""
@@ -3465,7 +3440,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_result_array_empty_text_is_empty_like_kiro_go() {
+    fn test_tool_result_array_empty_text_is_empty() {
         assert_eq!(
             extract_tool_result_content(&Some(serde_json::json!([
                 {"type": "text", "text": ""}
@@ -3475,7 +3450,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_result_object_text_block_is_empty_like_kiro_go() {
+    fn test_tool_result_object_text_block_is_empty() {
         assert_eq!(
             extract_tool_result_content(&Some(serde_json::json!({
                 "type": "text", "text": "hello"
@@ -3485,7 +3460,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_result_object_text_field_is_empty_like_kiro_go() {
+    fn test_tool_result_object_text_field_is_empty() {
         assert_eq!(
             extract_tool_result_content(&Some(serde_json::json!({"text": "x"}))),
             ""
@@ -3493,7 +3468,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_result_array_uses_text_fields_only_like_kiro_go() {
+    fn test_tool_result_array_uses_text_fields_only() {
         let out = extract_tool_result_content(&Some(serde_json::json!([
             "first",
             {"type": "text", "text": "second"},
@@ -3505,7 +3480,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_result_unknown_object_does_not_pollute_text_like_kiro_go() {
+    fn test_tool_result_unknown_object_does_not_pollute_text() {
         assert_eq!(
             extract_tool_result_content(&Some(serde_json::json!({"custom": "ignored"}))),
             ""
@@ -3513,7 +3488,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_result_image_attaches_to_current_message_like_kiro_go() {
+    fn test_tool_result_image_attaches_to_current_message() {
         const IMG_DATA: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
         let req = make_request_with_messages(serde_json::json!([
             {"role": "user", "content": "read image"},
@@ -3550,7 +3525,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_result_untyped_source_image_attaches_like_kiro_go() {
+    fn test_tool_result_untyped_source_image_attaches() {
         const IMG_DATA: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
         let req = make_request_with_messages(serde_json::json!([
             {"role": "user", "content": "read image"},
@@ -3586,7 +3561,7 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_tool_result_does_not_inject_success_placeholder_like_kiro_go() {
+    fn test_empty_tool_result_does_not_inject_success_placeholder() {
         let req = make_request_with_messages(serde_json::json!([
             {"role": "user", "content": "run"},
             {"role": "assistant", "content": [
@@ -3610,7 +3585,7 @@ mod tests {
     }
 
     #[test]
-    fn test_image_passthrough_keeps_declared_format_like_kiro_go() {
+    fn test_image_passthrough_keeps_declared_format() {
         const IMG_DATA: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
         let req = make_request_with_messages(serde_json::json!([
             {"role": "user", "content": [
@@ -3635,7 +3610,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_result_image_ignores_unknown_object_text_pollution_like_kiro_go() {
+    fn test_tool_result_image_ignores_unknown_object_text_pollution() {
         const IMG_DATA: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
         let content = Some(serde_json::json!([
             "raw-string",
@@ -3657,7 +3632,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_result_image_text_parts_join_like_kiro_go() {
+    fn test_tool_result_image_text_parts_join() {
         const IMG_DATA: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
         let content = Some(serde_json::json!([
             {"type": "text", "text": "{\n  \"alpha\": true\n}"},
@@ -3678,7 +3653,7 @@ mod tests {
     }
 
     #[test]
-    fn test_image_url_data_url_attaches_like_kiro_go() {
+    fn test_image_url_data_url_attaches() {
         const IMG_DATA: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
         let req = make_request_with_messages(serde_json::json!([
             {"role": "user", "content": [
@@ -3700,7 +3675,7 @@ mod tests {
     }
 
     #[test]
-    fn test_images_are_not_capped_at_twenty_like_kiro_go() {
+    fn test_images_are_not_capped_at_twenty() {
         const IMG_DATA: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
         let blocks: Vec<serde_json::Value> = (0..25)
             .map(|_| {
@@ -3726,7 +3701,7 @@ mod tests {
     }
 
     #[test]
-    fn test_image_placeholder_text_is_removed_from_current_message_like_kiro_go() {
+    fn test_image_placeholder_text_is_removed_from_current_message() {
         const IMG_DATA: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
         let req = make_request_with_messages(serde_json::json!([
             {"role": "user", "content": [
@@ -3747,7 +3722,7 @@ mod tests {
     }
 
     #[test]
-    fn test_image_placeholder_text_is_removed_from_history_like_kiro_go() {
+    fn test_image_placeholder_text_is_removed_from_history() {
         const IMG_DATA: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
         let req = make_request_with_messages(serde_json::json!([
             {"role": "user", "content": [
@@ -3778,7 +3753,7 @@ mod tests {
     }
 
     #[test]
-    fn test_image_source_accepts_media_type_aliases_like_kiro_go() {
+    fn test_image_source_accepts_media_type_aliases() {
         const IMG_DATA: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
         let req = make_request_with_messages(serde_json::json!([
             {"role": "user", "content": [
@@ -3802,7 +3777,7 @@ mod tests {
     }
 
     #[test]
-    fn test_image_placeholder_is_not_treated_as_image_like_kiro_go() {
+    fn test_image_placeholder_is_not_treated_as_image() {
         let req = make_request_with_messages(serde_json::json!([
             {"role": "user", "content": [
                 {"type": "image_url", "image_url": {"url": "[Image 1]"}}
@@ -3818,7 +3793,7 @@ mod tests {
     }
 
     #[test]
-    fn test_non_image_mime_file_is_ignored_like_kiro_go() {
+    fn test_non_image_mime_file_is_ignored() {
         const TXT_DATA: &str = "aGVsbG8=";
         let req = make_request_with_messages(serde_json::json!([
             {"role": "user", "content": [
@@ -3839,7 +3814,7 @@ mod tests {
     }
 
     #[test]
-    fn test_gif_image_is_passed_through_like_kiro_go() {
+    fn test_gif_image_is_passed_through() {
         const GIF_DATA: &str = "R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==";
         let req = make_request_with_messages(serde_json::json!([
             {"role": "user", "content": [
@@ -3864,7 +3839,7 @@ mod tests {
     }
 
     #[test]
-    fn test_arbitrary_image_mime_is_passed_through_like_kiro_go() {
+    fn test_arbitrary_image_mime_is_passed_through() {
         const IMG_DATA: &str = "aGVsbG8=";
         let req = make_request_with_messages(serde_json::json!([
             {"role": "user", "content": [
@@ -3936,7 +3911,7 @@ mod tests {
 
     #[test]
     fn test_history_keeps_web_search_tool_use_for_placeholder_pairing() {
-        // 对齐 Kiro-Go sanitizeKiroHistory: 非活跃 tool turn 的 tool_uses 被剥离，
+        // 非活跃 tool turn 的 tool_uses 被剥离，
         // tool_result 被叙述为纯文本。
         // web_search tool_result 仍会出现在叙述文本中，用于 placeholder 配对。
         let req = make_request_with_messages(serde_json::json!([
@@ -3966,7 +3941,7 @@ mod tests {
 
     #[test]
     fn test_tool_use_input_non_object_falls_back_to_empty_object() {
-        // 对齐 Kiro-Go sanitizeKiroHistory: 非活跃 tool turn 的 tool_uses 被剥离
+        // 非活跃 tool turn 的 tool_uses 被剥离。
         // 这里 tool_result 在历史中，但当前消息没有 tool_result，所以 tool turn 不是"活跃"的
         let req = make_request_with_messages(serde_json::json!([
             {"role": "user", "content": "go"},
@@ -3995,7 +3970,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sanitize_history_joins_existing_user_text_and_tool_results_like_kiro_go() {
+    fn test_sanitize_history_joins_existing_user_text_and_tool_results() {
         let mut user_msg = HistoryUserMessage::new("existing user text", "claude-sonnet-4.5");
         user_msg
             .user_input_message
@@ -4031,7 +4006,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sanitize_history_collapses_empty_user_turns_like_kiro_go() {
+    fn test_sanitize_history_collapses_empty_user_turns() {
         let mut history = vec![
             Message::User(HistoryUserMessage::new("", "claude-sonnet-4.5")),
             Message::User(HistoryUserMessage::new("", "claude-sonnet-4.5")),
@@ -4050,7 +4025,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sanitize_history_drops_polluted_and_dot_assistant_turns_like_kiro_go() {
+    fn test_sanitize_history_drops_polluted_and_dot_assistant_turns() {
         let req = make_request_with_messages(serde_json::json!([
             {"role": "user", "content": "start"},
             {"role": "assistant", "content": "[Called tool exec_command with input {\"cmd\":\"x\"}]"},
@@ -4078,10 +4053,10 @@ mod tests {
         assert!(assistant_text.contains("Let me check."));
     }
 
-    // ----- Codex App 兼容：未知 role 归一化 -----
+    // ----- Kiro-Go role 行为：未知 role 不注入 Kiro history -----
 
     #[test]
-    fn test_normalize_unknown_role_developer_to_user() {
+    fn test_unknown_role_developer_is_ignored_like_kiro_go() {
         let req = make_request_with_messages(serde_json::json!([
             {"role": "developer", "content": "context A"},
             {"role": "developer", "content": "context B"},
@@ -4091,7 +4066,6 @@ mod tests {
         let pf = crate::model::config::PromptFilterConfig::default();
         let kr = convert_request(&req, &cfg, &pf, false).expect("convert");
 
-        // currentMessage 应为最后一条 user
         let cur_text = &kr
             .conversation_state
             .current_message
@@ -4102,7 +4076,6 @@ mod tests {
             "currentMessage 应包含 question"
         );
 
-        // 前两条 developer 归一化后合并到 history 第一条 user
         let has_context_a = kr.conversation_state.history.iter().any(|m| {
             if let Message::User(u) = m {
                 u.user_input_message.content.contains("context A")
@@ -4110,11 +4083,11 @@ mod tests {
                 false
             }
         });
-        assert!(has_context_a, "context A 应保留在 history");
+        assert!(!has_context_a, "developer role 不应注入 Kiro history");
     }
 
     #[test]
-    fn test_normalize_system_role_to_user() {
+    fn test_message_system_role_is_ignored_like_kiro_go() {
         let req = make_request_with_messages(serde_json::json!([
             {"role": "system", "content": "ignore me"},
             {"role": "user", "content": "real question"}
@@ -4128,24 +4101,17 @@ mod tests {
             .user_input_message
             .content;
         assert!(cur_text.contains("real question"));
-    }
 
-    #[test]
-    fn test_normalize_preserves_user_assistant_zero_copy() {
-        let msgs = vec![
-            super::super::types::Message {
-                role: "user".to_string(),
-                content: serde_json::Value::String("hi".to_string()),
-            },
-            super::super::types::Message {
-                role: "assistant".to_string(),
-                content: serde_json::Value::String("ok".to_string()),
-            },
-        ];
-        let cow = normalize_message_roles(&msgs);
+        let has_system_text = kr.conversation_state.history.iter().any(|m| {
+            if let Message::User(u) = m {
+                u.user_input_message.content.contains("ignore me")
+            } else {
+                false
+            }
+        });
         assert!(
-            matches!(cow, std::borrow::Cow::Borrowed(_)),
-            "全 user/assistant 应零拷贝"
+            !has_system_text,
+            "message-level system role 不应注入 Kiro history"
         );
     }
 }

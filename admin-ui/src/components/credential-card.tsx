@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2, RotateCcw, Boxes } from 'lucide-react'
 import { Card } from '@/components/ui/card'
@@ -25,9 +25,24 @@ import {
   useForceRefreshToken,
   useSetOverage,
 } from '@/hooks/use-credentials'
+import { useProxies, useSetCredentialProxyByRegion } from '@/hooks/use-proxies'
 import { getCredentialBalance } from '@/api/credentials'
 import { usePrivacyMode } from '@/hooks/use-privacy-mode'
-import { maskEmail } from '@/lib/utils'
+import {
+  formatCredentialBalanceNumber,
+  formatCredentialOverageStatusLabel,
+  getCredentialBalanceBaseUsage,
+  getCredentialBalanceOverageUsage,
+} from '@/lib/credential-balance'
+import { getCredentialMaterialRows } from '@/lib/credential-material'
+import {
+  compactCredentialMetadataValue,
+  getCredentialIdentityRows,
+  getCredentialMetadataRows,
+  formatCredentialAuthLabel,
+  maskEmail,
+  stringifyCredentialMetadataValue,
+} from '@/lib/credential-metadata'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 
 interface CredentialCardProps {
@@ -58,12 +73,6 @@ function formatLastUsed(lastUsedAt: string | null): string {
   return `${days} 天前`
 }
 
-// 重置时间，参考 BK：toLocaleString 完整时间戳
-function formatResetDate(ts: number | null): string | null {
-  if (!ts) return null
-  return new Date(ts * 1000).toLocaleString('zh-CN')
-}
-
 interface BalanceBlockProps {
   balance: BalanceResponse | null
   loading: boolean
@@ -91,19 +100,9 @@ function BalanceBlock({ balance, loading, overageMutating, onToggleOverage }: Ba
     )
   }
 
-  const limit = balance.usageLimit
-  const used = balance.currentUsage
-  const baseUsed = Math.min(used, limit)
-  const baseRemaining = Math.max(0, limit - used)
-  const basePercent = limit > 0 ? Math.min(100, (baseUsed / limit) * 100) : 0
-  const overUsed = Math.max(0, used - limit)
-  const overCap = balance.overageCap || 0
-  const overRemaining = Math.max(0, overCap - overUsed)
-  const overPercent = overCap > 0 ? Math.min(100, (overUsed / overCap) * 100) : 0
-
-  const resetStr = formatResetDate(balance.nextResetAt)
-  const showOverage = balance.overageCapability === 'OVERAGE_CAPABLE' || overUsed > 0 || overCap > 0
-  const baseTone = basePercent >= 90 ? 'bg-destructive' : basePercent >= 70 ? 'bg-warning' : 'bg-foreground/80'
+  const baseUsage = getCredentialBalanceBaseUsage(balance)
+  const overageUsage = getCredentialBalanceOverageUsage(balance)
+  const baseTone = baseUsage.percent >= 90 ? 'bg-destructive' : baseUsage.percent >= 70 ? 'bg-warning' : 'bg-foreground/80'
 
   return (
     <div className="space-y-3">
@@ -112,38 +111,38 @@ function BalanceBlock({ balance, loading, overageMutating, onToggleOverage }: Ba
         <div className="flex items-baseline justify-between gap-2">
           <span className="text-xs text-muted-foreground">正式额度</span>
           <span className="tabular text-xs font-medium">
-            <span className="text-foreground">{baseRemaining.toFixed(2)}</span>
-            <span className="text-muted-foreground"> / {limit.toFixed(2)}</span>
+            <span className="text-foreground">{formatCredentialBalanceNumber(baseUsage.remaining)}</span>
+            <span className="text-muted-foreground"> / {formatCredentialBalanceNumber(baseUsage.limit)}</span>
           </span>
         </div>
         <div className="h-1.5 w-full overflow-hidden rounded-full bg-secondary">
           <div
             className={`h-full transition-all ${baseTone}`}
-            style={{ width: `${basePercent}%` }}
+            style={{ width: `${baseUsage.percent}%` }}
           />
         </div>
-        {resetStr && (
+        {baseUsage.resetAt && (
           <div className="text-2xs text-muted-foreground tabular">
-            {resetStr} 重置
+            {baseUsage.resetAt} 重置
           </div>
         )}
       </div>
 
       {/* 超额额度 */}
-      {showOverage && (
+      {overageUsage.visible && (
         <div className="space-y-1.5 rounded-md border border-dashed bg-muted/30 px-2.5 py-2">
           <div className="flex items-baseline justify-between gap-2">
             <span className="text-xs text-muted-foreground">超额额度</span>
             <span className="tabular text-xs font-medium">
-              <span className="text-foreground">{overRemaining.toFixed(2)}</span>
-              <span className="text-muted-foreground"> / {overCap > 0 ? overCap.toFixed(2) : '—'}</span>
+              <span className="text-foreground">{formatCredentialBalanceNumber(overageUsage.remaining)}</span>
+              <span className="text-muted-foreground"> / {overageUsage.cap > 0 ? formatCredentialBalanceNumber(overageUsage.cap) : '—'}</span>
             </span>
           </div>
-          {overCap > 0 ? (
+          {overageUsage.cap > 0 ? (
             <div className="h-1.5 w-full overflow-hidden rounded-full bg-secondary">
               <div
                 className="h-full bg-warning transition-all"
-                style={{ width: `${overPercent}%` }}
+                style={{ width: `${overageUsage.percent}%` }}
               />
             </div>
           ) : (
@@ -151,15 +150,7 @@ function BalanceBlock({ balance, loading, overageMutating, onToggleOverage }: Ba
           )}
           <div className="flex items-center justify-between gap-2 pt-0.5">
             <span className="text-2xs text-muted-foreground">
-              {overageMutating
-                ? '切换中...'
-                : balance.overageCapability === 'OVERAGE_CAPABLE'
-                  ? balance.overageStatus === 'ENABLED'
-                    ? '已开启'
-                    : '已关闭'
-                  : balance.overageCapability === 'OVERAGE_INCAPABLE'
-                    ? '订阅不支持'
-                    : ''}
+              {formatCredentialOverageStatusLabel(balance, { mutating: overageMutating })}
             </span>
             {balance.overageCapability === 'OVERAGE_CAPABLE' && (
               <Switch
@@ -188,8 +179,8 @@ export function CredentialCard({
 }: CredentialCardProps) {
   const { privacyMode } = usePrivacyMode()
   const displayEmail = credential.email ? maskEmail(credential.email, privacyMode) : null
-  const displayTitle = displayEmail || `凭据 #${credential.id}`
-  const tooltipContent = credential.email ? displayEmail : null
+  const displayTitle = credential.nickname || credential.label || displayEmail || `凭据 #${credential.id}`
+  const tooltipContent = credential.email && displayTitle !== displayEmail ? displayEmail : null
   const [editingPriority, setEditingPriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
   const [editingConcurrency, setEditingConcurrency] = useState(false)
@@ -225,6 +216,19 @@ export function CredentialCard({
   const forceRefresh = useForceRefreshToken()
   const setOverage = useSetOverage()
   const overageMutating = setOverage.isPending
+  const { data: proxyData } = useProxies()
+  const setProxyByRegion = useSetCredentialProxyByRegion()
+  const boundProxy = proxyData?.proxies.find(proxy => proxy.id === credential.proxyId) ?? null
+  const boundProxyRegion = boundProxy?.region ?? null
+  const proxyRegions = useMemo(() => {
+    const regions = new Set<string>()
+    for (const proxy of proxyData?.proxies ?? []) {
+      if (!proxy.disabled && !proxy.dead && proxy.region?.trim()) {
+        regions.add(proxy.region.trim())
+      }
+    }
+    return [...regions].sort((a, b) => a.localeCompare(b))
+  }, [proxyData?.proxies])
 
   const handleToggleDisabled = () => {
     setDisabled.mutate(
@@ -240,7 +244,17 @@ export function CredentialCard({
     )
   }
 
-  // KAM 模式：乐观更新 → 调上游切换 → 成功后拉真值覆盖 → 失败回滚
+  const handleSetProxyRegion = (region: string | null) => {
+    setProxyByRegion.mutate(
+      { id: credential.id, region },
+      {
+        onSuccess: response => toast.success(response.message || '代理绑定已更新'),
+        onError: error => toast.error(`代理绑定失败: ${error instanceof Error ? error.message : '未知错误'}`),
+      },
+    )
+  }
+
+  // 远端 overage：乐观更新 → 调上游切换 → 成功后拉真值覆盖 → 失败回滚
   // 父级 balanceMap 是单一真源，全部经 onBalanceChange 派发
   const handleToggleOverage = (next: boolean) => {
     if (!balance) return
@@ -368,10 +382,30 @@ export function CredentialCard({
     })
   }
 
-  const authLabel = credential.authMethod === 'api_key' ? 'API Key' :
-    credential.authMethod === 'idc' ? 'IdC' :
-    credential.authMethod === 'social' ? 'Social' :
-    credential.authMethod || ''
+  const authLabel = formatCredentialAuthLabel(credential.provider, credential.authMethod)
+  const metadataRows = [
+    ...getCredentialIdentityRows(credential, {
+      keys: ['nickname', 'label', 'sourceAccountId', 'status', 'addedAt'],
+    }),
+    ...getCredentialMetadataRows(credential, { exclude: ['endpoint'] }),
+    ...getCredentialMaterialRows(credential, { exclude: ['hasProfileArn', 'hasToken', 'hasRefreshToken'] }),
+    { label: '封禁状态', value: credential.banStatus },
+    { label: '封禁原因', value: credential.banReason },
+    { label: '封禁时间', value: credential.banTime },
+    { label: '请求数', value: credential.requestCount },
+    { label: '错误数', value: credential.errorCount },
+    { label: '总令牌数', value: credential.totalTokens },
+    { label: '总额度', value: credential.totalCredits },
+    { label: '上次使用', value: credential.lastUsed },
+    { label: '创建时间', value: credential.createdAt },
+    { label: '标签', value: credential.tags == null ? null : JSON.stringify(credential.tags) },
+  ]
+    .map((row) => ({
+      label: row.label,
+      raw: stringifyCredentialMetadataValue(row.value),
+      value: compactCredentialMetadataValue(row.value),
+    }))
+    .filter((row) => row.value)
 
   const inFlight = Math.max(0, credential.maxPermits - credential.availablePermits)
   const usagePct = credential.maxPermits > 0
@@ -562,21 +596,67 @@ export function CredentialCard({
             </span>
           </div>
 
-          {/* 最后调用 / API Key */}
+          {/* 最后调用 / API 密钥 */}
           <div className="col-span-2 flex items-center justify-between gap-2 pt-1.5 border-t border-border/50">
             <span className="text-muted-foreground">最后调用</span>
             <span className="tabular font-medium">{formatLastUsed(credential.lastUsedAt)}</span>
           </div>
           {credential.maskedApiKey && (
             <div className="col-span-2 flex items-center justify-between gap-2">
-              <span className="text-muted-foreground">API Key</span>
+              <span className="text-muted-foreground">API 密钥</span>
               <span className="font-mono text-2xs">{credential.maskedApiKey}</span>
             </div>
           )}
-          {credential.hasProxy && credential.proxyUrl && (
+          {credential.hasProxy && (credential.proxyUrl || boundProxy || credential.proxyId != null) && (
             <div className="col-span-2 flex items-center justify-between gap-2">
               <span className="text-muted-foreground">代理</span>
-              <span className="truncate font-mono text-2xs" title={credential.proxyUrl}>{credential.proxyUrl}</span>
+              <span
+                className="truncate font-mono text-2xs"
+                title={credential.proxyUrl || boundProxy?.url || `代理 #${credential.proxyId}`}
+              >
+                {credential.proxyUrl || (boundProxy ? `${boundProxy.region ?? '未分组'} · ${boundProxy.url}` : `代理 #${credential.proxyId}`)}
+              </span>
+            </div>
+          )}
+          <div className="col-span-2 flex items-center justify-between gap-2">
+            <span className="text-muted-foreground">代理池</span>
+            <select
+              value={boundProxyRegion ?? ''}
+              disabled={setProxyByRegion.isPending}
+              onChange={event => handleSetProxyRegion(event.target.value ? event.target.value : null)}
+              className="h-7 max-w-[62%] rounded-md border border-input bg-background px-2 text-2xs outline-none"
+              title={boundProxy ? boundProxy.url : '未绑定代理池'}
+            >
+              <option value="">未绑定</option>
+              {boundProxyRegion && !proxyRegions.includes(boundProxyRegion) && (
+                <option value={boundProxyRegion}>{boundProxyRegion}</option>
+              )}
+              {proxyRegions.map(region => (
+                <option key={region} value={region}>
+                  {region}
+                </option>
+              ))}
+            </select>
+          </div>
+          {boundProxy && (
+            <div className="col-span-2 flex items-center justify-between gap-2">
+              <span className="text-muted-foreground">池代理</span>
+              <span className="truncate font-mono text-2xs" title={boundProxy.url}>
+                {boundProxy.url}
+              </span>
+            </div>
+          )}
+          {metadataRows.length > 0 && (
+            <div className="col-span-2 space-y-1.5 border-t border-border/50 pt-2">
+              <div className="text-2xs font-medium text-muted-foreground">来源元数据</div>
+              {metadataRows.map((row) => (
+                <div key={row.label} className="flex items-center justify-between gap-2">
+                  <span className="shrink-0 text-muted-foreground">{row.label}</span>
+                  <span className="truncate font-mono text-2xs" title={row.raw || undefined}>
+                    {row.value}
+                  </span>
+                </div>
+              ))}
             </div>
           )}
         </div>
@@ -598,7 +678,7 @@ export function CredentialCard({
             className="h-7 px-2 text-xs"
             onClick={() => onViewModels(credential.id)}
             disabled={credential.authMethod === 'api_key'}
-            title={credential.authMethod === 'api_key' ? 'API Key 凭据不支持模型查询' : '查看可用模型'}
+            title={credential.authMethod === 'api_key' ? 'API 密钥凭据不支持模型查询' : '查看可用模型'}
           >
             <Boxes className="mr-1 h-3 w-3" />
             模型
@@ -609,7 +689,7 @@ export function CredentialCard({
             className="h-7 px-2 text-xs"
             onClick={handleForceRefresh}
             disabled={forceRefresh.isPending || credential.disabled || credential.authMethod === 'api_key'}
-            title={credential.authMethod === 'api_key' ? 'API Key 凭据无需刷新' : credential.disabled ? '已禁用' : '强制刷新 Token'}
+            title={credential.authMethod === 'api_key' ? 'API 密钥凭据无需刷新' : credential.disabled ? '已禁用' : '强制刷新令牌'}
           >
             <RefreshCw className={`mr-1 h-3 w-3 ${forceRefresh.isPending ? 'animate-spin' : ''}`} />
             刷新

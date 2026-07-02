@@ -18,6 +18,7 @@ use axum::{
 };
 use bytes::Bytes;
 use futures::{Stream, StreamExt, stream};
+use serde::Serialize;
 use serde_json::json;
 use std::time::Duration;
 use tokio::sync::OwnedSemaphorePermit;
@@ -26,7 +27,7 @@ use uuid::Uuid;
 
 use super::converter::{
     ConversionError, convert_request_with_thinking_suffix, extract_session_id,
-    generate_thinking_prefix,
+    generate_thinking_prefix, map_model_with_thinking_suffix,
 };
 use super::middleware::{AppState, MatchedApiKeyId};
 use super::stream::{BufferedStreamContext, CacheUsageBreakdown, SseEvent, StreamContext};
@@ -42,8 +43,27 @@ use crate::model::runtime::SharedPromptConfig;
 const PAYLOAD_TRUNCATION_MIN_RECENT_MESSAGES: usize = 4;
 const PAYLOAD_TRUNCATION_PLACEHOLDER: &str = "[Earlier conversation history was truncated to fit the model's input limit. Older messages and tool activity have been omitted.]";
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PublicStatsResponse {
+    status: String,
+    version: String,
+    #[serde(rename = "accounts")]
+    credentials_total_alias: usize,
+    #[serde(rename = "available")]
+    credentials_available_alias: usize,
+    credentials_total: usize,
+    credentials_available: usize,
+    total_requests: i64,
+    success_requests: i64,
+    failed_requests: i64,
+    total_tokens: i64,
+    total_credits: f64,
+    uptime: u64,
+}
+
 // ============================================================================
-// Cache usage 工具集（按 BK 严格对齐）
+// Cache usage 工具集
 // ============================================================================
 //
 // 由 cache_tracker 在请求阶段算出 cache 命中分布，注入到 message_start /
@@ -373,7 +393,7 @@ pub(crate) struct PayloadTruncationOutcome {
 }
 
 // ============================================================================
-// 错误分类谓词（按 BK 移植）
+// 错误分类谓词
 // ============================================================================
 //
 // provider.rs 在不同失败路径会在错误字符串中保留稳定关键字，
@@ -611,7 +631,7 @@ fn truncate_string_to_byte_budget(content: &mut String, budget: usize) {
     }
 }
 
-/// 将 KiroProvider 错误映射为 HTTP 响应（按 BK 完整分类）
+/// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_kiro_provider_error_to_response(request_body: &str, err: Error) -> Response {
     if is_input_too_long_error(&err) {
         tracing::warn!(
@@ -719,7 +739,7 @@ fn map_kiro_provider_error_to_response(request_body: &str, err: Error) -> Respon
         .into_response()
 }
 
-/// 对日志/审计中的 user_id 做脱敏（按 BK 严格对齐）
+/// 对日志/审计中的 user_id 做脱敏
 ///
 /// 截断规则：
 /// - len > 25：保留前 13 + 后 8，中间 `***`
@@ -759,7 +779,7 @@ fn mask_user_id(user_id: Option<&str>) -> String {
 /// 说明：
 /// - Claude Code/claude-cli 在某些 tool_use-only 场景下可能会把空 text block 写回 history；
 /// - 上游会拒绝空 text block（400: "text content blocks must be non-empty"）。
-/// - 空 text block 不携带任何语义，直接移除是最小且安全的兼容策略。
+/// - 空 text block 不携带任何语义，直接移除是最小且安全的清理策略。
 #[allow(dead_code)]
 fn strip_empty_text_content_blocks(messages: &mut [super::types::Message]) -> usize {
     let mut removed = 0usize;
@@ -814,6 +834,36 @@ pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
     Json(ModelsResponse {
         object: "list".to_string(),
         data: models,
+    })
+}
+
+/// GET /v1/stats
+///
+/// 返回 API-key 保护的公开网关统计。
+pub async fn get_public_stats(State(state): State<AppState>) -> impl IntoResponse {
+    let stats = state.gateway_stats_snapshot();
+    let (credentials_total, credentials_available) = state
+        .kiro_provider
+        .as_ref()
+        .map(|provider| {
+            let snapshot = provider.token_manager().snapshot();
+            (snapshot.total, snapshot.available)
+        })
+        .unwrap_or((0, 0));
+
+    Json(PublicStatsResponse {
+        status: "ok".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        credentials_total_alias: credentials_total,
+        credentials_available_alias: credentials_available,
+        credentials_total,
+        credentials_available,
+        total_requests: stats.total_requests,
+        success_requests: stats.success_requests,
+        failed_requests: stats.failed_requests,
+        total_tokens: stats.total_tokens,
+        total_credits: stats.total_credits,
+        uptime: stats.uptime,
     })
 }
 
@@ -1054,6 +1104,7 @@ struct PreparedRequest {
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     user_id: Option<String>,
+    accounting_payload: MessagesRequest,
 }
 
 /// 公共请求预处理前段：转换→压缩→序列化→大小检查→元数据提取
@@ -1135,12 +1186,12 @@ fn prepare_request(
                     threshold = max_body,
                     removed_history_messages = outcome.removed_history_messages,
                     inserted_placeholder = outcome.inserted_placeholder,
-                    "请求体超过阈值，已按兼容策略截断历史"
+                    "请求体超过阈值，已按安全截断策略截断历史"
                 );
             }
             Ok(None) => {}
             Err(e) => {
-                tracing::error!("兼容策略历史截断序列化失败: {}", e);
+                tracing::error!("安全截断策略历史截断序列化失败: {}", e);
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ErrorResponse::new(
@@ -1153,17 +1204,17 @@ fn prepare_request(
         }
     }
 
-    // Kiro-Go 风格截断后仍超限，说明当前消息/工具/图片本身已超过上游限制。
+    // 安全截断后仍超限，说明当前消息/工具/图片本身已超过上游限制。
     if max_body > 0 && request_body.len() > max_body {
         tracing::warn!(
             conversation_id = kiro_request.conversation_state.conversation_id.as_str(),
             request_body_bytes = request_body.len(),
             threshold = max_body,
-            "兼容策略截断后请求体仍超过安全阈值，拒绝发送"
+            "安全截断策略执行后请求体仍超过安全阈值，拒绝发送"
         );
         #[cfg(feature = "sensitive-logs")]
         tracing::error!(
-            "兼容策略截断后仍超限，完整请求体（用于诊断）: {}",
+            "安全截断策略执行后仍超限，完整请求体（用于诊断）: {}",
             truncate_base64_in_request_body(&request_body)
         );
         return Err((
@@ -1187,11 +1238,12 @@ fn prepare_request(
     tracing::debug!("Kiro request body: {}", request_body);
 
     // 估算输入 tokens
+    let accounting_payload = request_with_thinking_accounting(payload.clone(), &thinking_suffix);
     let input_tokens = token::count_all_tokens(
-        payload.model.clone(),
-        payload.system.clone(),
-        payload.messages.clone(),
-        payload.tools.clone(),
+        accounting_payload.model.clone(),
+        accounting_payload.system.clone(),
+        accounting_payload.messages.clone(),
+        accounting_payload.tools.clone(),
     ) as i32;
 
     // 检查是否启用了 thinking
@@ -1213,6 +1265,7 @@ fn prepare_request(
         thinking_enabled,
         tool_name_map,
         user_id,
+        accounting_payload,
     })
 }
 
@@ -1300,11 +1353,13 @@ pub async fn post_messages(
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
 
         // 估算输入 tokens
+        let accounting_payload =
+            request_with_thinking_accounting(payload.clone(), &thinking_suffix);
         let input_tokens = token::count_all_tokens(
-            payload.model.clone(),
-            payload.system.clone(),
-            payload.messages.clone(),
-            payload.tools.clone(),
+            accounting_payload.model,
+            accounting_payload.system,
+            accounting_payload.messages,
+            accounting_payload.tools,
         ) as i32;
 
         return websearch::handle_websearch_request(provider, &payload, None, None, input_tokens)
@@ -1323,12 +1378,16 @@ pub async fn post_messages(
     };
     let user_id = prep.user_id.as_deref();
 
-    // 读 prompt-cache 快照 + 按 accounting_enabled 构造 cache_profile（BK 模式）
+    // 读 prompt-cache 快照 + 按 accounting_enabled 构造 cache_profile。
     let prompt_cache = state.prompt_cache_snapshot();
     let claude_format = state.thinking_config.read().claude_format.clone();
-    let cache_profile = prompt_cache
-        .accounting_enabled
-        .then(|| build_cache_profile(prompt_cache.tracker.as_ref(), &payload, prep.input_tokens));
+    let cache_profile = prompt_cache.accounting_enabled.then(|| {
+        build_cache_profile(
+            prompt_cache.tracker.as_ref(),
+            &prep.accounting_payload,
+            prep.input_tokens,
+        )
+    });
 
     if payload.stream {
         // 流式响应
@@ -1428,14 +1487,14 @@ fn validate_thinking_config(
             }
         }
         "adaptive" => {
-            if thinking.budget_tokens.is_some() {
+            if thinking.budget_tokens.unwrap_or_default() != 0 {
                 return Some(
                     "thinking.budget_tokens is not supported when thinking.type is adaptive",
                 );
             }
         }
         "disabled" => {
-            if thinking.budget_tokens.is_some() {
+            if thinking.budget_tokens.unwrap_or_default() != 0 {
                 return Some(
                     "thinking.budget_tokens is not supported when thinking.type is disabled",
                 );
@@ -1446,6 +1505,9 @@ fn validate_thinking_config(
 
     if let Some(display) = thinking.display.as_deref() {
         let display = display.trim().to_lowercase();
+        if display.is_empty() {
+            return None;
+        }
         if display != "summarized" && display != "omitted" {
             return Some("thinking.display must be one of: summarized, omitted");
         }
@@ -1536,14 +1598,21 @@ async fn handle_stream_request(
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let mut api_result = match provider
-        .call_api_stream(context.request_body, context.user_id)
+        .call_api_stream_with_client_affinity(
+            context.request_body,
+            context.user_id,
+            context.api_key_id.as_deref(),
+        )
         .await
     {
         Ok(resp) => resp,
-        Err(e) => return map_kiro_provider_error_to_response(context.request_body, e),
+        Err(e) => {
+            context.app_state.record_gateway_failure();
+            return map_kiro_provider_error_to_response(context.request_body, e);
+        }
     };
 
-    // 凭据已选定 → 用 resolved_cache_usage 重算并提交 cache_tracker（BK 模式）
+    // 凭据已选定 → 用 resolved_cache_usage 重算并提交 cache_tracker。
     let final_cache_context = match (context.cache_tracker, context.cache_profile) {
         (Some(tracker), Some(profile)) => {
             let resolved = resolved_cache_usage(tracker, api_result.credential_id, profile);
@@ -1581,6 +1650,7 @@ async fn handle_stream_request(
     // 创建 SSE 流（permit 随 stream 一起持有，body 消费完成后再释放）
     let cred_permit = api_result._credential_permit.take();
     let glb_permit = api_result._global_permit.take();
+    let proxy_permit = api_result._proxy_permit.take();
     let tm = provider.token_manager().clone();
     let credential_id = api_result.credential_id;
     let stream = create_sse_stream(
@@ -1589,6 +1659,7 @@ async fn handle_stream_request(
         initial_events,
         cred_permit,
         glb_permit,
+        proxy_permit,
         tm,
         credential_id,
         context.app_state,
@@ -1620,6 +1691,7 @@ fn create_sse_stream(
     initial_events: Vec<SseEvent>,
     cred_permit: Option<OwnedSemaphorePermit>,
     glb_permit: Option<OwnedSemaphorePermit>,
+    proxy_permit: Option<OwnedSemaphorePermit>,
     tm: std::sync::Arc<crate::kiro::token_manager::MultiTokenManager>,
     credential_id: u64,
     app_state: AppState,
@@ -1636,8 +1708,8 @@ fn create_sse_stream(
     let body_stream = response.bytes_stream();
 
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), cred_permit, glb_permit, tm, credential_id, app_state, api_key_id),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, cred_permit, glb_permit, tm, credential_id, app_state, api_key_id)| async move {
+        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), cred_permit, glb_permit, proxy_permit, tm, credential_id, app_state, api_key_id),
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, cred_permit, glb_permit, proxy_permit, tm, credential_id, app_state, api_key_id)| async move {
             if finished {
                 return None;
             }
@@ -1657,7 +1729,7 @@ fn create_sse_stream(
                             for result in decoder.decode_iter() {
                                 match result {
                                     Ok(frame) => {
-                                        // 对齐 Kiro-Go: 从帧中提取 token 使用量（比估算更准确）
+                                        // 从帧中提取 token 使用量（比估算更准确）
                                         if let Some(usage) = crate::kiro::model::events::extract_token_usage_from_frame_with_current(
                                             &frame,
                                             None,
@@ -1687,27 +1759,30 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, cred_permit, glb_permit, tm, credential_id, app_state, api_key_id)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, cred_permit, glb_permit, proxy_permit, tm, credential_id, app_state, api_key_id)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
                             // 上游异常结束 → 立即释放 permit（占用语义 = 一次上游来回，不绑客户端消费速度）
                             drop(cred_permit);
                             drop(glb_permit);
+                            drop(proxy_permit);
                             if let Some(m) = ctx.metering.as_ref() {
                                 tm.apply_credit_usage(credential_id, m.usage);
                             }
-                            let final_events = ctx.generate_final_events();
+                            app_state.record_gateway_failure();
+                            let final_events = ctx.generate_error_events(e.to_string());
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, None, None, tm, credential_id, app_state, api_key_id)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, None, None, None, tm, credential_id, app_state, api_key_id)))
                         }
                         None => {
                             // 上游正常结束 → 立即释放 permit
                             drop(cred_permit);
                             drop(glb_permit);
+                            drop(proxy_permit);
                             if let Some(m) = ctx.metering.as_ref() {
                                 tm.apply_credit_usage(credential_id, m.usage);
                             }
@@ -1720,7 +1795,7 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, None, None, tm, credential_id, app_state, api_key_id)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, None, None, None, tm, credential_id, app_state, api_key_id)))
                         }
                     }
                 }
@@ -1728,7 +1803,7 @@ fn create_sse_stream(
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, cred_permit, glb_permit, tm, credential_id, app_state, api_key_id)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, cred_permit, glb_permit, proxy_permit, tm, credential_id, app_state, api_key_id)))
                 }
             }
         },
@@ -1747,14 +1822,21 @@ async fn handle_non_stream_request(
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let api_result = match provider
-        .call_api(context.request_body, context.user_id)
+        .call_api_with_client_affinity(
+            context.request_body,
+            context.user_id,
+            context.api_key_id.as_deref(),
+        )
         .await
     {
         Ok(resp) => resp,
-        Err(e) => return map_kiro_provider_error_to_response(context.request_body, e),
+        Err(e) => {
+            context.app_state.record_gateway_failure();
+            return map_kiro_provider_error_to_response(context.request_body, e);
+        }
     };
 
-    // 凭据已选定 → 用 resolved_cache_usage 重算并提交 cache_tracker（BK 模式）
+    // 凭据已选定 → 用 resolved_cache_usage 重算并提交 cache_tracker。
     let final_cache_context = match (context.cache_tracker, context.cache_profile) {
         (Some(tracker), Some(profile)) => {
             let resolved = resolved_cache_usage(tracker, api_result.credential_id, profile);
@@ -1772,6 +1854,9 @@ async fn handle_non_stream_request(
 
     // 读取响应体
     let credential_id = api_result.credential_id;
+    let _cred_permit = api_result._credential_permit;
+    let _glb_permit = api_result._global_permit;
+    let _proxy_permit = api_result._proxy_permit;
     let body_bytes = match api_result.response.bytes().await {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -1812,7 +1897,7 @@ async fn handle_non_stream_request(
     for result in decoder.decode_iter() {
         match result {
             Ok(frame) => {
-                // 对齐 Kiro-Go: 从帧 payload 中提取 token 使用量
+                // 从帧 payload 中提取 token 使用量。
                 if let Some(usage) =
                     crate::kiro::model::events::extract_token_usage_from_frame_with_current(
                         &frame,
@@ -1947,9 +2032,9 @@ async fn handle_non_stream_request(
     // 估算输出 tokens
     let output_tokens = token::estimate_output_tokens(&content);
 
-    // Kiro-Go 语义：优先使用上游 real input tokens，无则回落请求侧估算。
+    // 优先使用上游 real input tokens，无则回落请求侧估算。
     let final_input_tokens = context_input_tokens.unwrap_or(context.input_tokens);
-    // BK 模式：billed = final - cache_creation - cache_read（用 saturating_sub 防负）
+    // billed = final - cache_creation - cache_read（用 saturating_sub 防负）。
     let billed_input_tokens = final_cache_context
         .map(|ctx| {
             billed_input_tokens(
@@ -1973,7 +2058,7 @@ async fn handle_non_stream_request(
         output_tokens
     );
 
-    // 构建 Anthropic 响应（usage 字段按 BK 模式注入 credit + cache）
+    // 构建 Anthropic 响应（usage 字段注入 credit + cache）。
     let response_body = {
         let mut usage = json!({
             "input_tokens": billed_input_tokens,
@@ -2041,7 +2126,7 @@ fn inject_system_prompt(payload: &mut MessagesRequest, shared: &SharedPromptConf
     }
 }
 
-/// 模型名/请求兜底，确保 thinking 配置与上游兼容
+/// 模型名/请求兜底，确保 thinking 配置满足上游要求
 ///
 /// 1. **Opus 4.7 不支持 `type: "enabled"`**：自动降级为 `adaptive`，
 ///    补 `display=summarized` + `output_config.effort=high`，
@@ -2064,7 +2149,7 @@ pub(crate) fn override_thinking_from_model_name(
     // Case 1: Opus 4.7 不支持 enabled，自动降级 adaptive；不论有无后缀
     if is_opus_4_7 {
         if let Some(ref mut t) = payload.thinking {
-            if t.thinking_type == "enabled" {
+            if t.thinking_type.trim().eq_ignore_ascii_case("enabled") {
                 tracing::info!(
                     model = %payload.model,
                     "Opus 4.7 不支持 thinking.type=\"enabled\"，自动降级为 \"adaptive\""
@@ -2161,7 +2246,7 @@ fn effective_count_tokens_request(
     payload: CountTokensRequest,
     thinking_suffix: &str,
 ) -> CountTokensRequest {
-    let mut effective = MessagesRequest {
+    let effective = MessagesRequest {
         model: payload.model,
         max_tokens: payload.max_tokens,
         temperature: None,
@@ -2175,33 +2260,7 @@ fn effective_count_tokens_request(
         output_config: payload.output_config,
         metadata: None,
     };
-    override_thinking_from_model_name(&mut effective, thinking_suffix);
-
-    if let Some(prefix) = generate_thinking_prefix(&effective) {
-        effective.system = Some(match effective.system.take() {
-            Some(mut system) if !system.is_empty() => {
-                if !system
-                    .iter()
-                    .any(|block| block.text.contains("<thinking_mode>"))
-                {
-                    system.insert(
-                        0,
-                        SystemMessage {
-                            text: prefix,
-                            block_type: Some("text".to_string()),
-                            cache_control: None,
-                        },
-                    );
-                }
-                system
-            }
-            _ => vec![SystemMessage {
-                text: prefix,
-                block_type: Some("text".to_string()),
-                cache_control: None,
-            }],
-        });
-    }
+    let effective = request_with_thinking_accounting(effective, thinking_suffix);
 
     CountTokensRequest {
         model: effective.model,
@@ -2214,9 +2273,49 @@ fn effective_count_tokens_request(
     }
 }
 
+fn request_with_thinking_accounting(
+    mut payload: MessagesRequest,
+    thinking_suffix: &str,
+) -> MessagesRequest {
+    override_thinking_from_model_name(&mut payload, thinking_suffix);
+    payload.model = map_model_with_thinking_suffix(&payload.model, thinking_suffix);
+    apply_thinking_prefix_for_accounting(&mut payload);
+    payload
+}
+
+fn apply_thinking_prefix_for_accounting(payload: &mut MessagesRequest) {
+    let Some(prefix) = generate_thinking_prefix(payload) else {
+        return;
+    };
+
+    payload.system = Some(match payload.system.take() {
+        Some(mut system) if !system.is_empty() => {
+            if !system
+                .iter()
+                .any(|block| block.text.contains("<thinking_mode>"))
+            {
+                system.insert(
+                    0,
+                    SystemMessage {
+                        text: prefix,
+                        block_type: Some("text".to_string()),
+                        cache_control: None,
+                    },
+                );
+            }
+            system
+        }
+        _ => vec![SystemMessage {
+            text: prefix,
+            block_type: Some("text".to_string()),
+            cache_control: None,
+        }],
+    });
+}
+
 /// POST /cc/v1/messages
 ///
-/// Claude Code 兼容端点，与 /v1/messages 的区别在于：
+/// Claude Code 端点，与 /v1/messages 的区别在于：
 /// - 流式响应会等待 kiro 端返回 contextUsageEvent 后再发送 message_start
 /// - message_start 中的 input_tokens 是从 contextUsageEvent 计算的准确值
 pub async fn post_messages_cc(
@@ -2267,11 +2366,13 @@ pub async fn post_messages_cc(
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
 
         // 估算输入 tokens
+        let accounting_payload =
+            request_with_thinking_accounting(payload.clone(), &thinking_suffix);
         let input_tokens = token::count_all_tokens(
-            payload.model.clone(),
-            payload.system.clone(),
-            payload.messages.clone(),
-            payload.tools.clone(),
+            accounting_payload.model,
+            accounting_payload.system,
+            accounting_payload.messages,
+            accounting_payload.tools,
         ) as i32;
 
         return websearch::handle_websearch_request(provider, &payload, None, None, input_tokens)
@@ -2292,9 +2393,13 @@ pub async fn post_messages_cc(
 
     let prompt_cache = state.prompt_cache_snapshot();
     let claude_format = state.thinking_config.read().claude_format.clone();
-    let cache_profile = prompt_cache
-        .accounting_enabled
-        .then(|| build_cache_profile(prompt_cache.tracker.as_ref(), &payload, prep.input_tokens));
+    let cache_profile = prompt_cache.accounting_enabled.then(|| {
+        build_cache_profile(
+            prompt_cache.tracker.as_ref(),
+            &prep.accounting_payload,
+            prep.input_tokens,
+        )
+    });
 
     if payload.stream {
         // 流式响应（缓冲模式）
@@ -2359,12 +2464,18 @@ async fn handle_stream_request_buffered(
     api_key_id: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let mut api_result = match provider.call_api_stream(request_body, user_id).await {
+    let mut api_result = match provider
+        .call_api_stream_with_client_affinity(request_body, user_id, api_key_id.as_deref())
+        .await
+    {
         Ok(resp) => resp,
-        Err(e) => return map_kiro_provider_error_to_response(request_body, e),
+        Err(e) => {
+            app_state.record_gateway_failure();
+            return map_kiro_provider_error_to_response(request_body, e);
+        }
     };
 
-    // 凭据已选定 → 用 resolved_cache_usage 重算并提交 cache_tracker（BK 模式）
+    // 凭据已选定 → 用 resolved_cache_usage 重算并提交 cache_tracker。
     let final_cache_usage = match (cache_tracker, cache_profile) {
         (Some(tracker), Some(profile)) => {
             let resolved = resolved_cache_usage(tracker, api_result.credential_id, profile);
@@ -2387,6 +2498,7 @@ async fn handle_stream_request_buffered(
 
     let _cred_permit = api_result._credential_permit.take();
     let _glb_permit = api_result._global_permit.take();
+    let _proxy_permit = api_result._proxy_permit.take();
     let response = api_result.response;
     let _credential_id = api_result.credential_id;
 
@@ -2407,6 +2519,7 @@ async fn handle_stream_request_buffered(
         ctx,
         _cred_permit,
         _glb_permit,
+        _proxy_permit,
         tm,
         _credential_id,
         app_state,
@@ -2435,6 +2548,7 @@ fn create_buffered_sse_stream(
     ctx: BufferedStreamContext,
     cred_permit: Option<OwnedSemaphorePermit>,
     glb_permit: Option<OwnedSemaphorePermit>,
+    proxy_permit: Option<OwnedSemaphorePermit>,
     tm: std::sync::Arc<crate::kiro::token_manager::MultiTokenManager>,
     credential_id: u64,
     app_state: AppState,
@@ -2451,12 +2565,13 @@ fn create_buffered_sse_stream(
             interval(Duration::from_secs(PING_INTERVAL_SECS)),
             cred_permit,
             glb_permit,
+            proxy_permit,
             tm,
             credential_id,
             app_state,
             api_key_id,
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, cred_permit, glb_permit, tm, credential_id, app_state, api_key_id)| async move {
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, cred_permit, glb_permit, proxy_permit, tm, credential_id, app_state, api_key_id)| async move {
             if finished {
                 return None;
             }
@@ -2471,7 +2586,7 @@ fn create_buffered_sse_stream(
                     _ = ping_interval.tick() => {
                         tracing::trace!("发送 ping 保活事件（缓冲模式）");
                         let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, cred_permit, glb_permit, tm, credential_id, app_state, api_key_id)));
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, cred_permit, glb_permit, proxy_permit, tm, credential_id, app_state, api_key_id)));
                     }
 
                     // 然后处理数据流
@@ -2486,7 +2601,7 @@ fn create_buffered_sse_stream(
                                 for result in decoder.decode_iter() {
                                     match result {
                                         Ok(frame) => {
-                                            // 对齐 Kiro-Go: 从帧中提取 token 使用量
+                                            // 从帧中提取 token 使用量。
                                             if let Some(usage) = crate::kiro::model::events::extract_token_usage_from_frame_with_current(
                                                 &frame,
                                                 None,
@@ -2516,6 +2631,7 @@ fn create_buffered_sse_stream(
                                 // 上游异常结束 → 立即释放 permit
                                 drop(cred_permit);
                                 drop(glb_permit);
+                                drop(proxy_permit);
                                 if let Some(m) = ctx.metering() {
                                     tm.apply_credit_usage(credential_id, m.usage);
                                 }
@@ -2524,12 +2640,13 @@ fn create_buffered_sse_stream(
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, None, None, tm, credential_id, app_state, api_key_id)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, None, None, None, tm, credential_id, app_state, api_key_id)));
                             }
                             None => {
                                 // 上游正常结束 → 立即释放 permit
                                 drop(cred_permit);
                                 drop(glb_permit);
+                                drop(proxy_permit);
                                 if let Some(m) = ctx.metering() {
                                     tm.apply_credit_usage(credential_id, m.usage);
                                 }
@@ -2542,7 +2659,7 @@ fn create_buffered_sse_stream(
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, None, None, tm, credential_id, app_state, api_key_id)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, None, None, None, tm, credential_id, app_state, api_key_id)));
                             }
                         }
                     }
@@ -2674,7 +2791,7 @@ mod tests {
             false,
             false,
             std::sync::Arc::new(parking_lot::RwLock::new(
-                crate::anthropic::middleware::PromptCacheRuntime::new(300, false),
+                crate::anthropic::middleware::PromptCacheRuntime::new(300, false, 0.85),
             )),
             crate::anthropic::middleware::ThinkingRuntimeConfig {
                 suffix: "-thinking".to_string(),
@@ -2733,7 +2850,7 @@ mod tests {
     }
 
     #[test]
-    fn non_stream_tool_use_flushes_without_stop_like_kiro_go() {
+    fn non_stream_tool_use_flushes_without_stop() {
         let mut current = None;
         let mut output = Vec::new();
         let names = std::collections::HashMap::new();
@@ -2753,7 +2870,7 @@ mod tests {
     }
 
     #[test]
-    fn non_stream_tool_use_adopts_late_real_id_like_kiro_go() {
+    fn non_stream_tool_use_adopts_late_real_id() {
         let mut current = None;
         let mut output = Vec::new();
         let names = std::collections::HashMap::new();
@@ -2777,7 +2894,7 @@ mod tests {
     }
 
     #[test]
-    fn non_stream_tool_use_object_input_replaces_buffer_like_kiro_go() {
+    fn non_stream_tool_use_object_input_replaces_buffer() {
         let mut current = None;
         let mut output = Vec::new();
         let names = std::collections::HashMap::new();
@@ -2806,7 +2923,7 @@ mod tests {
     }
 
     #[test]
-    fn non_stream_tool_use_name_change_flushes_previous_like_kiro_go() {
+    fn non_stream_tool_use_name_change_flushes_previous() {
         let mut current = None;
         let mut output = Vec::new();
         let names = std::collections::HashMap::new();
@@ -2832,7 +2949,7 @@ mod tests {
     }
 
     #[test]
-    fn non_stream_assistant_text_normalizes_cumulative_chunks_like_kiro_go() {
+    fn non_stream_assistant_text_normalizes_cumulative_chunks() {
         let mut text = String::new();
         let mut previous = String::new();
 
@@ -2844,7 +2961,7 @@ mod tests {
     }
 
     #[test]
-    fn non_stream_reasoning_text_normalizes_cumulative_chunks_like_kiro_go() {
+    fn non_stream_reasoning_text_normalizes_cumulative_chunks() {
         let mut thinking = String::new();
         let mut previous = String::new();
 
@@ -2855,7 +2972,7 @@ mod tests {
     }
 
     #[test]
-    fn non_stream_omitted_thinking_emits_empty_block_like_kiro_go() {
+    fn non_stream_omitted_thinking_emits_empty_block() {
         let content = build_non_stream_content_blocks(
             "final answer",
             "private reasoning",
@@ -2890,7 +3007,7 @@ mod tests {
     }
 
     #[test]
-    fn non_stream_think_format_keeps_reasoning_in_text_like_kiro_go() {
+    fn non_stream_think_format_keeps_reasoning_in_text() {
         let content = build_non_stream_content_blocks(
             "final answer",
             "visible reasoning",
@@ -2909,7 +3026,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_model_info_matches_kiro_go_image_shape() {
+    fn test_build_model_info_includes_image_capability_shape() {
         let model = build_model_info("claude-sonnet-4.6", "anthropic", true);
 
         assert_eq!(model.id, "claude-sonnet-4.6");
@@ -3076,7 +3193,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_messages_request_shape_rejects_invalid_thinking_type_like_kiro_go() {
+    fn test_validate_messages_request_shape_rejects_invalid_thinking_type() {
         let req = messages_req(serde_json::json!({
             "model": "claude-sonnet-4-6",
             "max_tokens": 4096,
@@ -3136,7 +3253,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_messages_request_shape_rejects_invalid_thinking_display_like_kiro_go() {
+    fn test_validate_messages_request_shape_rejects_invalid_thinking_display() {
         let req = messages_req(serde_json::json!({
             "model": "claude-sonnet-4-6",
             "max_tokens": 4096,
@@ -3155,7 +3272,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_messages_request_shape_rejects_disabled_thinking_display_like_kiro_go() {
+    fn test_validate_messages_request_shape_rejects_disabled_thinking_display() {
         let req = messages_req(serde_json::json!({
             "model": "claude-sonnet-4-6",
             "max_tokens": 4096,
@@ -3167,6 +3284,18 @@ mod tests {
             validate_messages_request_shape(&req),
             Some("thinking.display is not supported when thinking.type is disabled")
         );
+    }
+
+    #[test]
+    fn test_validate_messages_request_shape_allows_empty_thinking_display() {
+        let req = messages_req(serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 4096,
+            "thinking": {"type": "adaptive", "display": ""},
+            "messages": [{"role": "user", "content": "hello"}]
+        }));
+
+        assert_eq!(validate_messages_request_shape(&req), None);
     }
 
     #[test]
@@ -3183,7 +3312,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_messages_request_shape_rejects_adaptive_thinking_budget_like_kiro_go() {
+    fn test_validate_messages_request_shape_rejects_adaptive_thinking_budget() {
         let req = messages_req(serde_json::json!({
             "model": "claude-sonnet-4-6",
             "max_tokens": 4096,
@@ -3198,7 +3327,19 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_messages_request_shape_rejects_disabled_thinking_budget_like_kiro_go() {
+    fn test_validate_messages_request_shape_allows_adaptive_zero_budget() {
+        let req = messages_req(serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 4096,
+            "thinking": {"type": "adaptive", "budget_tokens": 0},
+            "messages": [{"role": "user", "content": "hello"}]
+        }));
+
+        assert_eq!(validate_messages_request_shape(&req), None);
+    }
+
+    #[test]
+    fn test_validate_messages_request_shape_rejects_disabled_thinking_budget() {
         let req = messages_req(serde_json::json!({
             "model": "claude-sonnet-4-6",
             "max_tokens": 4096,
@@ -3213,7 +3354,19 @@ mod tests {
     }
 
     #[test]
-    fn test_count_tokens_effective_request_includes_thinking_prefix_like_kiro_go() {
+    fn test_validate_messages_request_shape_allows_disabled_zero_budget() {
+        let req = messages_req(serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 4096,
+            "thinking": {"type": "disabled", "budget_tokens": 0},
+            "messages": [{"role": "user", "content": "hello"}]
+        }));
+
+        assert_eq!(validate_messages_request_shape(&req), None);
+    }
+
+    #[test]
+    fn test_count_tokens_effective_request_includes_thinking_prefix() {
         let payload: CountTokensRequest = serde_json::from_value(serde_json::json!({
             "model": "claude-opus-4-6",
             "max_tokens": 4096,
@@ -3256,6 +3409,7 @@ mod tests {
 
         let effective = effective_count_tokens_request(payload, "-thinking");
 
+        assert_eq!(effective.model, "claude-sonnet-4.5");
         assert_eq!(
             effective.thinking.as_ref().and_then(|t| t.budget_tokens),
             Some(20000)
@@ -3270,6 +3424,43 @@ mod tests {
                 .text
                 .contains("<thinking_mode>enabled</thinking_mode>")
         );
+    }
+
+    #[test]
+    fn test_messages_accounting_request_includes_thinking_prefix() {
+        let payload: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-4-5-thinking",
+            "max_tokens": 4096,
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+
+        let base_tokens = token::count_all_tokens(
+            payload.model.clone(),
+            payload.system.clone(),
+            payload.messages.clone(),
+            payload.tools.clone(),
+        );
+        let effective = request_with_thinking_accounting(payload, "-thinking");
+        let effective_tokens = token::count_all_tokens(
+            effective.model.clone(),
+            effective.system.clone(),
+            effective.messages.clone(),
+            effective.tools.clone(),
+        );
+
+        assert_eq!(effective.model, "claude-sonnet-4.5");
+        assert!(
+            effective
+                .system
+                .as_ref()
+                .unwrap()
+                .first()
+                .unwrap()
+                .text
+                .contains("<thinking_mode>enabled</thinking_mode>")
+        );
+        assert!(effective_tokens > base_tokens);
     }
 
     fn sample_messages_request() -> MessagesRequest {
@@ -3314,7 +3505,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_context_uses_kiro_go_cache_profile_tokens() {
+    fn test_cache_context_uses_cache_profile_tokens() {
         let payload = sample_messages_request();
 
         let cache_tracker =
@@ -3324,7 +3515,7 @@ mod tests {
         let raw_system_tokens = token::count_tokens(system_text) as i32;
 
         let cache_profile = build_cache_profile(&cache_tracker, &payload, raw_system_tokens);
-        let cache_context = compute_cache_usage(&cache_tracker, 0, &cache_profile);
+        let cache_context = compute_cache_usage(&cache_tracker, 1, &cache_profile);
 
         assert!(cache_profile.total_input_tokens() >= raw_system_tokens);
         assert_eq!(
@@ -3365,7 +3556,7 @@ mod tests {
     }
 
     #[test]
-    fn test_non_stream_usage_prefers_kiro_go_real_input_tokens() {
+    fn test_non_stream_usage_prefers_real_input_tokens() {
         let estimated_input_tokens = 1493;
         let upstream_context_input_tokens = 3106;
         let cache_creation_input_tokens = 9;
@@ -3407,7 +3598,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_claude_usage_map_includes_cache_fields_like_kiro_go() {
+    fn test_build_claude_usage_map_includes_cache_fields() {
         let cache_context = CacheUsageContext {
             cache_creation_input_tokens: 30,
             cache_read_input_tokens: 20,
@@ -3536,7 +3727,7 @@ mod tests {
     }
 
     #[test]
-    fn test_truncate_payload_does_not_infer_system_priming_from_ordinary_turn_like_kiro_go() {
+    fn test_truncate_payload_does_not_infer_system_priming_from_ordinary_turn() {
         let big = "ordinary context ".repeat(700);
         let mut history = vec![
             KiroMessage::user(format!("ordinary user: {big}"), "model"),
@@ -3582,7 +3773,7 @@ mod tests {
     }
 
     #[test]
-    fn test_prepare_request_truncates_payload_when_compression_disabled_like_kiro_go() {
+    fn test_prepare_request_truncates_payload_when_compression_disabled() {
         let mut compression = crate::model::config::CompressionConfig::default();
         compression.max_request_body_bytes = 50_000;
         let state = test_state_with_compression(compression);
@@ -3631,7 +3822,7 @@ mod tests {
     }
 
     #[test]
-    fn test_prepare_request_serializes_anthropic_inference_config_like_kiro_go() {
+    fn test_prepare_request_serializes_anthropic_inference_config() {
         let state = test_state_with_compression(crate::model::config::CompressionConfig::default());
         let payload = MessagesRequest {
             model: "claude-sonnet-4.6".to_string(),
@@ -3710,6 +3901,24 @@ mod tests {
             "claude-opus-4-7",
             Some(Thinking {
                 thinking_type: "enabled".to_string(),
+                budget_tokens: Some(20000),
+                display: None,
+            }),
+            None,
+        );
+        override_thinking_from_model_name(&mut req, "-thinking");
+        let t = req.thinking.as_ref().unwrap();
+        assert_eq!(t.thinking_type, "adaptive");
+        assert_eq!(t.display.as_deref(), Some("summarized"));
+        assert_eq!(req.output_config.as_ref().unwrap().effort, "high");
+    }
+
+    #[test]
+    fn test_override_thinking_opus_4_7_enabled_trims_and_folds_case() {
+        let mut req = make_req(
+            "claude-opus-4-7",
+            Some(Thinking {
+                thinking_type: " Enabled ".to_string(),
                 budget_tokens: Some(20000),
                 display: None,
             }),

@@ -1,7 +1,7 @@
 //! Token 使用量提取
 //!
 //! 从 Kiro 事件 payload 中递归提取 token 使用量统计。
-//! 对齐 Kiro-Go `updateTokensFromEvent()` / `collectUsageMaps()` 逻辑。
+//! 递归收集 usage map 并读取多种 token 数值字段。
 //!
 //! Kiro 上游可能在任意事件的 payload 中嵌套 `usage` / `tokenUsage` / `token_usage` 字段，
 //! 包含 inputTokens / outputTokens 等实际 token 计数。
@@ -35,7 +35,7 @@ impl TokenUsage {
 ///
 /// 递归查找 `usage` / `tokenUsage` / `token_usage` 字段，
 /// 然后从中提取 inputTokens / outputTokens 等值。
-/// 对齐 Kiro-Go `updateTokensFromEvent()` + `collectUsageMaps()` + `readTokenNumber()`。
+/// 递归收集 usage map，并同时读取 JSON number 与字符串形式数值。
 pub fn extract_token_usage(event: &Value) -> Option<TokenUsage> {
     extract_token_usage_with_current(event, None, None)
 }
@@ -160,7 +160,6 @@ fn collect_usage_maps(v: &Value, out: &mut Vec<serde_json::Map<String, Value>>) 
 
 /// 从 map 中按多个候选 key 读取数值
 ///
-/// 对齐 Kiro-Go `readTokenNumber()`:
 /// 同时处理 JSON number 和 string-encoded number（如 `"100"`）
 fn read_token_number(map: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<i64> {
     for key in keys {
@@ -174,7 +173,7 @@ fn read_token_number(map: &serde_json::Map<String, Value>, keys: &[&str]) -> Opt
                         return Some(f as i64);
                     }
                 }
-                // 对齐 Kiro-Go: 上游可能以字符串形式返回数值
+                // 上游可能以字符串形式返回数值
                 Value::String(s) => {
                     if let Ok(i) = s.parse::<i64>() {
                         return Some(i);
@@ -209,7 +208,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_from_root_fields_like_kiro_go() {
+    fn test_extract_from_root_fields() {
         let event = json!({
             "inputTokens": 100,
             "outputTokens": 50
@@ -272,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn test_root_total_tokens_fallback_like_kiro_go() {
+    fn test_root_total_tokens_fallback() {
         let event = json!({
             "totalTokens": 150,
             "outputTokens": 50
@@ -283,7 +282,7 @@ mod tests {
     }
 
     #[test]
-    fn test_total_tokens_fallback_uses_current_output_like_kiro_go() {
+    fn test_total_tokens_fallback_uses_current_output() {
         let event = json!({
             "usage": {
                 "totalTokens": 150

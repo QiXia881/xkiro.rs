@@ -14,37 +14,35 @@ use super::{
     types::{
         AddCredentialRequest, BatchOperationRequest, BatchRefreshRequest,
         CompleteIamSsoLoginRequest, CompleteKiroSsoLoginRequest, CompleteSocialCallbackRequest,
-        CompleteSocialLoginRequest, CreateApiKeyRequest, ExportKamRequest, ExportTokenJsonRequest,
-        ImportSsoTokenRequest, ImportTokenJsonRequest, KiroGoImportCredentialsRequest,
-        KiroGoUpdateAccountRequest, PollBuilderIdLoginRequest, PollBuilderIdLoginResponse,
-        PollKiroSsoLoginRequest, SetConcurrencyRequest, SetDisabledRequest, SetEndpointRequest,
-        SetOverageRequest, SetPriorityRequest, SetRegionRequest, StartBuilderIdLoginRequest,
-        StartIdcLoginRequest, StartKiroSsoLoginRequest, StartSocialLoginRequest, SuccessResponse,
-        UpdateApiKeyRequest, UpdateEndpointConfigRequest, UpdateGlobalConfigRequest,
-        UpdatePromptFilterConfigRequest, UpdateProxyConfigRequest, UpdateSettingsRequest,
-        UpdateSystemPromptRequest, UpdateThinkingConfigRequest, UpsertUserPresetRequest,
+        CompleteSocialLoginRequest, CreateApiKeyRequest, CredentialAliasUpdateRequest,
+        CredentialBatchRequest, CredentialProbeRequest, CredentialSnapshotExportRequest,
+        ExportCredentialBackupRequest, ImportCredentialRecordRequest,
+        ImportCredentialRecordResponse, ImportCredentialsRequest, ImportSsoTokenRequest,
+        PollBuilderIdLoginByBodyResponse, PollBuilderIdLoginRequest, PollKiroSsoLoginRequest,
+        ProxyAutoAssignRequest, ProxyImportRequest, ProxyUpsertRequest,
+        RefreshAllCredentialModelsResponse, RefreshCredentialModelsResponse, SetConcurrencyRequest,
+        SetCredentialProxyByRegionRequest, SetCredentialProxyRequest, SetDisabledRequest,
+        SetEndpointRequest, SetOverageRequest, SetPriorityRequest, SetRegionRequest,
+        StartBuilderIdLoginRequest, StartIdcLoginRequest, StartKiroSsoLoginRequest,
+        StartSocialLoginRequest, SuccessResponse, UpdateAccessSettingsRequest, UpdateApiKeyRequest,
+        UpdateCommonConfigRequest, UpdateEndpointConfigRequest, UpdateGlobalConfigRequest,
+        UpdatePromptFilterConfigRequest, UpdateProxyConfigRequest, UpdateSystemPromptRequest,
+        UpdateThinkingConfigRequest, UpsertUserPresetRequest,
     },
 };
 use crate::model::config::CompressionConfig;
-
-#[derive(Default, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct KiroGoExportRequest {
-    #[serde(default)]
-    ids: Vec<serde_json::Value>,
-}
-
-fn parse_expires_at_millis(value: Option<&str>) -> Option<i64> {
-    value
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        .map(|dt| dt.timestamp_millis())
-}
 
 /// GET /api/admin/credentials
 /// 获取所有凭据状态
 pub async fn get_all_credentials(State(state): State<AdminState>) -> impl IntoResponse {
     let response = state.service.get_all_credentials();
     Json(response)
+}
+
+/// GET /api/admin/accounts
+/// `/accounts` 凭据别名视图列表
+pub async fn list_credential_alias_views(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.list_credential_alias_views())
 }
 
 /// GET /api/admin/credentials/balances/cached
@@ -175,23 +173,41 @@ pub async fn add_credential(
     }
 }
 
-/// POST /api/admin/auth/credentials
-/// Kiro-Go 兼容导入路径：支持 external_idp trust-on-import 和回退刷新。
-pub async fn import_credentials_kiro_go(
+/// POST /api/admin/credentials/import/record
+/// 单条凭据记录导入：支持 external_idp trust-on-import 和回退刷新。
+pub async fn import_credential_record(
     State(state): State<AdminState>,
-    Json(payload): Json<KiroGoImportCredentialsRequest>,
+    Json(payload): Json<ImportCredentialRecordRequest>,
 ) -> impl IntoResponse {
-    match state.service.import_kiro_go_credential(payload).await {
-        Ok(resp) => Json(serde_json::json!({
-            "success": true,
-            "account": {
-                "id": resp.credential_id,
-                "email": resp.email,
-            },
-        }))
-        .into_response(),
+    match state.service.import_credential_record(payload).await {
+        Ok(resp) => Json(ImportCredentialRecordResponse::new(resp)).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
+}
+
+/// GET /api/admin/accounts/:id/models
+/// `/accounts` 凭据别名模型刷新，支持 sourceAccountId 或本地数字 ID
+pub async fn refresh_credential_alias_models(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .refresh_credential_models_by_path_id(&id)
+        .await
+    {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/accounts/:id/models/cached
+/// `/accounts` 凭据别名缓存模型列表，支持 sourceAccountId 或本地数字 ID
+pub async fn get_cached_credential_alias_models(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    Json(state.service.get_cached_credential_models_by_path_id(&id))
 }
 
 /// DELETE /api/admin/credentials/:id
@@ -206,88 +222,66 @@ pub async fn delete_credential(
     }
 }
 
-/// GET /api/admin/accounts/:id/full
-/// Kiro-Go 兼容完整账号信息，仅返回本地可导出的 OAuth 凭据字段。
-pub async fn get_account_full_kiro_go(
+/// DELETE /api/admin/accounts/:id
+/// `/accounts` 凭据别名删除路径，支持 sourceAccountId 或本地数字 ID
+pub async fn delete_credential_alias(
     State(state): State<AdminState>,
-    Path(id): Path<u64>,
+    Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let snapshot = state.service.token_manager_snapshot();
-    let entry = match snapshot.entries.iter().find(|entry| entry.id == id) {
-        Some(entry) => entry,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "Account not found"})),
-            )
-                .into_response();
-        }
-    };
+    match state.service.delete_credential_by_path_id(&id) {
+        Ok(_) => Json(serde_json::json!({ "success": true })).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
 
-    let mut exported = state.service.export_credentials_to_kam(&[id]);
-    let account = match exported.pop() {
-        Some(account) => account,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "credential is not exportable"})),
-            )
-                .into_response();
-        }
-    };
-
-    Json(serde_json::json!({
-        "id": id,
-        "email": account.email,
-        "userId": account.user_id,
-        "nickname": account.label,
-        "accessToken": account.access_token,
-        "refreshToken": account.refresh_token,
-        "clientId": account.client_id,
-        "clientSecret": account.client_secret,
-        "authMethod": account.auth_method,
-        "provider": account.provider,
-        "region": account.region,
-        "expiresAt": parse_expires_at_millis(account.expires_at.as_deref()),
-        "machineId": account.machine_id,
-        "weight": entry.weight,
-        "profileArn": account.profile_arn,
-        "proxyURL": entry.proxy_url,
-        "enabled": !entry.disabled,
-        "requestCount": entry.success_count,
-        "errorCount": entry.failure_count,
-        "totalTokens": 0,
-        "totalCredits": 0.0,
-        "lastUsed": entry.last_used_at,
-    }))
-    .into_response()
+/// GET /api/admin/accounts/:id/full
+/// `/accounts` 凭据别名完整导出视图，支持 sourceAccountId 或本地数字 ID。
+pub async fn get_credential_alias_full(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.service.get_credential_full_export_by_path_id(&id) {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
 }
 
 /// PUT /api/admin/accounts/:id
-/// Kiro-Go 兼容更新路径；仅适配本地已有等价语义的字段。
-pub async fn update_account_kiro_go(
+/// `/accounts` 凭据别名更新路径；仅适配本地已有等价语义的字段。
+pub async fn update_credential_alias(
     State(state): State<AdminState>,
-    Path(id): Path<u64>,
-    Json(payload): Json<KiroGoUpdateAccountRequest>,
+    Path(id): Path<String>,
+    Json(payload): Json<CredentialAliasUpdateRequest>,
 ) -> impl IntoResponse {
-    match state.service.update_kiro_go_account(id, payload) {
+    match state
+        .service
+        .update_credential_alias_by_path_id(&id, payload)
+    {
         Ok(_) => Json(serde_json::json!({ "success": true })).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
 
 /// POST /api/admin/credentials/:id/refresh
-/// 强制刷新凭据 Token
+/// 强制刷新凭据令牌
 pub async fn force_refresh_token(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
     match state.service.force_refresh_token(id).await {
-        Ok(_) => Json(SuccessResponse::new(format!(
-            "凭据 #{} Token 已强制刷新",
-            id
-        )))
-        .into_response(),
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 令牌已强制刷新", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/accounts/:id/refresh
+/// `/accounts` 凭据别名信息刷新，支持 sourceAccountId 或本地数字 ID
+pub async fn refresh_credential_alias(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.service.refresh_credential_by_path_id(&id).await {
+        Ok(resp) => Json(resp).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
@@ -310,136 +304,47 @@ pub async fn set_compression_config(
     Json(payload)
 }
 
-/// POST /api/admin/credentials/import-token-json
-/// 批量导入 token.json
-pub async fn import_token_json(
+/// POST /api/admin/credentials/export
+/// 按 ID 列表导出 xkiro.rs 完整备份
+pub async fn export_credential_backup(
     State(state): State<AdminState>,
-    Json(payload): Json<ImportTokenJsonRequest>,
-) -> impl IntoResponse {
-    let response = state.service.import_token_json(payload).await;
-    Json(response)
-}
-
-/// POST /api/admin/credentials/export-token-json
-/// 按 ID 列表导出 token.json 兼容格式（可被 import-token-json 直接吃回）
-pub async fn export_token_json(
-    State(state): State<AdminState>,
-    Json(payload): Json<ExportTokenJsonRequest>,
+    Json(payload): Json<ExportCredentialBackupRequest>,
 ) -> impl IntoResponse {
     if payload.ids.is_empty() {
         return (
-            axum::http::StatusCode::BAD_REQUEST,
+            StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "ids 不能为空"})),
         )
             .into_response();
     }
-    let items = state.service.export_credentials_to_token_json(&payload.ids);
-    Json(items).into_response()
-}
-
-/// POST /api/admin/credentials/export-kam
-/// 按 ID 列表导出 KAM (`kiro-account-manager`) 兼容格式（Account[] JSON）
-pub async fn export_kam(
-    State(state): State<AdminState>,
-    Json(payload): Json<ExportKamRequest>,
-) -> impl IntoResponse {
-    if payload.ids.is_empty() {
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "ids 不能为空"})),
-        )
-            .into_response();
-    }
-    let items = state.service.export_credentials_to_kam(&payload.ids);
-    Json(items).into_response()
+    Json(state.service.export_credential_backup(&payload.ids)).into_response()
 }
 
 /// POST /api/admin/export
-/// Kiro-Go 兼容导出路径：空 body 或空 ids 导出全部可导出的 OAuth 凭据。
-pub async fn export_accounts_kiro_go(
+/// 凭据快照导出：空 body 或解析失败时导出全部
+pub async fn export_credentials_snapshot(
     State(state): State<AdminState>,
     body: Bytes,
 ) -> impl IntoResponse {
-    let req = serde_json::from_slice::<KiroGoExportRequest>(&body).unwrap_or_default();
-    let mut ids: Vec<u64> = req
-        .ids
-        .iter()
-        .filter_map(|id| {
-            id.as_u64()
-                .or_else(|| id.as_str().and_then(|s| s.parse::<u64>().ok()))
-        })
-        .collect();
-    if ids.is_empty() {
-        ids = state
-            .service
-            .token_manager_snapshot()
-            .entries
-            .iter()
-            .map(|entry| entry.id)
-            .collect();
-    }
+    let payload = if body.is_empty() {
+        CredentialSnapshotExportRequest::default()
+    } else {
+        serde_json::from_slice::<CredentialSnapshotExportRequest>(&body).unwrap_or_default()
+    };
+    Json(state.service.export_credential_snapshot(&payload.ids))
+}
 
-    let accounts = state.service.export_credentials_to_kam(&ids);
-    let now_ms = Utc::now().timestamp_millis();
-    let accounts: Vec<serde_json::Value> = accounts
-        .into_iter()
-        .map(|account| {
-            let provider = account
-                .provider
-                .clone()
-                .unwrap_or_else(|| "Google".to_string());
-            let auth_method = account
-                .auth_method
-                .clone()
-                .unwrap_or_else(|| "social".to_string());
-            serde_json::json!({
-                "id": account.id,
-                "email": account.email,
-                "nickname": account.label,
-                "idp": provider,
-                "userId": account.user_id,
-                "machineId": account.machine_id,
-                "credentials": {
-                    "accessToken": account.access_token,
-                    "csrfToken": "",
-                    "refreshToken": account.refresh_token,
-                    "clientId": account.client_id,
-                    "clientSecret": account.client_secret,
-                    "region": account.region,
-                    "expiresAt": account.expires_at,
-                    "authMethod": auth_method,
-                    "provider": provider,
-                },
-                "subscription": {
-                    "type": "Free",
-                    "title": null,
-                },
-                "usage": {
-                    "current": 0.0,
-                    "limit": 0.0,
-                    "percentUsed": 0.0,
-                    "lastUpdated": now_ms,
-                },
-                "tags": [],
-                "status": if account.enabled { "active" } else { "disabled" },
-                "createdAt": now_ms,
-                "lastUsedAt": now_ms,
-            })
-        })
-        .collect();
-
-    Json(serde_json::json!({
-        "version": env!("CARGO_PKG_VERSION"),
-        "exportedAt": now_ms,
-        "accounts": accounts,
-        "groups": [],
-        "tags": [],
-    }))
-    .into_response()
+/// POST /api/admin/credentials/import
+/// 自动识别并导入扁平凭据 / 完整备份
+pub async fn import_credentials(
+    State(state): State<AdminState>,
+    Json(payload): Json<ImportCredentialsRequest>,
+) -> impl IntoResponse {
+    Json(state.service.import_credentials(payload))
 }
 
 /// POST /api/admin/credentials/:id/region
-/// 设置凭据 Region
+/// 设置凭据区域
 pub async fn set_credential_region(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
@@ -449,56 +354,181 @@ pub async fn set_credential_region(
         .service
         .set_region(id, payload.region, payload.api_region)
     {
-        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} Region 已更新", id))).into_response(),
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 区域已更新", id))).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
 
 /// POST /api/admin/credentials/:id/endpoint
-/// 设置凭据 endpoint
+/// 设置凭据端点
 pub async fn set_credential_endpoint(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
     Json(payload): Json<SetEndpointRequest>,
 ) -> impl IntoResponse {
     match state.service.set_endpoint(id, payload.endpoint) {
-        Ok(_) => Json(SuccessResponse::new(format!(
-            "凭据 #{} endpoint 已更新",
-            id
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 端点已更新", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/proxy
+/// 获取简化代理 URL 配置
+pub async fn get_proxy_url_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_proxy_url_config())
+}
+
+/// POST /api/admin/proxy
+/// 更新简化代理 URL 配置
+pub async fn update_proxy_url_config(
+    State(state): State<AdminState>,
+    Json(req): Json<UpdateProxyConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.update_proxy_url_config(req).await {
+        Ok(_) => Json(SuccessResponse::new("全局代理配置已更新")).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/proxy
+/// 获取全局代理配置（脱敏）
+pub async fn get_proxy_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_proxy_config())
+}
+
+/// POST /api/admin/config/proxy
+/// 更新全局代理配置（热更新）
+pub async fn update_proxy_config(
+    State(state): State<AdminState>,
+    Json(req): Json<UpdateProxyConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.update_proxy_config(req).await {
+        Ok(_) => Json(SuccessResponse::new("全局代理配置已更新")).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+pub async fn list_proxies(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.list_proxies())
+}
+
+pub async fn add_proxy(
+    State(state): State<AdminState>,
+    Json(req): Json<ProxyUpsertRequest>,
+) -> impl IntoResponse {
+    match state.service.add_proxy(req).await {
+        Ok(id) => Json(SuccessResponse::new(format!("代理 #{} 已新增", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+pub async fn update_proxy(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(req): Json<ProxyUpsertRequest>,
+) -> impl IntoResponse {
+    match state.service.update_proxy(id, req) {
+        Ok(_) => Json(SuccessResponse::new(format!("代理 #{} 已更新", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+pub async fn delete_proxy(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.delete_proxy(id) {
+        Ok(unbound) => Json(SuccessResponse::new(format!(
+            "代理 #{} 已删除，解绑 {} 个凭据",
+            id, unbound
         )))
         .into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
 
-/// GET /api/admin/proxy
-/// 获取全局代理配置（脱敏）
-pub async fn get_proxy_config(State(state): State<AdminState>) -> impl IntoResponse {
-    Json(state.service.get_kiro_go_proxy_config())
+pub async fn test_proxy(State(state): State<AdminState>, Path(id): Path<u64>) -> impl IntoResponse {
+    Json(state.service.test_proxy(id).await)
 }
 
-/// POST /api/admin/proxy
-/// 更新全局代理配置（热更新）
-pub async fn update_proxy_config(
+pub async fn import_proxies(
     State(state): State<AdminState>,
-    Json(req): Json<UpdateProxyConfigRequest>,
+    Json(req): Json<ProxyImportRequest>,
 ) -> impl IntoResponse {
-    match state.service.update_kiro_go_proxy_config(req).await {
-        Ok(_) => Json(SuccessResponse::new("全局代理配置已更新")).into_response(),
+    Json(state.service.import_proxies(req).await)
+}
+
+pub async fn auto_assign_proxies(
+    State(state): State<AdminState>,
+    Json(req): Json<ProxyAutoAssignRequest>,
+) -> impl IntoResponse {
+    Json(state.service.auto_assign_proxies(req))
+}
+
+pub async fn set_credential_proxy(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(req): Json<SetCredentialProxyRequest>,
+) -> impl IntoResponse {
+    match state.service.set_credential_proxy(id, req.proxy_id) {
+        Ok(_) => {
+            let message = match req.proxy_id {
+                Some(proxy_id) => format!("凭据 #{} 已绑定代理 #{}", id, proxy_id),
+                None => format!("凭据 #{} 已解绑代理", id),
+            };
+            Json(SuccessResponse::new(message)).into_response()
+        }
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
 
-pub async fn get_settings(State(state): State<AdminState>) -> impl IntoResponse {
-    Json(state.service.get_settings())
+pub async fn set_credential_proxy_by_region(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(req): Json<SetCredentialProxyByRegionRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .set_credential_proxy_by_region(id, req.region.as_deref())
+    {
+        Ok(proxy_id) => {
+            let message = match proxy_id {
+                Some(proxy_id) => format!("凭据 #{} 已绑定代理 #{}", id, proxy_id),
+                None => format!("凭据 #{} 已解绑代理", id),
+            };
+            Json(serde_json::json!({ "message": message, "proxyId": proxy_id })).into_response()
+        }
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
 }
 
-pub async fn update_settings(
+pub async fn get_access_settings(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_access_settings())
+}
+
+pub async fn update_access_settings(
     State(state): State<AdminState>,
-    Json(req): Json<UpdateSettingsRequest>,
+    Json(req): Json<UpdateAccessSettingsRequest>,
 ) -> impl IntoResponse {
-    match state.service.update_settings(req).await {
+    match state.service.update_access_settings(req).await {
         Ok(_) => Json(serde_json::json!({ "success": true })).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+pub async fn get_common_config(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.get_common_config() {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+pub async fn update_common_config(
+    State(state): State<AdminState>,
+    Json(req): Json<UpdateCommonConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.update_common_config(req) {
+        Ok(resp) => Json(resp).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
@@ -570,7 +600,7 @@ pub async fn get_runtime_stats(State(state): State<AdminState>) -> impl IntoResp
 }
 
 /// POST /api/admin/credentials/refresh-batch
-/// 批量刷新 Token：服务端 Semaphore(8) 并发，前端一次往返
+/// 批量刷新令牌：服务端 Semaphore(8) 并发，前端一次往返
 pub async fn force_refresh_tokens_batch(
     State(state): State<AdminState>,
     Json(req): Json<BatchRefreshRequest>,
@@ -611,8 +641,37 @@ pub async fn set_credential_overage(
     }
 }
 
+/// POST /api/admin/accounts/:id/overage
+/// `/accounts` 凭据别名路径：支持 sourceAccountId 或本地数字 ID，返回 overage 快照。
+pub async fn set_credential_alias_overage(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    Json(payload): Json<SetOverageRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .set_credential_overage_by_path_id(&id, payload.enabled)
+        .await
+    {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// GET /api/admin/accounts/:id/overage
-/// Kiro-Go 兼容路径：拉取并返回单个账号的上游 overage 状态。
+/// `/accounts` 凭据别名路径：支持 sourceAccountId 或本地数字 ID，返回 overage 快照。
+pub async fn get_credential_alias_overage(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.service.get_credential_overage_by_path_id(&id).await {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/credentials/:id/overage
+/// xkiro 原生路径：数字 ID，拉取并返回上游 overage 状态。
 pub async fn get_credential_overage(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
@@ -711,7 +770,7 @@ pub async fn complete_social_login_callback(
 }
 
 /// POST /api/admin/auth/social/complete/:session_id
-/// helper 模式：本机 helper 完成 OAuth 后回传最终 token
+/// helper 模式：本机 helper 完成 OAuth 后回传最终令牌
 pub async fn complete_social_login(
     State(state): State<AdminState>,
     Path(session_id): Path<String>,
@@ -739,7 +798,7 @@ pub async fn start_idc_login(
 }
 
 /// POST /api/admin/auth/iam-sso/start
-/// Kiro-Go 兼容 IAM SSO authorization-code 登录开始。
+/// IAM SSO authorization-code 登录开始。
 pub async fn start_iam_sso_login(
     State(state): State<AdminState>,
     Json(payload): Json<StartIdcLoginRequest>,
@@ -751,7 +810,7 @@ pub async fn start_iam_sso_login(
 }
 
 /// POST /api/admin/auth/iam-sso/complete
-/// Kiro-Go 兼容 IAM SSO callbackUrl 完成。
+/// IAM SSO callbackUrl 完成。
 pub async fn complete_iam_sso_login(
     State(state): State<AdminState>,
     Json(payload): Json<CompleteIamSsoLoginRequest>,
@@ -813,8 +872,8 @@ pub async fn get_version(State(state): State<AdminState>) -> impl IntoResponse {
     Json(state.service.get_version())
 }
 
-/// GET /api/admin/generate-machine-id
-/// 生成 Machine ID
+/// GET /api/admin/system/machine-id
+/// 生成机器 ID
 pub async fn generate_machine_id(State(state): State<AdminState>) -> impl IntoResponse {
     Json(state.service.generate_machine_id())
 }
@@ -828,6 +887,29 @@ pub async fn test_credential(
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
     match state.service.test_credential(id).await {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/accounts/:id/test
+/// `/accounts` 凭据别名测试：支持 sourceAccountId 或本地数字 ID。
+pub async fn test_credential_alias(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> impl IntoResponse {
+    let payload = if body.is_empty() {
+        CredentialProbeRequest::default()
+    } else {
+        serde_json::from_slice::<CredentialProbeRequest>(&body).unwrap_or_default()
+    };
+
+    match state
+        .service
+        .test_credential_by_path_id(&id, payload.model)
+        .await
+    {
         Ok(resp) => Json(resp).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
@@ -847,10 +929,22 @@ pub async fn batch_operation(
     }
 }
 
-// ============ SSO Token 导入 ============
+/// POST /api/admin/accounts/batch
+/// `/accounts` 凭据别名批量操作（enable/disable/refresh）
+pub async fn batch_credentials(
+    State(state): State<AdminState>,
+    Json(payload): Json<CredentialBatchRequest>,
+) -> impl IntoResponse {
+    match state.service.batch_credentials(payload).await {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+// ============ SSO 令牌导入 ============
 
 /// POST /api/admin/auth/sso-token
-/// 从 SSO Token 导入凭据
+/// 从 SSO 令牌导入凭据
 pub async fn import_sso_token(
     State(state): State<AdminState>,
     Json(payload): Json<super::types::ImportSsoTokenRequest>,
@@ -900,7 +994,7 @@ pub async fn poll_builder_id_login(
 }
 
 /// POST /api/admin/auth/builderid/poll
-/// Kiro-Go 兼容路径：从 body.sessionId 读取会话 ID。
+/// 保留 body.sessionId 轮询入口。
 pub async fn poll_builder_id_login_by_body(
     State(state): State<AdminState>,
     Json(payload): Json<PollBuilderIdLoginRequest>,
@@ -910,38 +1004,7 @@ pub async fn poll_builder_id_login_by_body(
         .poll_builder_id_login(&payload.session_id)
         .await
     {
-        Ok(PollBuilderIdLoginResponse::Pending { interval }) => Json(serde_json::json!({
-            "success": true,
-            "completed": false,
-            "status": "pending",
-            "interval": interval,
-        }))
-        .into_response(),
-        Ok(PollBuilderIdLoginResponse::Success {
-            credential_id,
-            email,
-        }) => Json(serde_json::json!({
-            "success": true,
-            "completed": true,
-            "account": {
-                "id": credential_id,
-                "email": email,
-            },
-        }))
-        .into_response(),
-        Ok(PollBuilderIdLoginResponse::Expired) => Json(serde_json::json!({
-            "success": false,
-            "completed": false,
-            "status": "expired",
-            "error": "expired",
-        }))
-        .into_response(),
-        Ok(PollBuilderIdLoginResponse::Error { message }) => Json(serde_json::json!({
-            "success": false,
-            "completed": false,
-            "error": message,
-        }))
-        .into_response(),
+        Ok(resp) => Json(PollBuilderIdLoginByBodyResponse::new(resp)).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
@@ -999,16 +1062,16 @@ pub async fn cancel_kiro_sso_login(
     Json(serde_json::json!({ "success": true }))
 }
 
-// ============ API Key 管理 ============
+// ============ API 密钥管理 ============
 
 /// GET /api/admin/api-keys
-/// 获取所有 API Keys
+/// 获取所有 API 密钥
 pub async fn get_api_keys(State(state): State<AdminState>) -> impl IntoResponse {
     Json(state.service.get_api_keys())
 }
 
 /// POST /api/admin/api-keys
-/// 创建 API Key
+/// 创建 API 密钥
 pub async fn create_api_key(
     State(state): State<AdminState>,
     Json(payload): Json<super::types::CreateApiKeyRequest>,
@@ -1020,7 +1083,7 @@ pub async fn create_api_key(
 }
 
 /// GET /api/admin/api-keys/:id
-/// 获取单个 API Key
+/// 获取单个 API 密钥
 pub async fn get_api_key(
     State(state): State<AdminState>,
     Path(id): Path<String>,
@@ -1032,7 +1095,7 @@ pub async fn get_api_key(
 }
 
 /// PUT /api/admin/api-keys/:id
-/// 更新 API Key
+/// 更新 API 密钥
 pub async fn update_api_key(
     State(state): State<AdminState>,
     Path(id): Path<String>,
@@ -1049,19 +1112,19 @@ pub async fn update_api_key(
 }
 
 /// DELETE /api/admin/api-keys/:id
-/// 删除 API Key
+/// 删除 API 密钥
 pub async fn delete_api_key(
     State(state): State<AdminState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     match state.service.delete_api_key(&id) {
-        Ok(_) => Json(SuccessResponse::new("API Key 已删除")).into_response(),
+        Ok(_) => Json(SuccessResponse::new("API 密钥已删除")).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
 
 /// POST /api/admin/api-keys/:id/reset-usage
-/// 重置 API Key 使用量
+/// 重置 API 密钥使用量
 pub async fn reset_api_key_usage(
     State(state): State<AdminState>,
     Path(id): Path<String>,
@@ -1085,7 +1148,11 @@ pub async fn refresh_credential_models(
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
     match state.service.list_available_models(id, None, true).await {
-        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 模型缓存已刷新", id))).into_response(),
+        Ok(response) => Json(RefreshCredentialModelsResponse::new(
+            format!("凭据 #{} 模型缓存已刷新", id),
+            response.available_models.len(),
+        ))
+        .into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
@@ -1094,7 +1161,7 @@ pub async fn refresh_credential_models(
 /// 刷新所有凭据的模型缓存
 pub async fn refresh_all_credential_models(State(state): State<AdminState>) -> impl IntoResponse {
     let snapshot = state.service.token_manager_snapshot();
-    let mut success_count = 0;
+    let mut refreshed = 0;
     let mut failure_count = 0;
 
     for entry in &snapshot.entries {
@@ -1106,13 +1173,17 @@ pub async fn refresh_all_credential_models(State(state): State<AdminState>) -> i
             .list_available_models(entry.id, None, true)
             .await
         {
-            Ok(_) => success_count += 1,
+            Ok(response) => refreshed += response.available_models.len(),
             Err(_) => failure_count += 1,
         }
     }
 
-    Json(SuccessResponse::new(format!(
-        "模型缓存刷新完成：成功 {}，失败 {}",
-        success_count, failure_count
-    )))
+    Json(RefreshAllCredentialModelsResponse::new(
+        format!(
+            "模型缓存刷新完成：刷新 {} 个模型，失败 {} 个凭据",
+            refreshed, failure_count
+        ),
+        refreshed,
+        failure_count,
+    ))
 }

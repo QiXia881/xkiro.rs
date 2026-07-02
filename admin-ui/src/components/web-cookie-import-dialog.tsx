@@ -9,24 +9,25 @@ import {
   DialogFooter,
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
-import { importKiroGoCredential } from '@/api/credentials'
+import { importCredentialRecord } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
+import { CREDENTIAL_AUTH_LABELS, formatCredentialAuthLabel } from '@/lib/credential-metadata'
 
-interface KiroCookieImportDialogProps {
+interface WebCookieImportDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
   onSuccess: () => void
 }
 
-export function KiroCookieImportDialog({ open, onOpenChange, onSuccess }: KiroCookieImportDialogProps) {
+export function WebCookieImportDialog({ open, onOpenChange, onSuccess }: WebCookieImportDialogProps) {
   const [cookie, setCookie] = useState('')
-  const [provider, setProvider] = useState<'Google' | 'Github'>('Google')
+  const [provider, setProvider] = useState<'Google' | 'GitHub'>('Google')
   const [importing, setImporting] = useState(false)
-  const [result, setResult] = useState<{ status: 'success' | 'error'; error?: string } | null>(null)
+  const [result, setResult] = useState<{ status: 'success' | 'error'; authLabel?: string; error?: string } | null>(null)
 
   const handleImport = async () => {
     if (!cookie.trim()) {
-      toast.error('请输入 RefreshToken cookie')
+      toast.error('请输入刷新令牌 Cookie')
       return
     }
 
@@ -42,14 +43,15 @@ export function KiroCookieImportDialog({ open, onOpenChange, onSuccess }: KiroCo
         }
       }
 
-      await importKiroGoCredential({
+      const added = await importCredentialRecord({
         refreshToken,
         authMethod: 'social',
         provider,
       })
 
-      setResult({ status: 'success' })
-      toast.success('导入成功！')
+      const authLabel = formatCredentialAuthLabel(added.provider, added.authMethod)
+      setResult({ status: 'success', authLabel })
+      toast.success(`导入成功，已添加${authLabel ? ` ${authLabel}` : ''} 凭据 #${added.credentialId}`)
       onSuccess()
     } catch (error) {
       setResult({ status: 'error', error: extractErrorMessage(error) })
@@ -74,24 +76,24 @@ export function KiroCookieImportDialog({ open, onOpenChange, onSuccess }: KiroCo
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <Cookie className="h-5 w-5" />
-            Kiro Web Cookie 导入
+            浏览器 Cookie 导入
           </DialogTitle>
         </DialogHeader>
 
         <div className="space-y-4 py-4">
           <div className="space-y-2">
             <label className="text-sm font-medium">
-              RefreshToken Cookie
+              刷新令牌 Cookie
             </label>
             <textarea
               className="w-full h-24 p-3 text-sm border rounded-md resize-none font-mono"
-              placeholder={"从浏览器 DevTools → Application → Cookies 中复制\nhttps://app.kiro.dev 的 RefreshToken 值"}
+              placeholder={"从浏览器 DevTools → Application → Cookies 中复制\nhttps://app.kiro.dev 的刷新令牌 Cookie 值"}
               value={cookie}
               onChange={e => setCookie(e.target.value)}
               disabled={importing}
             />
             <p className="text-xs text-muted-foreground">
-              登录 https://app.kiro.dev 后，从浏览器 Cookie 中获取 RefreshToken
+              登录 https://app.kiro.dev 后，从浏览器 Cookie 中获取刷新令牌
             </p>
           </div>
 
@@ -104,15 +106,15 @@ export function KiroCookieImportDialog({ open, onOpenChange, onSuccess }: KiroCo
                 onClick={() => setProvider('Google')}
                 disabled={importing}
               >
-                Google
+                {CREDENTIAL_AUTH_LABELS.google}
               </Button>
               <Button
-                variant={provider === 'Github' ? 'default' : 'outline'}
+                variant={provider === 'GitHub' ? 'default' : 'outline'}
                 size="sm"
-                onClick={() => setProvider('Github')}
+                onClick={() => setProvider('GitHub')}
                 disabled={importing}
               >
-                GitHub
+                {CREDENTIAL_AUTH_LABELS.github}
               </Button>
             </div>
           </div>
@@ -133,6 +135,9 @@ export function KiroCookieImportDialog({ open, onOpenChange, onSuccess }: KiroCo
                 )}
                 <span>{result.status === 'success' ? '导入成功！' : '导入失败'}</span>
               </div>
+              {result.status === 'success' && result.authLabel && (
+                <p className="mt-1 text-xs text-muted-foreground">{result.authLabel}</p>
+              )}
               {result.error && (
                 <p className="mt-1 text-xs text-red-600">{result.error}</p>
               )}

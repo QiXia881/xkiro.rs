@@ -109,7 +109,7 @@ export function LoginPage({ onLogin }: LoginPageProps) {
     e.preventDefault()
     const trimmed = apiKey.trim()
     if (!trimmed) {
-      setError('请输入 Admin API Key')
+      setError('请输入 Admin API 密钥')
       triggerShake()
       return
     }
@@ -185,16 +185,16 @@ export function LoginPage({ onLogin }: LoginPageProps) {
           <Card className="shadow-lg shadow-black/5 dark:shadow-black/20">
             <CardContent className="pt-6">
               <form onSubmit={handleSubmit} className="space-y-5">
-                {/* API Key input with show/hide toggle */}
+                {/* API 密钥输入框，支持显示/隐藏 */}
                 <div className="space-y-2">
                   <label htmlFor="api-key" className="text-sm font-medium">
-                    Admin API Key
+                    Admin API 密钥
                   </label>
                   <div className="relative">
                     <Input
                       id="api-key"
                       type={showPassword ? 'text' : 'password'}
-                      placeholder="输入你的 Admin API Key"
+                      placeholder="输入你的 Admin API 密钥"
                       value={apiKey}
                       onChange={(e) => {
                         setApiKey(e.target.value)
@@ -247,7 +247,7 @@ export function LoginPage({ onLogin }: LoginPageProps) {
                     htmlFor="remember-me"
                     className="text-sm text-muted-foreground select-none cursor-pointer"
                   >
-                    记住 API Key
+                    记住 API 密钥
                   </label>
                 </div>
 
@@ -271,7 +271,7 @@ export function LoginPage({ onLogin }: LoginPageProps) {
               transitionDelay: '500ms',
             }}
           >
-            需要 Admin API Key 才能访问管理面板
+            需要 Admin API 密钥才能访问管理面板
           </p>
         </div>
       </div>

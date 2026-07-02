@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -31,6 +32,20 @@ pub enum SystemPromptPosition {
 impl Default for SystemPromptPosition {
     fn default() -> Self {
         Self::Append
+    }
+}
+
+/// 新凭据缺少 machineId 时的分配策略
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CredentialMachineIdStrategy {
+    Local,
+    Random,
+}
+
+impl Default for CredentialMachineIdStrategy {
+    fn default() -> Self {
+        Self::Random
     }
 }
 
@@ -69,7 +84,6 @@ fn default_true() -> bool {
 
 /// 默认请求体大小上限
 ///
-/// 对齐 Kiro-Go `maxPayloadBytes = 900 * 1024` (900KB)：
 /// Kiro 上游对请求体有硬性大小限制，超过会返回 400。
 fn default_max_request_body_bytes() -> usize {
     900 * 1024 // 921,600 bytes = 900KB
@@ -77,7 +91,6 @@ fn default_max_request_body_bytes() -> usize {
 
 /// 系统提示清洗配置
 ///
-/// 对齐 Kiro-Go `applyPromptFilters`：三个内置开关 + 自定义规则。
 /// 默认全 `false`、规则为空 —— 与未启用此模块时行为一致。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -113,7 +126,7 @@ pub struct PromptFilterRule {
     pub replace: String,
 }
 
-/// KNA 应用配置
+/// xkiro.rs 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Config {
@@ -126,12 +139,12 @@ pub struct Config {
     #[serde(default = "default_region")]
     pub region: String,
 
-    /// Auth Region（用于 Token 刷新），未配置时回退到 region
+    /// 认证区域（用于令牌刷新），未配置时回退到 region
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_region: Option<String>,
 
-    /// API Region（用于 API 请求），未配置时回退到 region
+    /// API 区域（用于 API 请求），未配置时回退到 region
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_region: Option<String>,
@@ -139,8 +152,13 @@ pub struct Config {
     #[serde(default = "default_kiro_version")]
     pub kiro_version: String,
 
+    /// 本机 machineId。新凭据可按策略复用该值，也兼容旧版全局兜底。
     #[serde(default)]
     pub machine_id: Option<String>,
+
+    /// 新凭据缺少 machineId 时的分配策略（local/random）
+    #[serde(default)]
+    pub credential_machine_id_strategy: CredentialMachineIdStrategy,
 
     #[serde(default)]
     pub api_key: Option<String>,
@@ -183,7 +201,7 @@ pub struct Config {
     #[serde(default)]
     pub admin_api_key: Option<String>,
 
-    /// 是否要求客户端 API Key（Kiro-Go 兼容设置）
+    /// 是否要求客户端 API 密钥
     #[serde(default = "default_true")]
     pub require_api_key: bool,
 
@@ -194,37 +212,37 @@ pub struct Config {
     #[serde(default = "default_extract_thinking")]
     pub extract_thinking: bool,
 
-    /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）
+    /// 默认端点名称（凭据未显式指定 `endpoint` 字段时使用，默认 "ide"）
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
 
-    /// Kiro-Go thinking 模型后缀（默认 "-thinking"）
+    /// thinking 模型后缀（默认 "-thinking"）
     #[serde(default = "default_thinking_suffix")]
     pub thinking_suffix: String,
 
-    /// Kiro-Go OpenAI thinking 输出格式
+    /// OpenAI thinking 输出格式
     #[serde(default = "default_openai_thinking_format")]
     pub openai_thinking_format: String,
 
-    /// Kiro-Go Claude thinking 输出格式
+    /// Claude thinking 输出格式
     #[serde(default = "default_claude_thinking_format")]
     pub claude_thinking_format: String,
 
-    /// Kiro-Go 首选 endpoint（auto/kiro/codewhisperer/amazonq）
+    /// 首选端点（auto/kiro/codewhisperer/amazonq）
     #[serde(default = "default_preferred_endpoint")]
     pub preferred_endpoint: String,
 
-    /// Kiro-Go endpoint fallback 开关
+    /// 端点故障转移开关
     #[serde(default = "default_true")]
     pub endpoint_fallback: bool,
 
-    /// Kiro-Go 全局超额使用开关；开启后余额/配额耗尽不会触发自动禁用。
+    /// 全局超额使用开关；开启后余额/配额耗尽不会触发自动禁用。
     #[serde(default)]
     pub allow_over_usage: bool,
 
     /// 端点特定的配置
     ///
-    /// 键为端点名（如 "ide" / "cli"），值为该端点自由定义的参数对象。
+    /// 键为端点名（如 "ide" / "codewhisperer" / "amazonq" / "cli"），值为该端点自由定义的参数对象。
     /// 未在此表出现的端点沿用实现内置默认值。
     #[serde(default)]
     pub endpoints: HashMap<String, serde_json::Value>,
@@ -233,7 +251,7 @@ pub struct Config {
     #[serde(default)]
     pub compression: CompressionConfig,
 
-    /// 系统提示清洗配置（默认全关，向后兼容）
+    /// 系统提示清洗配置（默认全关，保持既有默认行为）
     #[serde(default)]
     pub prompt_filter: PromptFilterConfig,
 
@@ -269,10 +287,14 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub prompt_cache_accounting_enabled: bool,
 
+    /// Prompt Cache cache_read 输入 token 占比上限，默认 0.85
+    #[serde(default = "default_prompt_cache_max_ratio")]
+    pub prompt_cache_max_ratio: f64,
+
     /// 单凭据最大并发请求数（默认 1）
     ///
     /// 同一凭据在任意时刻最多同时承载多少个上游 API 调用。设为 1 表示
-    /// 严格串行，避免 Kiro 上游对单账号的速率/并发风险；增大后允许同账号
+    /// 严格串行，避免 Kiro 上游对单凭据的速率/并发风险；增大后允许同凭据
     /// 并行，但上游限流命中概率上升。
     #[serde(default = "default_per_credential_concurrency")]
     pub per_credential_concurrency: usize,
@@ -317,11 +339,11 @@ pub struct Config {
     #[serde(default = "default_balance_refresh_concurrency")]
     pub balance_refresh_concurrency: usize,
 
-    /// 是否启用 session 亲和（同会话黏住同凭据，提升上游 prompt cache 命中率）
+    /// 是否启用调度亲和（会话或客户端 API key 优先复用同凭据）
     ///
-    /// false（默认）：每条消息独立走 rank 调度，多号天然平摊；上游 prompt cache 必失，
-    /// 但客户端每次都带完整 history，模型不会"失忆"。
-    /// true：同 session_id 黏住首条选中的凭据，长会话内不切号；只在该号 sema 满 / 禁用 / 模型不支持时回退 rank。
+    /// false（默认）：每条消息独立走 rank 调度，多号天然平摊。
+    /// true：优先按 session_id 黏住首条选中的凭据；没有 session_id 时按已认证客户端 API 密钥 ID 黏住。
+    /// 绑定凭据 sema 满 / 禁用 / 模型不支持时回退 rank。
     #[serde(default)]
     pub session_affinity_enabled: bool,
 
@@ -352,6 +374,10 @@ fn default_kiro_version() -> String {
     "0.11.107".to_string()
 }
 
+pub fn generate_default_machine_id() -> String {
+    Uuid::new_v4().to_string().to_ascii_lowercase()
+}
+
 fn default_system_version() -> String {
     const SYSTEM_VERSIONS: &[&str] = &["darwin#24.6.0", "win32#10.0.22631"];
     SYSTEM_VERSIONS[fastrand::usize(..SYSTEM_VERSIONS.len())].to_string()
@@ -375,6 +401,10 @@ fn default_extract_thinking() -> bool {
 
 fn default_prompt_cache_ttl_seconds() -> u64 {
     300
+}
+
+fn default_prompt_cache_max_ratio() -> f64 {
+    0.85
 }
 
 fn default_per_credential_concurrency() -> usize {
@@ -432,6 +462,7 @@ impl Default for Config {
             api_region: None,
             kiro_version: default_kiro_version(),
             machine_id: None,
+            credential_machine_id_strategy: CredentialMachineIdStrategy::default(),
             api_key: None,
             system_version: default_system_version(),
             node_version: default_node_version(),
@@ -462,6 +493,7 @@ impl Default for Config {
             system_prompt_position: SystemPromptPosition::default(),
             prompt_cache_ttl_seconds: default_prompt_cache_ttl_seconds(),
             prompt_cache_accounting_enabled: default_true(),
+            prompt_cache_max_ratio: default_prompt_cache_max_ratio(),
             per_credential_concurrency: default_per_credential_concurrency(),
             global_concurrency: default_global_concurrency(),
             acquire_wait_timeout_secs: default_acquire_wait_timeout_secs(),
@@ -482,13 +514,13 @@ impl Config {
         "config.json"
     }
 
-    /// 获取有效的 Auth Region（用于 Token 刷新）
+    /// 获取有效的认证区域（用于令牌刷新）
     /// 优先使用 auth_region，未配置时回退到 region
     pub fn effective_auth_region(&self) -> &str {
         self.auth_region.as_deref().unwrap_or(&self.region)
     }
 
-    /// 获取有效的 API Region（用于 API 请求）
+    /// 获取有效的 API 区域（用于 API 请求）
     /// 优先使用 api_region，未配置时回退到 region
     pub fn effective_api_region(&self) -> &str {
         self.api_region.as_deref().unwrap_or(&self.region)

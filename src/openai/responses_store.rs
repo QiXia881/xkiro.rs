@@ -236,7 +236,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn expands_previous_response_chain_like_kiro_go() {
+    fn expands_previous_response_chain() {
         let dir = std::env::temp_dir().join(format!(
             "xkiro-responses-test-{}",
             SystemTime::now()
@@ -329,7 +329,7 @@ mod tests {
     }
 
     #[test]
-    fn stores_response_metadata_like_kiro_go() {
+    fn stores_response_metadata() {
         let dir = std::env::temp_dir().join(format!(
             "xkiro-responses-metadata-test-{}",
             SystemTime::now()

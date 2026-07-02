@@ -1,6 +1,6 @@
 //! 日志脱敏工具
 //!
-//! 目标：避免在日志中输出敏感信息（Token、密钥、密码等）。
+//! 目标：避免在日志中输出敏感信息（令牌、密钥、密码等）。
 
 #![allow(dead_code)] // 工具模块，函数将在后续被调用
 
@@ -110,7 +110,7 @@ static BEARER_PATTERN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::
     regex::Regex::new(r"(?i)(Bearer\s+)([A-Za-z0-9._\-]{16,})").expect("Bearer regex 编译失败")
 });
 
-/// 对上游响应文本做脱敏处理，防 token reflection 泄入日志/错误响应。
+/// 对上游响应文本做脱敏处理，防令牌反射泄入日志/错误响应。
 ///
 /// 1. 替换 JSON 中常见敏感字段值为 `<REDACTED>`
 /// 2. 替换 `Bearer xxx` 为 `Bearer <REDACTED>`

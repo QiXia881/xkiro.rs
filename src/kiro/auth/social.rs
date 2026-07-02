@@ -10,6 +10,9 @@ use crate::model::config::Config;
 
 pub const KIRO_AUTH_ENDPOINT: &str = "https://prod.us-east-1.auth.desktop.kiro.dev";
 pub const MANUAL_CALLBACK_PORT: u16 = 3128;
+const GITHUB_CREDENTIAL_PROVIDER: &str = "GitHub";
+const GITHUB_PORTAL_IDP: &str = "Github";
+const GOOGLE_PROVIDER: &str = "Google";
 
 // Mirrors the port list from Kiro IDE's portal-auth-provider
 const CALLBACK_PORTS: &[u16] = &[
@@ -20,6 +23,30 @@ const CALLBACK_PORTS: &[u16] = &[
 pub struct OAuthCallbackData {
     pub code: String,
     pub state: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SocialProviderNames {
+    pub credential_provider: &'static str,
+    pub portal_idp: &'static str,
+}
+
+pub fn resolve_provider_names(provider: &str) -> anyhow::Result<SocialProviderNames> {
+    let provider = provider.trim();
+    match provider.to_ascii_lowercase().as_str() {
+        "google" => Ok(SocialProviderNames {
+            credential_provider: GOOGLE_PROVIDER,
+            portal_idp: GOOGLE_PROVIDER,
+        }),
+        "github" => Ok(SocialProviderNames {
+            credential_provider: GITHUB_CREDENTIAL_PROVIDER,
+            portal_idp: GITHUB_PORTAL_IDP,
+        }),
+        _ => anyhow::bail!(
+            "不支持的社交登录提供方: {}（应为 GitHub 或 Google）",
+            provider
+        ),
+    }
 }
 
 // Drop sends shutdown signal to the callback server, releasing the port.
@@ -77,12 +104,12 @@ async fn run_callback_server(
     let listener = match TcpListener::from_std(std_listener) {
         Ok(l) => l,
         Err(e) => {
-            tracing::error!("Social 回调服务器初始化失败 (port {}): {}", port, e);
+            tracing::error!("社交登录回调服务器初始化失败 (port {}): {}", port, e);
             return;
         }
     };
 
-    tracing::info!("Social 回调服务器已启动: http://127.0.0.1:{}", port);
+    tracing::info!("社交登录回调服务器已启动: http://127.0.0.1:{}", port);
 
     let mut tx = Some(tx);
     loop {
@@ -92,7 +119,7 @@ async fn run_callback_server(
                 Err(_) => break,
             },
             _ = &mut shutdown_rx => {
-                tracing::info!("Social 回调服务器关闭，端口 {} 已释放", port);
+                tracing::info!("社交登录回调服务器关闭，端口 {} 已释放", port);
                 break;
             }
         };
@@ -111,7 +138,7 @@ async fn run_callback_server(
                 .or_else(|| s.strip_suffix(" HTTP/1.0"))
         }) {
             if let Some(callback) = parse_callback(path_and_query) {
-                let body = "<html><head><meta charset='utf-8'><title>登录成功</title></head><body style='font-family:sans-serif;text-align:center;padding:60px'><h2>&#10003; 登录成功</h2><p>Token 已更新，请返回 xkiro.rs 管理界面。</p><p style='color:#888;font-size:13px'>此标签页可以关闭。</p></body></html>";
+                let body = "<html><head><meta charset='utf-8'><title>登录成功</title></head><body style='font-family:sans-serif;text-align:center;padding:60px'><h2>&#10003; 登录成功</h2><p>令牌已更新，请返回 xkiro.rs 管理界面。</p><p style='color:#888;font-size:13px'>此标签页可以关闭。</p></body></html>";
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
@@ -177,15 +204,15 @@ fn parse_callback(path_and_query: &str) -> Option<OAuthCallbackData> {
 pub fn callback_from_input(input: &str) -> anyhow::Result<OAuthCallbackData> {
     let callback = oauth_callback::parse_input(input)?;
     if callback.path != "/oauth/callback" && callback.path != "/signin/callback" {
-        anyhow::bail!("无效的 Social OAuth 回调 URL");
+        anyhow::bail!("无效的社交 OAuth 回调 URL");
     }
     if let Some(error) = callback.error_message() {
-        anyhow::bail!("Social OAuth 回调错误: {}", error);
+        anyhow::bail!("社交 OAuth 回调错误: {}", error);
     }
     let code = callback
         .code
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| anyhow::anyhow!("Social OAuth 回调缺少 code"))?;
+        .ok_or_else(|| anyhow::anyhow!("社交 OAuth 回调缺少 code"))?;
     let state = callback.state.unwrap_or_default();
     Ok(OAuthCallbackData { code, state })
 }
@@ -303,26 +330,28 @@ pub async fn exchange_code_for_token(
     let status = resp.status();
     if !status.is_success() {
         let body_text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("Social token 交换失败 {}: {}", status, body_text);
+        anyhow::bail!("社交登录令牌交换失败 {}: {}", status, body_text);
     }
 
     resp.json::<SocialCreateTokenResponse>()
         .await
-        .map_err(|e| anyhow::anyhow!("解析 Social token 响应失败: {}", e))
+        .map_err(|e| anyhow::anyhow!("解析社交登录令牌响应失败: {}", e))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         build_login_url, build_social_user_agent, callback_from_input, manual_redirect_uri,
+        resolve_provider_names,
     };
     use std::collections::HashMap;
 
     #[test]
     fn login_url_matches_kiro_auth_service_shape() {
+        let provider = resolve_provider_names("GitHub").unwrap();
         let raw_url = build_login_url(
             "https://prod.us-east-1.auth.desktop.kiro.dev",
-            "Github",
+            provider.portal_idp,
             "state-1",
             "challenge-1",
             "kiro://app/callback",
@@ -348,6 +377,20 @@ mod tests {
             Some("S256")
         );
         assert_eq!(params.get("state").map(String::as_str), Some("state-1"));
+    }
+
+    #[test]
+    fn provider_names_keep_canonical_credential_and_portal_idp() {
+        let github = resolve_provider_names("GitHub").unwrap();
+        assert_eq!(github.credential_provider, "GitHub");
+        assert_eq!(github.portal_idp, "Github");
+
+        let github_portal_alias = resolve_provider_names("Github").unwrap();
+        assert_eq!(github_portal_alias, github);
+
+        let google = resolve_provider_names("google").unwrap();
+        assert_eq!(google.credential_provider, "Google");
+        assert_eq!(google.portal_idp, "Google");
     }
 
     #[test]

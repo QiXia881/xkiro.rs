@@ -2,7 +2,7 @@
 //!
 //! 提供文本 token 数量计算功能。
 //!
-//! 默认本地估算与 Kiro-Go 的 estimateApproxTokens 保持一致。
+//! 默认本地估算使用 xkiro.rs 启发式计数。
 
 use crate::anthropic::types::{
     CountTokensRequest, CountTokensResponse, Message, SystemMessage, Tool,
@@ -203,7 +203,7 @@ fn count_all_tokens_local(
         }
     }
 
-    // 消息内容按 Kiro-Go estimateClaudeValueTokens 语义递归估算。
+    // 消息内容按 xkiro.rs 本地估算语义递归计算。
     for msg in &messages {
         total += count_message_content_tokens(&msg.content);
     }
@@ -352,7 +352,7 @@ mod tests {
     }
 
     #[test]
-    fn heuristic_counting_matches_kiro_go_estimator() {
+    fn heuristic_counting_matches_local_estimator() {
         let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
         set_precise_counting(false);
         assert_eq!(count_tokens(""), 0);
@@ -365,7 +365,7 @@ mod tests {
     }
 
     #[test]
-    fn message_content_tokens_falls_back_to_json_like_kiro_go() {
+    fn message_content_tokens_falls_back_to_json_for_unknown_content() {
         let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
         set_precise_counting(false);
         let value = serde_json::json!({
@@ -379,7 +379,7 @@ mod tests {
     }
 
     #[test]
-    fn local_request_tokens_count_tool_use_and_tool_result_like_kiro_go() {
+    fn local_request_tokens_count_tool_use_and_tool_result() {
         let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
         set_precise_counting(false);
 
@@ -432,7 +432,7 @@ mod tests {
     }
 
     #[test]
-    fn local_request_tokens_allow_zero_like_kiro_go() {
+    fn local_request_tokens_allow_zero_input() {
         let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
         set_precise_counting(false);
 
@@ -440,7 +440,7 @@ mod tests {
     }
 
     #[test]
-    fn output_tokens_allow_zero_like_kiro_go() {
+    fn output_tokens_allow_zero() {
         let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
         set_precise_counting(false);
 
@@ -455,7 +455,7 @@ mod tests {
     }
 
     #[test]
-    fn output_tokens_count_thinking_and_tool_name_like_kiro_go() {
+    fn output_tokens_count_thinking_and_tool_name() {
         let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
         set_precise_counting(false);
 
@@ -479,7 +479,7 @@ mod tests {
     }
 
     #[test]
-    fn output_tokens_fall_back_to_json_for_unknown_blocks_like_kiro_go() {
+    fn output_tokens_fall_back_to_json_for_unknown_blocks() {
         let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
         set_precise_counting(false);
 

@@ -11,9 +11,11 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { CredentialLoginSummary } from '@/components/credential-login-summary'
 import { pollBuilderIdLogin, startBuilderIdLogin } from '@/api/credentials'
-import type { StartBuilderIdLoginResponse } from '@/types/api'
+import type { CredentialLoginDetails, StartBuilderIdLoginResponse } from '@/types/api'
 import { extractErrorMessage } from '@/lib/utils'
+import { CREDENTIAL_AUTH_LABELS, formatCredentialAuthLabel } from '@/lib/credential-metadata'
 
 interface BuilderIdLoginDialogProps {
   open: boolean
@@ -29,6 +31,8 @@ export function BuilderIdLoginDialog({ open, onOpenChange, onSuccess }: BuilderI
   const [isStarting, setIsStarting] = useState(false)
   const [session, setSession] = useState<StartBuilderIdLoginResponse | null>(null)
   const [credentialId, setCredentialId] = useState<number | null>(null)
+  const [credentialAuthLabel, setCredentialAuthLabel] = useState('')
+  const [credentialDetails, setCredentialDetails] = useState<CredentialLoginDetails | null>(null)
   const pollingRef = useRef(false)
 
   useEffect(() => {
@@ -40,16 +44,23 @@ export function BuilderIdLoginDialog({ open, onOpenChange, onSuccess }: BuilderI
       try {
         const result = await pollBuilderIdLogin(session.sessionId)
         if (result.status === 'success') {
+          const details = result.details ?? null
+          const authLabel = formatCredentialAuthLabel(
+            details?.provider ?? result.provider,
+            details?.authMethod ?? result.authMethod,
+          )
           setCredentialId(result.credentialId)
+          setCredentialAuthLabel(authLabel)
+          setCredentialDetails(details)
           setStep('done')
           onSuccess()
-          toast.success(`登录成功，已添加凭据 #${result.credentialId}`)
+          toast.success(`登录成功，已添加${authLabel ? ` ${authLabel}` : ''} 凭据 #${result.credentialId}`)
         } else if (result.status === 'expired') {
-          toast.error('Builder ID 授权已过期，请重新开始')
+          toast.error(`${CREDENTIAL_AUTH_LABELS.awsBuilderId} 授权已过期，请重新开始`)
           setStep('form')
           setSession(null)
         } else if (result.status === 'error') {
-          toast.error(`Builder ID 授权失败: ${result.message}`)
+          toast.error(`${CREDENTIAL_AUTH_LABELS.awsBuilderId} 授权失败: ${result.message}`)
           setStep('form')
           setSession(null)
         } else if (result.pollInterval && result.pollInterval !== session.pollInterval) {
@@ -73,6 +84,8 @@ export function BuilderIdLoginDialog({ open, onOpenChange, onSuccess }: BuilderI
       setStep('form')
       setSession(null)
       setCredentialId(null)
+      setCredentialAuthLabel('')
+      setCredentialDetails(null)
       setIsStarting(false)
       pollingRef.current = false
     }
@@ -88,7 +101,7 @@ export function BuilderIdLoginDialog({ open, onOpenChange, onSuccess }: BuilderI
       const sessionId = result.sessionId.trim()
       const verificationUri = result.verificationUri.trim()
       if (!sessionId || !verificationUri) {
-        toast.error('后端返回的 Builder ID 验证地址为空，请检查服务日志')
+        toast.error(`后端返回的 ${CREDENTIAL_AUTH_LABELS.awsBuilderId} 验证地址为空，请检查服务日志`)
         return
       }
       setSession({ ...result, sessionId, verificationUri })
@@ -117,17 +130,17 @@ export function BuilderIdLoginDialog({ open, onOpenChange, onSuccess }: BuilderI
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <Shield className="h-5 w-5" />
-            AWS Builder ID 登录
+            {CREDENTIAL_AUTH_LABELS.awsBuilderId} 登录
           </DialogTitle>
           <DialogDescription>
-            使用 AWS Builder ID 设备验证码流程添加凭据
+            使用 {CREDENTIAL_AUTH_LABELS.awsBuilderId} 设备验证码流程添加凭据
           </DialogDescription>
         </DialogHeader>
 
         {step === 'form' && (
           <div className="space-y-4 py-4">
             <div className="space-y-2">
-              <label className="text-sm font-medium">Region</label>
+              <label className="text-sm font-medium">区域</label>
               <Input
                 value={region}
                 onChange={e => setRegion(e.target.value)}
@@ -184,6 +197,11 @@ export function BuilderIdLoginDialog({ open, onOpenChange, onSuccess }: BuilderI
                 </p>
               </div>
             </div>
+            <CredentialLoginSummary
+              credentialId={credentialId}
+              authLabel={credentialAuthLabel}
+              details={credentialDetails}
+            />
           </div>
         )}
 

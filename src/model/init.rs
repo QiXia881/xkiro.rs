@@ -15,7 +15,7 @@ use anyhow::{Context, Result, bail};
 
 use super::config::Config;
 
-/// 默认 API Key（与下游客户端约定的访问凭据）
+/// 默认 API 密钥（与下游客户端约定的访问凭据）
 fn suggest_api_key() -> String {
     // 16 字节十六进制：足够熵 + 输入方便
     let bytes: [u8; 16] = std::array::from_fn(|_| fastrand::u8(..));
@@ -89,9 +89,9 @@ pub fn run_init(path: &Path, force: bool) -> Result<()> {
         .parse()
         .map_err(|_| anyhow::anyhow!("端口必须是 0-65535 的整数: {}", port_str))?;
 
-    // apiKey（下游客户端访问 xkiro.rs 时的 Bearer Token）
+    // apiKey（下游客户端访问 xkiro.rs 时的 Bearer 令牌）
     println!();
-    println!("【apiKey】下游客户端调用 /v1/messages 等接口时携带的 Bearer Token。");
+    println!("【apiKey】下游客户端调用 /v1/messages 等接口时携带的 Bearer 令牌。");
     println!("         留空将拒绝启动；建议使用随机生成的默认值。");
     let suggested_api_key = suggest_api_key();
     let api_key = prompt("apiKey", Some(&suggested_api_key))?;
@@ -117,6 +117,7 @@ pub fn run_init(path: &Path, force: bool) -> Result<()> {
     config.port = port;
     config.api_key = Some(api_key);
     config.admin_api_key = admin_api_key.clone();
+    config.machine_id = Some(super::config::generate_default_machine_id());
 
     // 写盘
     let content = serde_json::to_string_pretty(&config).context("序列化配置失败")?;
@@ -148,7 +149,7 @@ pub fn run_init(path: &Path, force: bool) -> Result<()> {
     }
     println!("------------------------------------------------------------");
     println!("下一步：");
-    println!("  1. 准备 credentials.json（社交登录或 idc 账号）");
+    println!("  1. 准备 credentials.json（社交登录或 IAM Identity Center 凭据）");
     println!("  2. 直接运行 xkiro.rs 即可启动服务");
     println!();
 

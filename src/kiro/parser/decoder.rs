@@ -4,7 +4,7 @@
 //!
 //! ## 状态机设计
 //!
-//! 参考 kiro-kt 项目的状态机设计，采用四态模型：
+//! xkiro.rs 采用四态模型：
 //!
 //! ```text
 //! ┌─────────────────┐
@@ -45,7 +45,7 @@ pub const DEFAULT_BUFFER_CAPACITY: usize = 8192;
 
 /// 解码器状态
 ///
-/// 采用四态模型，参考 kiro-kt 的设计：
+/// 采用四态模型：
 /// - Ready: 就绪状态，可以接收数据
 /// - Parsing: 正在解析帧
 /// - Recovering: 恢复中（尝试跳过损坏数据）
@@ -236,7 +236,7 @@ impl EventStreamDecoder {
 
     /// 尝试容错恢复
     ///
-    /// 根据错误类型采用不同的恢复策略（参考 kiro-kt 的设计）：
+    /// 根据错误类型采用不同的恢复策略：
     /// - Prelude 阶段错误（CRC 失败、长度异常）：跳过 1 字节，尝试找下一帧边界
     /// - Data 阶段错误（Message CRC 失败、Header 解析失败）：跳过整个损坏帧
     fn try_recover(&mut self, error: &ParseError) {

@@ -1,7 +1,7 @@
 //! Kiro `ListAvailableModels` 客户端
 //!
 //! 查询单个凭据可用的上游模型清单（区分 IDE / CLI 端点 user-agent；不区分 Internal provider）。
-//! 完整行为对齐参考 `kiro-account-manager`：
+//! 完整行为对齐上游 profile/model 列表流程：
 //! - URL: `https://q.{api_region}.amazonaws.com/ListAvailableModels`
 //! - 查询参数：`origin=AI_EDITOR`、`maxResults=50`、可选 `profileArn` / `modelProvider` / `nextToken`
 //! - 翻页直到 `nextToken` 为空，把 `default_model` 标记到列表
@@ -12,8 +12,9 @@ use uuid::Uuid;
 
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{
-    CLI_ENDPOINT_NAME, CliEndpoint, IDE_ENDPOINT_NAME, IdeEndpoint, KiroEndpoint, RequestContext,
-    UsageRequestParts,
+    AMAZONQ_ENDPOINT_NAME, AmazonQEndpoint, CLI_ENDPOINT_NAME, CODEWHISPERER_ENDPOINT_NAME,
+    CliEndpoint, CodewhispererEndpoint, IDE_ENDPOINT_NAME, IdeEndpoint, KiroEndpoint,
+    RequestContext, UsageRequestParts,
 };
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
@@ -72,8 +73,10 @@ fn build_endpoint(
 ) -> anyhow::Result<Box<dyn KiroEndpoint>> {
     match credentials.effective_endpoint_name(Some(&config.default_endpoint)) {
         IDE_ENDPOINT_NAME => Ok(Box::new(IdeEndpoint::new())),
+        CODEWHISPERER_ENDPOINT_NAME => Ok(Box::new(CodewhispererEndpoint::new())),
+        AMAZONQ_ENDPOINT_NAME => Ok(Box::new(AmazonQEndpoint::new())),
         CLI_ENDPOINT_NAME => Ok(Box::new(CliEndpoint::new())),
-        name => anyhow::bail!("未知 endpoint: {}", name),
+        name => anyhow::bail!("未知端点: {}", name),
     }
 }
 
@@ -118,10 +121,29 @@ fn list_models_request_parts(
         .unwrap_or_else(|| {
             format!(
                 "q.{}.amazonaws.com",
-                ctx.credentials.effective_api_region(ctx.config)
+                ctx.credentials.effective_kiro_api_region(ctx.config)
             )
         });
     parts.url = build_list_models_url(&host, ctx.credentials.profile_arn_trimmed(), None, None)?;
+    Ok(parts)
+}
+
+fn list_profiles_request_parts(
+    endpoint: &dyn KiroEndpoint,
+    ctx: &RequestContext<'_>,
+) -> anyhow::Result<UsageRequestParts> {
+    let mut parts = endpoint.usage_request_parts(ctx, false)?;
+    let host = parts
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("host"))
+        .map(|(_, v)| v.clone())
+        .unwrap_or_else(|| {
+            crate::kiro::endpoint::codewhisperer_rest_host_for_region(
+                ctx.credentials.effective_kiro_api_region(ctx.config),
+            )
+        });
+    parts.url = format!("https://{host}/ListAvailableProfiles");
     Ok(parts)
 }
 
@@ -284,7 +306,6 @@ pub struct ProfileEntry {
 
 /// 查询可用 Profile 列表并返回第一个有效 profileArn
 ///
-/// 对齐 Kiro-Go `listAvailableProfiles()`:
 /// - POST https://q.{region}.amazonaws.com/ListAvailableProfiles
 /// - Body: `{"maxResults": 10}`
 /// - 返回第一个非空 arn
@@ -309,20 +330,18 @@ pub async fn list_available_profiles(
         config,
     };
 
-    // 构建 URL
-    let api_region = credentials.effective_api_region(config);
-    let host = format!("q.{}.amazonaws.com", api_region);
-    let url = format!("https://{}/ListAvailableProfiles", host);
+    let parts = list_profiles_request_parts(endpoint.as_ref(), &rctx).map_err(|e| e.to_string())?;
 
     let client = build_client(proxy, 30, config.tls_backend)
         .map_err(|e| format!("创建 HTTP 客户端失败: {e}"))?;
 
-    let base = client
-        .post(&url)
+    let mut request = client
+        .post(&parts.url)
         .header("content-type", "application/json")
         .body(r#"{"maxResults":10}"#);
-
-    let request = endpoint.decorate_api(base, &rctx);
+    for (name, value) in &parts.headers {
+        request = request.header(*name, value);
+    }
 
     let resp = request
         .send()
@@ -358,7 +377,6 @@ pub async fn list_available_profiles(
 
 /// 带重试的 ListAvailableProfiles 调用
 ///
-/// 对齐 Kiro-Go `listAvailableProfilesWithRetry()`:
 /// - 最多重试 3 次
 /// - 仅对瞬态错误（网络错误、5xx、429）重试
 /// - 空 profile 列表和 4xx（非 429）不重试
@@ -425,7 +443,7 @@ async fn list_available_profiles_with_retry_in_region(
 fn profile_region_candidates(credentials: &KiroCredentials, config: &Config) -> Vec<String> {
     let mut out = Vec::new();
 
-    push_unique_region(&mut out, credentials.effective_api_region(config));
+    push_unique_region(&mut out, credentials.effective_kiro_api_region(config));
     if !should_probe_fallback_regions(credentials) {
         return out;
     }
@@ -484,6 +502,13 @@ fn is_transient_profile_error(err: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn header_value<'a>(headers: &'a [(&'static str, String)], name: &str) -> Option<&'a str> {
+        headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
     #[test]
     fn list_models_url_uses_trimmed_profile_arn() {
         let mut credentials = KiroCredentials::default();
@@ -519,7 +544,7 @@ mod tests {
     }
 
     #[test]
-    fn external_idp_profile_candidates_include_kiro_go_fallback_regions() {
+    fn external_idp_profile_candidates_include_default_fallback_regions() {
         let config = Config::default();
         let mut credentials = KiroCredentials::default();
         credentials.auth_method = Some("external_idp".to_string());
@@ -527,6 +552,106 @@ mod tests {
         assert_eq!(
             profile_region_candidates(&credentials, &config),
             vec!["us-east-1".to_string(), "eu-central-1".to_string()]
+        );
+    }
+
+    #[test]
+    fn profile_candidates_prefer_profile_arn_region() {
+        let mut config = Config::default();
+        config.api_region = Some("us-east-1".to_string());
+        let mut credentials = KiroCredentials::default();
+        credentials.auth_method = Some("external_idp".to_string());
+        credentials.api_region = Some("us-west-2".to_string());
+        credentials.profile_arn =
+            Some("arn:aws:codewhisperer:eu-central-1:123:profile/test".to_string());
+
+        assert_eq!(
+            profile_region_candidates(&credentials, &config),
+            vec!["eu-central-1".to_string(), "us-east-1".to_string()]
+        );
+    }
+
+    #[test]
+    fn list_models_build_endpoint_accepts_all_registered_upstream_endpoints() {
+        let mut config = Config::default();
+        for endpoint_name in ["ide", "codewhisperer", "amazonq", "cli"] {
+            config.default_endpoint = endpoint_name.to_string();
+            let credentials = KiroCredentials::default();
+            let endpoint = build_endpoint(&credentials, &config).unwrap();
+
+            assert_eq!(endpoint.name(), endpoint_name);
+        }
+    }
+
+    #[test]
+    fn list_profiles_request_uses_runtime_rest_shape() {
+        let endpoint = IdeEndpoint::new();
+        let config = Config::default();
+        let credentials = KiroCredentials::default();
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: "token",
+            machine_id: "machine",
+            config: &config,
+        };
+
+        let parts = list_profiles_request_parts(&endpoint, &ctx).unwrap();
+
+        assert_eq!(
+            parts.url,
+            "https://codewhisperer.us-east-1.amazonaws.com/ListAvailableProfiles"
+        );
+        assert_eq!(
+            header_value(&parts.headers, "Accept"),
+            Some("application/json")
+        );
+        assert_eq!(
+            header_value(&parts.headers, "host"),
+            Some("codewhisperer.us-east-1.amazonaws.com")
+        );
+        assert!(
+            header_value(&parts.headers, "user-agent")
+                .is_some_and(|value| value.contains("api/codewhispererruntime#1.0.0"))
+        );
+        assert!(
+            !parts
+                .headers
+                .iter()
+                .any(|(key, _)| key.eq_ignore_ascii_case("X-Amz-Target"))
+        );
+        assert!(
+            !parts
+                .headers
+                .iter()
+                .any(|(key, _)| key.eq_ignore_ascii_case("x-amzn-kiro-agent-mode"))
+        );
+        assert_ne!(header_value(&parts.headers, "Accept"), Some("*/*"));
+    }
+
+    #[test]
+    fn list_profiles_request_prefers_profile_arn_region() {
+        let endpoint = IdeEndpoint::new();
+        let mut config = Config::default();
+        config.api_region = Some("us-east-1".to_string());
+        let mut credentials = KiroCredentials::default();
+        credentials.profile_arn =
+            Some("arn:aws:codewhisperer:eu-central-1:123:profile/test".to_string());
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: "token",
+            machine_id: "machine",
+            config: &config,
+        };
+
+        let parts = list_profiles_request_parts(&endpoint, &ctx).unwrap();
+
+        assert_eq!(
+            parts.url,
+            "https://q.eu-central-1.amazonaws.com/ListAvailableProfiles"
+        );
+        assert_eq!(
+            header_value(&parts.headers, "host"),
+            Some("q.eu-central-1.amazonaws.com")
         );
     }
 

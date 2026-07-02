@@ -2,8 +2,10 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use axum::{
     body::Body,
@@ -12,7 +14,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Json, Response},
 };
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
@@ -32,6 +34,7 @@ pub(crate) struct PromptCacheSnapshot {
     pub accounting_enabled: bool,
     #[allow(dead_code)]
     pub ttl_seconds: u64,
+    pub max_ratio: f64,
     pub tracker: Arc<CacheTracker>,
 }
 
@@ -42,18 +45,133 @@ pub struct ThinkingRuntimeConfig {
     pub claude_format: String,
 }
 
+#[derive(Debug)]
+pub struct GatewayStats {
+    total_requests: AtomicI64,
+    success_requests: AtomicI64,
+    failed_requests: AtomicI64,
+    total_tokens: AtomicI64,
+    total_credits: Mutex<f64>,
+    start_time: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct GatewayStatsSnapshot {
+    pub total_requests: i64,
+    pub success_requests: i64,
+    pub failed_requests: i64,
+    pub total_tokens: i64,
+    pub total_credits: f64,
+    pub uptime: u64,
+}
+
+impl GatewayStats {
+    fn new() -> Self {
+        Self {
+            total_requests: AtomicI64::new(0),
+            success_requests: AtomicI64::new(0),
+            failed_requests: AtomicI64::new(0),
+            total_tokens: AtomicI64::new(0),
+            total_credits: Mutex::new(0.0),
+            start_time: Instant::now(),
+        }
+    }
+
+    fn record_success(&self, tokens: i64, credits: f64) {
+        self.total_requests.fetch_add(1, Ordering::Relaxed);
+        self.success_requests.fetch_add(1, Ordering::Relaxed);
+        if tokens > 0 {
+            self.total_tokens.fetch_add(tokens, Ordering::Relaxed);
+        }
+        if credits > 0.0 {
+            *self.total_credits.lock() += credits;
+        }
+    }
+
+    fn record_failure(&self) {
+        self.total_requests.fetch_add(1, Ordering::Relaxed);
+        self.failed_requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> GatewayStatsSnapshot {
+        GatewayStatsSnapshot {
+            total_requests: self.total_requests.load(Ordering::Relaxed),
+            success_requests: self.success_requests.load(Ordering::Relaxed),
+            failed_requests: self.failed_requests.load(Ordering::Relaxed),
+            total_tokens: self.total_tokens.load(Ordering::Relaxed),
+            total_credits: *self.total_credits.lock(),
+            uptime: self.start_time.elapsed().as_secs(),
+        }
+    }
+}
+
 pub struct PromptCacheRuntime {
     accounting_enabled: bool,
     ttl_seconds: u64,
+    max_ratio: f64,
     tracker: Arc<CacheTracker>,
+    persistence_path: Option<PathBuf>,
+    persistence_interval: Duration,
+    persistence_loop: Option<PromptCachePersistenceLoop>,
 }
 
 impl PromptCacheRuntime {
-    pub fn new(ttl_seconds: u64, accounting_enabled: bool) -> Self {
+    pub fn new(ttl_seconds: u64, accounting_enabled: bool, max_ratio: f64) -> Self {
+        Self::build(
+            ttl_seconds,
+            accounting_enabled,
+            max_ratio,
+            None,
+            Duration::from_secs(30),
+        )
+    }
+
+    pub fn new_with_persistence(
+        ttl_seconds: u64,
+        accounting_enabled: bool,
+        max_ratio: f64,
+        persistence_path: PathBuf,
+    ) -> Self {
+        Self::build(
+            ttl_seconds,
+            accounting_enabled,
+            max_ratio,
+            Some(persistence_path),
+            Duration::from_secs(30),
+        )
+    }
+
+    fn build(
+        ttl_seconds: u64,
+        accounting_enabled: bool,
+        max_ratio: f64,
+        persistence_path: Option<PathBuf>,
+        persistence_interval: Duration,
+    ) -> Self {
+        let tracker = Arc::new(CacheTracker::new_with_max_ratio(
+            Duration::from_secs(ttl_seconds),
+            max_ratio,
+        ));
+        let persistence_loop = persistence_path.as_ref().map(|path| {
+            let loaded = tracker.load_from_path(path);
+            if loaded > 0 {
+                tracing::info!(
+                    path = %path.display(),
+                    entries = loaded,
+                    "已加载 prompt cache 持久化条目"
+                );
+            }
+            PromptCachePersistenceLoop::start(tracker.clone(), path.clone(), persistence_interval)
+        });
+
         Self {
             accounting_enabled,
             ttl_seconds,
-            tracker: Arc::new(CacheTracker::new(Duration::from_secs(ttl_seconds))),
+            max_ratio,
+            tracker,
+            persistence_path,
+            persistence_interval,
+            persistence_loop,
         }
     }
 
@@ -61,20 +179,99 @@ impl PromptCacheRuntime {
         PromptCacheSnapshot {
             accounting_enabled: self.accounting_enabled,
             ttl_seconds: self.ttl_seconds,
+            max_ratio: self.max_ratio,
             tracker: self.tracker.clone(),
         }
     }
 
-    pub fn update(&mut self, ttl_seconds: Option<u64>, accounting_enabled: Option<bool>) {
+    pub fn update(
+        &mut self,
+        ttl_seconds: Option<u64>,
+        accounting_enabled: Option<bool>,
+        max_ratio: Option<f64>,
+    ) {
         if let Some(value) = accounting_enabled {
             self.accounting_enabled = value;
+        }
+
+        if let Some(value) = max_ratio {
+            self.max_ratio = value;
+            self.tracker.set_max_cache_read_ratio(value);
         }
 
         if let Some(value) = ttl_seconds
             && self.ttl_seconds != value
         {
             self.ttl_seconds = value;
-            self.tracker = Arc::new(CacheTracker::new(Duration::from_secs(value)));
+            self.persistence_loop = None;
+            self.tracker = Arc::new(CacheTracker::new_with_max_ratio(
+                Duration::from_secs(value),
+                self.max_ratio,
+            ));
+            if let Some(path) = &self.persistence_path {
+                let loaded = self.tracker.load_from_path(path);
+                if loaded > 0 {
+                    tracing::info!(
+                        path = %path.display(),
+                        entries = loaded,
+                        "已重新加载 prompt cache 持久化条目"
+                    );
+                }
+                self.persistence_loop = Some(PromptCachePersistenceLoop::start(
+                    self.tracker.clone(),
+                    path.clone(),
+                    self.persistence_interval,
+                ));
+            }
+        }
+    }
+}
+
+struct PromptCachePersistenceLoop {
+    stop_tx: mpsc::Sender<()>,
+    join_handle: Option<thread::JoinHandle<()>>,
+}
+
+impl PromptCachePersistenceLoop {
+    fn start(tracker: Arc<CacheTracker>, path: PathBuf, interval: Duration) -> Self {
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let join_handle = thread::spawn(move || {
+            loop {
+                match stop_rx.recv_timeout(interval) {
+                    Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        if let Err(err) = tracker.flush_to_path(&path) {
+                            tracing::warn!(
+                                path = %path.display(),
+                                error = %err,
+                                "prompt cache 最终持久化失败"
+                            );
+                        }
+                        return;
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if let Err(err) = tracker.flush_to_path(&path) {
+                            tracing::warn!(
+                                path = %path.display(),
+                                error = %err,
+                                "prompt cache 持久化失败"
+                            );
+                        }
+                    }
+                }
+            }
+        });
+        Self {
+            stop_tx,
+            join_handle: Some(join_handle),
+        }
+    }
+}
+
+impl Drop for PromptCachePersistenceLoop {
+    fn drop(&mut self) {
+        let _ = self.stop_tx.send(());
+        if let Some(handle) = self.join_handle.take() {
+            let _ = handle.join();
         }
     }
 }
@@ -82,13 +279,13 @@ impl PromptCacheRuntime {
 /// 应用共享状态
 #[derive(Clone)]
 pub struct AppState {
-    /// API 密钥（单 key 模式，向后兼容）
+    /// API 密钥（单 key 配置）
     pub api_key: Arc<RwLock<String>>,
-    /// 是否要求客户端 API Key
+    /// 是否要求客户端 API 密钥
     pub require_api_key: Arc<AtomicBool>,
-    /// 多 API Key 列表（可选，启用后支持多个 key）
+    /// 多 API 密钥列表（可选，启用后支持多个密钥）
     pub api_keys: Option<SharedApiKeys>,
-    /// 多 API Key 持久化路径
+    /// 多 API 密钥持久化路径
     pub api_keys_path: Option<Arc<PathBuf>>,
     /// Kiro Provider（可选，用于实际 API 调用）
     /// 内部使用 MultiTokenManager，已支持线程安全的多凭据管理
@@ -105,12 +302,14 @@ pub struct AppState {
     pub prompt_runtime: SharedPromptConfig,
     /// Prompt Cache 运行时配置（共享引用，支持热更新）
     pub prompt_cache_runtime: Arc<RwLock<PromptCacheRuntime>>,
-    /// Kiro-Go thinking 设置（运行时可改）
+    /// thinking 设置（运行时可改）
     pub thinking_config: Arc<RwLock<ThinkingRuntimeConfig>>,
     /// OpenAI Responses 历史存储目录
     pub responses_store_dir: Option<Arc<PathBuf>>,
     /// Kiro 可用模型缓存
     pub models_cache: Arc<RwLock<Vec<crate::kiro::models::AvailableModel>>>,
+    /// 公开网关统计，用于 `/v1/stats`
+    pub gateway_stats: Arc<GatewayStats>,
 }
 
 impl AppState {
@@ -143,10 +342,11 @@ impl AppState {
             thinking_config: Arc::new(RwLock::new(thinking_config)),
             responses_store_dir: None,
             models_cache: Arc::new(RwLock::new(Vec::new())),
+            gateway_stats: Arc::new(GatewayStats::new()),
         }
     }
 
-    /// 设置多 API Key 列表
+    /// 设置多 API 密钥列表
     pub fn with_api_keys(mut self, keys: Vec<crate::admin::types::ApiKeyEntry>) -> Self {
         self.api_keys = Some(Arc::new(RwLock::new(keys)));
         self
@@ -220,7 +420,17 @@ impl AppState {
         self.prompt_cache_runtime.read().snapshot()
     }
 
+    pub fn record_gateway_failure(&self) {
+        self.gateway_stats.record_failure();
+    }
+
+    pub fn gateway_stats_snapshot(&self) -> GatewayStatsSnapshot {
+        self.gateway_stats.snapshot()
+    }
+
     pub fn record_api_key_usage(&self, key_id: Option<&str>, tokens: i64, credits: f64) {
+        self.gateway_stats.record_success(tokens, credits);
+
         let Some(key_id) = key_id.filter(|id| !id.is_empty()) else {
             return;
         };
@@ -230,7 +440,7 @@ impl AppState {
 
         let mut keys = api_keys.write();
         let Some(entry) = keys.iter_mut().find(|k| k.id == key_id) else {
-            tracing::warn!(api_key_id = key_id, "API Key 使用量记录失败：未找到 key");
+            tracing::warn!(api_key_id = key_id, "API 密钥使用量记录失败：未找到密钥");
             return;
         };
 
@@ -247,18 +457,18 @@ impl AppState {
             match serde_json::to_string_pretty(&*keys) {
                 Ok(data) => {
                     if let Err(e) = std::fs::write(path.as_ref(), data) {
-                        tracing::warn!(path = %path.display(), error = %e, "保存 API Keys 文件失败");
+                        tracing::warn!(path = %path.display(), error = %e, "保存 API 密钥文件失败");
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "序列化 API Keys 失败");
+                    tracing::warn!(error = %e, "序列化 API 密钥失败");
                 }
             }
         }
     }
 }
 
-/// API Key 认证中间件
+/// API 密钥认证中间件
 ///
 /// 支持两种模式：
 /// 1. 单 key 模式：检查提取的 key 是否与配置的 api_key 匹配
@@ -329,8 +539,8 @@ fn authenticate_client_api_key(
         }
     }
 
-    let legacy_key = state.api_key.read().clone();
-    if !legacy_key.trim().is_empty() && auth::constant_time_eq(key, &legacy_key) {
+    let config_key = state.api_key.read().clone();
+    if !config_key.trim().is_empty() && auth::constant_time_eq(key, &config_key) {
         return Ok(None);
     }
 
@@ -346,7 +556,7 @@ mod tests {
             api_key,
             true,
             false,
-            Arc::new(RwLock::new(PromptCacheRuntime::new(300, false))),
+            Arc::new(RwLock::new(PromptCacheRuntime::new(300, false, 0.85))),
             ThinkingRuntimeConfig {
                 suffix: "-thinking".to_string(),
                 openai_format: "reasoning_content".to_string(),
@@ -361,6 +571,7 @@ mod tests {
             name: Some(key.to_string()),
             key: key.to_string(),
             enabled,
+            migrated: false,
             created_at: 1,
             last_used_at: None,
             token_limit: 0,
@@ -372,7 +583,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_api_keys_update_auth_immediately_like_kiro_go() {
+    fn shared_api_keys_update_auth_immediately() {
         let keys = Arc::new(RwLock::new(Vec::new()));
         let state = test_state("").with_api_keys_runtime(keys.clone());
 
@@ -390,7 +601,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_api_keys_disable_immediately_like_kiro_go() {
+    fn shared_api_keys_disable_immediately() {
         let keys = Arc::new(RwLock::new(vec![api_key_entry("sk-live", true)]));
         let state = test_state("").with_api_keys_runtime(keys.clone());
 
@@ -408,7 +619,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_legacy_key_fails_closed_when_auth_is_required_like_kiro_go() {
+    fn empty_config_key_fails_closed_when_auth_is_required() {
         let state = test_state("");
 
         assert_eq!(
@@ -418,18 +629,18 @@ mod tests {
     }
 
     #[test]
-    fn configured_api_keys_take_priority_over_legacy_key_like_kiro_go() {
+    fn configured_api_keys_take_priority_over_config_key() {
         let keys = Arc::new(RwLock::new(vec![api_key_entry("sk-live", true)]));
-        let state = test_state("legacy-key").with_api_keys_runtime(keys);
+        let state = test_state("config-key").with_api_keys_runtime(keys);
 
         assert_eq!(
-            authenticate_client_api_key(&state, "legacy-key"),
+            authenticate_client_api_key(&state, "config-key"),
             Err(ClientApiKeyAuthError::Invalid)
         );
     }
 
     #[test]
-    fn record_api_key_usage_persists_counters_like_kiro_go() {
+    fn record_api_key_usage_persists_counters() {
         let dir = std::env::temp_dir().join(format!(
             "xkiro-api-key-usage-test-{}",
             std::time::SystemTime::now()
@@ -454,12 +665,17 @@ mod tests {
         assert_eq!(entry.credits_used, 0.5);
         assert_eq!(entry.requests_count, 2);
         assert!(entry.last_used_at.is_some());
+        let stats = state.gateway_stats_snapshot();
+        assert_eq!(stats.total_requests, 2);
+        assert_eq!(stats.success_requests, 2);
+        assert_eq!(stats.total_tokens, 7);
+        assert_eq!(stats.total_credits, 0.5);
 
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn record_api_key_usage_empty_id_is_noop_like_kiro_go() {
+    fn record_api_key_usage_empty_id_skips_per_key_counters() {
         let keys = Arc::new(RwLock::new(vec![api_key_entry("sk-live", true)]));
         let state = test_state("").with_api_keys_runtime(keys.clone());
 
@@ -471,6 +687,23 @@ mod tests {
         assert_eq!(entry.credits_used, 0.0);
         assert_eq!(entry.requests_count, 0);
         assert!(entry.last_used_at.is_none());
+        let stats = state.gateway_stats_snapshot();
+        assert_eq!(stats.total_requests, 2);
+        assert_eq!(stats.success_requests, 2);
+        assert_eq!(stats.total_tokens, 200);
+        assert_eq!(stats.total_credits, 2.0);
+    }
+
+    #[test]
+    fn gateway_failure_stats_increment_without_per_key_usage() {
+        let state = test_state("config-key");
+
+        state.record_gateway_failure();
+
+        let stats = state.gateway_stats_snapshot();
+        assert_eq!(stats.total_requests, 1);
+        assert_eq!(stats.success_requests, 0);
+        assert_eq!(stats.failed_requests, 1);
     }
 }
 
@@ -483,11 +716,22 @@ mod tests {
 /// - `allow_origin(Any)`: 允许任何来源的请求
 /// - `allow_methods(Any)`: 允许任何 HTTP 方法
 /// - `allow_headers(Any)`: 允许任何请求头
+/// - `expose_headers(...)`: 暴露 Anthropic 风格的 request/rate-limit 响应头
 pub fn cors_layer() -> tower_http::cors::CorsLayer {
+    use http::HeaderName;
     use tower_http::cors::{Any, CorsLayer};
 
     CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any)
+        .expose_headers([
+            HeaderName::from_static("x-request-id"),
+            HeaderName::from_static("x-ratelimit-limit-requests"),
+            HeaderName::from_static("x-ratelimit-limit-tokens"),
+            HeaderName::from_static("x-ratelimit-remaining-requests"),
+            HeaderName::from_static("x-ratelimit-remaining-tokens"),
+            HeaderName::from_static("x-ratelimit-reset-requests"),
+            HeaderName::from_static("x-ratelimit-reset-tokens"),
+        ])
 }

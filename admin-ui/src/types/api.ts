@@ -1,3 +1,29 @@
+import type { CredentialMaterialFlags, OptionalCredentialMaterialFlags } from '@/lib/credential-material'
+import {
+  CREDENTIAL_SOURCE_FORMATS,
+  type CredentialImportAction,
+  type CredentialImportMetadataFields,
+  CredentialStatusMetadataFields,
+  OptionalCredentialMetadataFields,
+} from '@/lib/credential-metadata'
+
+export const REQUEST_LOG_STATUSES = {
+  success: 'success',
+  error: 'error',
+} as const
+
+export const REQUEST_LOG_ERROR_TYPES = {
+  quota: 'quota',
+  overage: 'overage',
+  suspended: 'suspended',
+  auth: 'auth',
+  profile: 'profile',
+  unknown: 'unknown',
+} as const
+
+export type RequestLogStatus = typeof REQUEST_LOG_STATUSES[keyof typeof REQUEST_LOG_STATUSES]
+export type RequestLogErrorType = typeof REQUEST_LOG_ERROR_TYPES[keyof typeof REQUEST_LOG_ERROR_TYPES]
+
 // 凭据状态响应
 export interface CredentialsStatusResponse {
   total: number
@@ -6,7 +32,7 @@ export interface CredentialsStatusResponse {
 }
 
 // 单个凭据状态
-export interface CredentialStatusItem {
+export interface CredentialStatusItem extends CredentialMaterialFlags, CredentialStatusMetadataFields {
   id: number
   priority: number
   weight: number
@@ -14,7 +40,42 @@ export interface CredentialStatusItem {
   failureCount: number
   expiresAt: string | null
   authMethod: string | null
-  hasProfileArn: boolean
+  provider?: string
+  userId?: string
+  sourceAccountId?: string
+  label?: string
+  status?: string
+  addedAt?: string
+  nickname?: string
+  subscriptionType?: string
+  subscriptionTitle?: string
+  daysRemaining?: number
+  overageStatus?: string
+  overageCapability?: string
+  overageCap?: number
+  overageRate?: number
+  currentOverages?: number
+  overageCheckedAt?: number
+  banStatus?: string
+  banReason?: string
+  banTime?: number
+  usageCurrent?: number
+  usageLimit?: number
+  usagePercent?: number
+  nextResetDate?: string
+  lastRefresh?: number
+  trialUsageCurrent?: number
+  trialUsageLimit?: number
+  trialUsagePercent?: number
+  trialStatus?: string
+  trialExpiresAt?: number
+  requestCount?: number
+  errorCount?: number
+  totalTokens?: number
+  totalCredits?: number
+  lastUsed?: number
+  createdAt?: number
+  tags?: unknown
   email?: string
   refreshTokenHash?: string
   apiKeyHash?: string
@@ -23,6 +84,7 @@ export interface CredentialStatusItem {
   lastUsedAt: string | null
   hasProxy: boolean
   proxyUrl?: string
+  proxyId: number | null
   refreshFailureCount: number
   disabledReason?: string
   endpoint: string
@@ -53,7 +115,7 @@ export interface GlobalConfigResponse {
   balanceRefreshIntervalSecs: number
   /** 周期余额刷新并发上限（1..=10） */
   balanceRefreshConcurrency: number
-  /** session 亲和：true=同会话黏住同凭据；false=每条消息独立平摊 */
+  /** 调度亲和：true=session/API key 黏住同凭据；false=每条消息独立平摊 */
   sessionAffinityEnabled: boolean
   /** admin UI 隐私模式（邮箱脱敏展示） */
   privacyMode: boolean
@@ -64,6 +126,8 @@ export interface GlobalConfigResponse {
 export interface CompressionConfigPayload {
   maxRequestBodyBytes: number
 }
+
+export type CompressionConfig = CompressionConfigPayload
 
 // 更新全局配置请求（所有字段可选）
 export interface UpdateGlobalConfigRequest {
@@ -83,10 +147,144 @@ export interface UpdateGlobalConfigRequest {
   compression?: Partial<CompressionConfigPayload>
 }
 
+export interface AccessSettings {
+  apiKey?: string | null
+  requireApiKey: boolean
+  port: number
+  host: string
+  allowOverUsage: boolean
+}
+
+export interface UpdateAccessSettingsRequest {
+  apiKey?: string
+  requireApiKey?: boolean
+  password?: string
+  allowOverUsage?: boolean
+}
+
+export type CredentialMachineIdStrategy = 'local' | 'random'
+
+export interface CommonConfig {
+  machineId: string
+  credentialMachineIdStrategy: CredentialMachineIdStrategy
+}
+
+export interface UpdateCommonConfigRequest {
+  credentialMachineIdStrategy?: CredentialMachineIdStrategy
+}
+
+export interface ThinkingConfig {
+  suffix: string
+  openaiFormat: 'reasoning_content' | 'thinking' | 'think'
+  claudeFormat: 'reasoning_content' | 'thinking' | 'think'
+}
+
+export interface EndpointConfig {
+  preferredEndpoint: 'auto' | 'kiro' | 'codewhisperer' | 'amazonq'
+  endpointFallback: boolean
+}
+
+export interface PromptFilterRule {
+  id: string
+  name: string
+  enabled: boolean
+  type: 'regex' | 'lines-containing' | 'contains'
+  match: string
+  replace?: string
+}
+
+export interface PromptFilterConfig {
+  filterClaudeCode: boolean
+  filterEnvNoise: boolean
+  filterStripBoundaries: boolean
+  rules: PromptFilterRule[]
+}
+
+export interface ProxyConfig {
+  proxyUrl: string | null
+  hasCredentials: boolean
+}
+
+export interface UpdateProxyConfigRequest {
+  proxyUrl: string | null
+  proxyUsername: string | null
+  proxyPassword: string | null
+}
+
+export interface ProxyItem {
+  id: number
+  url: string
+  username?: string | null
+  region?: string | null
+  country?: string | null
+  maxConcurrency?: number | null
+  disabled: boolean
+  note?: string | null
+  dead: boolean
+  consecutiveFailures: number
+  lastError?: string | null
+  lastChecked?: string | null
+  availablePermits?: number | null
+  boundCredentials: number
+}
+
+export interface ProxyListResponse {
+  proxies: ProxyItem[]
+}
+
+export interface ProxyUpsertRequest {
+  url: string
+  username?: string
+  password?: string
+  region?: string
+  maxConcurrency?: number
+  disabled?: boolean
+  note?: string
+}
+
+export interface ProxyImportRequest {
+  text: string
+  region?: string
+  maxConcurrency?: number
+}
+
+export interface ProxyImportResponse {
+  added: number
+  failed: number
+  errors: string[]
+}
+
+export interface ProxyTestResponse {
+  ok: boolean
+  exitIp?: string
+  latencyMs?: number
+  error?: string
+}
+
+export interface ProxyAutoAssignRequest {
+  credentialIds: number[]
+  reassignBound: boolean
+}
+
+export interface ProxyAutoAssignResponse {
+  assigned: [number, number][]
+  skipped: number[]
+}
+
+export interface SetCredentialProxyRequest {
+  proxyId: number | null
+}
+
+export interface SetCredentialProxyByRegionResponse {
+  message: string
+  proxyId: number | null
+}
+
 // 余额响应
 export interface BalanceResponse {
   id: number
   subscriptionTitle: string | null
+  subscriptionType?: string | null
   currentUsage: number
   usageLimit: number
   remaining: number
@@ -100,9 +298,45 @@ export interface BalanceResponse {
   overageStatus?: string | null
 }
 
+export interface AvailableModel {
+  modelId: string
+  modelName?: string
+  description?: string
+  provider?: string
+  capabilities?: string[]
+  contextWindow?: number
+  isDefault?: boolean
+  rateMultiplier?: number
+  rateUnit?: string
+  promptCaching?: {
+    maximumCacheCheckpointsPerRequest?: number
+    minimumTokensPerCacheCheckpoint?: number
+    supportsPromptCaching?: boolean
+  }
+  supportedInputTypes?: string[]
+  tokenLimits?: {
+    maxInputTokens?: number
+    maxOutputTokens?: number
+  }
+}
+
+export interface ListAvailableModelsResponse {
+  availableModels: AvailableModel[]
+  nextToken?: string | null
+  defaultModel?: AvailableModel | null
+}
+
 // 成功响应
 export interface SuccessResponse {
   success: boolean
+  message: string
+}
+
+export interface OperationSuccessResponse {
+  success: boolean
+}
+
+export interface MessageResponse {
   message: string
 }
 
@@ -135,23 +369,31 @@ export interface AddCredentialRequest {
   authMethod?: 'social' | 'idc' | 'external_idp' | 'api_key'
   clientId?: string
   clientSecret?: string
+  provider?: string
+  userId?: string
+  tokenEndpoint?: string
+  issuerUrl?: string
+  scopes?: string
   priority?: number
   weight?: number
+  region?: string
   authRegion?: string
   apiRegion?: string
   machineId?: string
   proxyUrl?: string
   proxyUsername?: string
   proxyPassword?: string
-  kiroApiKey?: string
+  proxyId?: number | null
+  apiKey?: string
   endpoint?: string
   /** 自定义并发上限（null/省略 = 跟随全局） */
   concurrency?: number | null
 }
 
-export interface ImportKiroGoCredentialRequest {
+export interface ImportCredentialRecordRequest {
   accessToken?: string
-  refreshToken: string
+  refreshToken?: string
+  apiKey?: string
   clientId?: string
   clientSecret?: string
   authMethod?: string
@@ -170,14 +412,58 @@ export interface ImportKiroGoCredentialRequest {
   weight?: number
   concurrency?: number | null
   id?: string | number
+  sourceAccountId?: string
   email?: string
+  label?: string
+  status?: string
+  addedAt?: string
+  password?: string
   profileArn?: string
   userId?: string | null
   machineId?: string
-  proxyURL?: string
+  usageData?: unknown
+  groupId?: string
+  tagLinks?: unknown
+  availableModelsCache?: unknown
+  failureCount?: number
+  lastFailureAt?: string
+  disabledReason?: string
+  successCount?: number
+  csrfToken?: string
+  nickname?: string
+  banStatus?: string
+  banReason?: string
+  banTime?: number
+  subscriptionType?: string
+  subscriptionTitle?: string
+  daysRemaining?: number
+  usageCurrent?: number
+  usageLimit?: number
+  usagePercent?: number
+  nextResetDate?: string
+  lastRefresh?: number
+  trialUsageCurrent?: number
+  trialUsageLimit?: number
+  trialUsagePercent?: number
+  trialStatus?: string
+  trialExpiresAt?: number
+  overageCapability?: string
+  overageCap?: number
+  overageRate?: number
+  currentOverages?: number
+  overageCheckedAt?: number
+  requestCount?: number
+  errorCount?: number
+  totalTokens?: number
+  totalCredits?: number
+  lastUsedAt?: number
+  lastUsed?: number
+  createdAt?: number
+  tags?: unknown
   proxyUrl?: string
   proxyUsername?: string
   proxyPassword?: string
+  proxyId?: number | null
   overageStatus?: string
   endpoint?: string
   enabled?: boolean
@@ -185,11 +471,36 @@ export interface ImportKiroGoCredentialRequest {
 }
 
 // 添加凭据响应
-export interface AddCredentialResponse {
+export interface AddCredentialResponse extends CredentialMaterialFlags, OptionalCredentialMetadataFields {
   success: boolean
   message: string
   credentialId: number
   email?: string
+  authMethod?: string
+  provider?: string
+  userId?: string
+  sourceAccountId?: string
+  label?: string
+  status?: string
+  addedAt?: string
+  nickname?: string
+}
+
+export interface CredentialLoginDetails extends OptionalCredentialMaterialFlags, OptionalCredentialMetadataFields {
+  id: number
+  email?: string
+  authMethod?: string
+  provider?: string
+  userId?: string
+  sourceAccountId?: string
+  label?: string
+  status?: string
+  addedAt?: string
+  nickname?: string
+}
+
+export interface CredentialLoginDetailsEnvelope {
+  details?: CredentialLoginDetails
 }
 
 // ============ 运行时状态轻量端点（高频轮询）============
@@ -208,6 +519,7 @@ export interface RuntimeStatsItem {
 /** runtime-stats 内嵌的余额快照（字段子集对齐 BalanceResponse） */
 export interface RuntimeBalanceSnapshot {
   subscriptionTitle: string | null
+  subscriptionType?: string | null
   currentUsage: number
   usageLimit: number
   remaining: number
@@ -223,7 +535,66 @@ export interface RuntimeStatsResponse {
   credentials: RuntimeStatsItem[]
 }
 
-// ============ 批量刷新 Token 端点 ============
+// ============ 系统状态和统计端点 ============
+
+export interface SystemStatusResponse {
+  status: string
+  version: string
+  uptime: number
+  totalRequests: number
+  successRequests: number
+  failedRequests: number
+  totalTokens: number
+  totalCredits: number
+  credentialsTotal: number
+  credentialsAvailable: number
+}
+
+export interface StatsResponse {
+  totalRequests: number
+  successRequests: number
+  failedRequests: number
+  totalTokens: number
+  totalCredits: number
+  uptime: number
+  credentialsTotal: number
+  credentialsAvailable: number
+}
+
+export interface GenerateMachineIdResponse {
+  machineId: string
+}
+
+export interface SystemVersionResponse {
+  version: string
+  name: string
+}
+
+export interface RequestLogEntry {
+  time: string
+  endpoint: string
+  model: string
+  credentialId: string
+  status: RequestLogStatus
+  error?: string
+  errorType?: string
+  tokens?: number
+  credits?: number
+  durationMs: number
+}
+
+export interface RequestLogsResponse {
+  logs: RequestLogEntry[]
+  total: number
+  success: number
+  errors: number
+}
+
+export interface ClearRequestLogsResponse {
+  cleared: number
+}
+
+// ============ 批量刷新令牌端点 ============
 
 /** 批量刷新请求 */
 export interface BatchRefreshRequest {
@@ -270,6 +641,7 @@ export interface CachedBalanceItem {
   remaining: number
   usagePercentage: number
   subscriptionTitle: string | null
+  subscriptionType?: string | null
   nextResetAt: number | null
   overageCap: number
   overageCapability?: string | null
@@ -283,6 +655,59 @@ export interface CachedBalanceItem {
 /** GET /credentials/balances/cached 响应 */
 export interface CachedBalancesResponse {
   balances: CachedBalanceItem[]
+}
+
+export interface CredentialBackup {
+  format: typeof CREDENTIAL_SOURCE_FORMATS.credentialBackup
+  version: number
+  exportedAt: string
+  source: {
+    app: string
+    schema: string
+    credentialCount: number
+  }
+  credentials: Array<{
+    credential: Record<string, unknown>
+  }>
+}
+
+export interface CredentialImportItem extends CredentialMaterialFlags, CredentialImportMetadataFields {
+  index: number
+  action: CredentialImportAction
+  sourceFormat: string
+  fingerprint: string
+  credentialId?: number
+  reason?: string
+  authMethod?: string
+  provider?: string
+  email?: string
+  userId?: string
+  willRefresh: boolean
+  warnings?: string[]
+}
+
+export interface CredentialImportResponse {
+  summary: {
+    parsed: number
+    added: number
+    skipped: number
+    merged: number
+    replaced: number
+    invalid: number
+  }
+  items: CredentialImportItem[]
+}
+
+export interface SsoTokenImportResult {
+  tokenIndex: number
+  credentialId?: number
+  email?: string
+  error?: string
+}
+
+export interface SsoTokenImportResponse {
+  imported: number
+  results: SsoTokenImportResult[]
 }
 
 // ============ 系统提示注入 ============
@@ -329,14 +754,14 @@ export interface UpsertUserPresetRequest {
   content: string
 }
 
-// ============ Social OAuth 登录 ============
+// ============ 社交 OAuth 登录 ============
 
 export interface StartSocialLoginRequest {
   priority?: number
   email?: string
   proxyUrl?: string
   authEndpoint?: string
-  provider: 'Google' | 'Github'
+  provider: 'Google' | 'GitHub'
   mode?: 'manual' | 'helper'
 }
 
@@ -349,7 +774,12 @@ export interface StartSocialLoginResponse {
 
 export type PollSocialLoginResponse =
   | { status: 'waiting' }
-  | { status: 'success'; credentialId: number }
+  | ({
+      status: 'success'
+      credentialId: number
+      authMethod?: string
+      provider?: string
+    } & CredentialLoginDetailsEnvelope)
   | { status: 'expired' }
   | { status: 'error'; message: string }
 
@@ -376,17 +806,18 @@ export interface StartIamSsoLoginResponse {
   expiresIn: number
 }
 
-export interface CompleteIamSsoLoginResponse {
+export interface CompleteIamSsoLoginResponse extends CredentialLoginDetailsEnvelope {
   success: boolean
-  account?: {
-    id: number
-    email?: string
-  }
 }
 
 export type PollIdcLoginResponse =
   | { status: 'pending' }
-  | { status: 'success'; credentialId: number }
+  | ({
+      status: 'success'
+      credentialId: number
+      authMethod?: string
+      provider?: string
+    } & CredentialLoginDetailsEnvelope)
   | { status: 'expired' }
 
 export interface StartBuilderIdLoginRequest {
@@ -406,7 +837,13 @@ export interface StartBuilderIdLoginResponse {
 
 export type PollBuilderIdLoginResponse =
   | { status: 'pending'; pollInterval?: number }
-  | { status: 'success'; credentialId: number; email?: string }
+  | ({
+      status: 'success'
+      credentialId: number
+      email?: string
+      authMethod?: string
+      provider?: string
+    } & CredentialLoginDetailsEnvelope)
   | { status: 'expired' }
   | { status: 'error'; message: string }
 
@@ -416,16 +853,11 @@ export interface StartKiroSsoLoginResponse {
   interval: number
 }
 
-export interface PollKiroSsoLoginResponse {
+export interface PollKiroSsoLoginResponse extends CredentialLoginDetailsEnvelope {
   success: boolean
   completed: boolean
   status?: 'pending'
   error?: string
-  account?: {
-    id: number
-    email?: string
-    authMethod?: string
-  }
 }
 
 export interface CompleteKiroSsoLoginResponse {

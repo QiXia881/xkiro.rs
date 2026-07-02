@@ -121,7 +121,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_proxy_routes_http_requests_like_kiro_go() {
+    async fn explicit_proxy_routes_http_requests() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let proxy_addr = listener.local_addr().unwrap();
         let (tx, rx) = mpsc::channel();
@@ -158,7 +158,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn environment_proxy_child_request_like_kiro_go_auth_client() {
+    async fn environment_proxy_child_request_uses_env_proxy() {
         if std::env::var_os("XKIRO_ENV_PROXY_CHILD").is_none() {
             return;
         }
@@ -175,7 +175,7 @@ mod tests {
     }
 
     #[test]
-    fn environment_proxy_routes_http_requests_like_kiro_go_auth_client() {
+    fn environment_proxy_routes_http_requests_via_environment() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let proxy_addr = listener.local_addr().unwrap();
@@ -211,7 +211,7 @@ mod tests {
 
         let proxy_url = format!("http://{proxy_addr}");
         let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .arg("environment_proxy_child_request_like_kiro_go_auth_client")
+            .arg("environment_proxy_child_request_uses_env_proxy")
             .arg("--test-threads=1")
             .env("XKIRO_ENV_PROXY_CHILD", "1")
             .env("HTTP_PROXY", &proxy_url)

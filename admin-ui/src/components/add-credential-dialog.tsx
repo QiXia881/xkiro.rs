@@ -5,6 +5,7 @@ import {
   Cookie,
   FileJson,
   FolderOpen,
+  Github,
   KeyRound,
   Landmark,
   Plus,
@@ -20,21 +21,24 @@ import {
 import { BuilderIdLoginDialog } from '@/components/builderid-login-dialog'
 import { IdcLoginDialog } from '@/components/idc-login-dialog'
 import { SsoTokenImportDialog } from '@/components/sso-token-import-dialog'
-import { KiroCacheImportDialog } from '@/components/kiro-cache-import-dialog'
-import { ImportJsonDialog } from '@/components/import-json-dialog'
-import { KiroCookieImportDialog } from '@/components/kiro-cookie-import-dialog'
+import { LocalCacheImportDialog } from '@/components/local-cache-import-dialog'
+import { WebCookieImportDialog } from '@/components/web-cookie-import-dialog'
 import { KiroSsoLoginDialog } from '@/components/kiro-sso-login-dialog'
+import { SocialLoginDialog } from '@/components/social-login-dialog'
+import { CredentialImportDialog } from '@/components/credential-import-dialog'
+import { CREDENTIAL_AUTH_LABELS } from '@/lib/credential-metadata'
 
 // ─── Types ────────────────────────────────────────────────────────────
 
 type MethodId =
   | 'builder-id'
+  | 'social'
   | 'kiro-sso'
   | 'idc'
   | 'sso-token'
-  | 'kiro-cache'
-  | 'credentials-json'
-  | 'kiro-cookie'
+  | 'local-cache'
+  | 'credential-import'
+  | 'web-cookie'
 
 interface MethodCard {
   id: MethodId
@@ -57,56 +61,64 @@ const METHODS: MethodCard[] = [
   {
     id: 'builder-id',
     icon: Building2,
-    title: 'AWS Builder ID',
-    description: '通过 AWS Builder ID 设备授权流程自动添加，免费个人账号',
+    title: CREDENTIAL_AUTH_LABELS.awsBuilderId,
+    description: `通过 ${CREDENTIAL_AUTH_LABELS.awsBuilderId} 设备授权流程添加个人凭据`,
     color: 'text-blue-600 dark:text-blue-400',
     bgColor: 'bg-blue-500/10',
   },
   {
+    id: 'social',
+    icon: Github,
+    title: `${CREDENTIAL_AUTH_LABELS.google} / ${CREDENTIAL_AUTH_LABELS.github}`,
+    description: `通过浏览器 OAuth 授权添加 ${CREDENTIAL_AUTH_LABELS.google} 或 ${CREDENTIAL_AUTH_LABELS.github} 凭据`,
+    color: 'text-slate-700 dark:text-slate-300',
+    bgColor: 'bg-slate-500/10',
+  },
+  {
     id: 'idc',
     icon: Shield,
-    title: 'IAM Identity Center',
-    description: '通过 AWS IAM Identity Center 授权码流程添加企业账号',
+    title: CREDENTIAL_AUTH_LABELS.iamIdentityCenter,
+    description: `通过 ${CREDENTIAL_AUTH_LABELS.iamIdentityCenter} 授权码流程添加企业凭据`,
     color: 'text-orange-600 dark:text-orange-400',
     bgColor: 'bg-orange-500/10',
   },
   {
     id: 'kiro-sso',
     icon: Landmark,
-    title: 'Enterprise SSO - Microsoft 365',
-    description: '通过 Kiro 托管登录页添加 Microsoft / Entra ID 租户账号',
+    title: CREDENTIAL_AUTH_LABELS.microsoftEntra,
+    description: `通过企业 SSO 远程登录添加 ${CREDENTIAL_AUTH_LABELS.microsoftEntra} 租户凭据`,
     color: 'text-sky-600 dark:text-sky-400',
     bgColor: 'bg-sky-500/10',
   },
   {
     id: 'sso-token',
     icon: KeyRound,
-    title: 'SSO Token',
+    title: 'SSO 令牌',
     description: '从浏览器 DevTools 导入 x-amz-sso_authn cookie',
     color: 'text-green-600 dark:text-green-400',
     bgColor: 'bg-green-500/10',
   },
   {
-    id: 'kiro-cache',
+    id: 'local-cache',
     icon: FolderOpen,
-    title: 'Kiro 本地缓存',
-    description: '导入 Kiro 客户端本地缓存的 refreshToken 数据',
+    title: '本地缓存',
+    description: '导入本地客户端缓存中的刷新令牌数据',
     color: 'text-purple-600 dark:text-purple-400',
     bgColor: 'bg-purple-500/10',
   },
   {
-    id: 'credentials-json',
+    id: 'credential-import',
     icon: FileJson,
-    title: 'Credentials JSON',
-    description: '粘贴或拖入 JSON 格式凭据，支持批量导入和自动验活',
+    title: '凭据导入',
+    description: '自动识别缓存凭据、xkiro.rs 完整备份和扁平凭据',
     color: 'text-cyan-600 dark:text-cyan-400',
     bgColor: 'bg-cyan-500/10',
   },
   {
-    id: 'kiro-cookie',
+    id: 'web-cookie',
     icon: Cookie,
-    title: 'Kiro Web Cookie',
-    description: '从 app.kiro.dev 浏览器 Cookie 提取 RefreshToken',
+    title: '浏览器 Cookie',
+    description: '从 app.kiro.dev 浏览器 Cookie 提取刷新令牌',
     color: 'text-pink-600 dark:text-pink-400',
     bgColor: 'bg-pink-500/10',
   },
@@ -186,7 +198,7 @@ export function AddCredentialDialog({ open, onOpenChange, onSuccess }: AddCreden
               添加凭据
             </DialogTitle>
             <DialogDescription>
-              选择一种方式添加新的 Kiro 凭据
+              选择一种方式添加新的 xkiro.rs 凭据
             </DialogDescription>
           </DialogHeader>
           <MethodPicker onSelect={handleMethodSelect} />
@@ -195,6 +207,12 @@ export function AddCredentialDialog({ open, onOpenChange, onSuccess }: AddCreden
 
       <BuilderIdLoginDialog
         open={open && activeMethod === 'builder-id'}
+        onOpenChange={(o) => { if (!o) handleSubDialogClose() }}
+        onSuccess={handleSubSuccess}
+      />
+
+      <SocialLoginDialog
+        open={open && activeMethod === 'social'}
         onOpenChange={(o) => { if (!o) handleSubDialogClose() }}
         onSuccess={handleSubSuccess}
       />
@@ -211,29 +229,30 @@ export function AddCredentialDialog({ open, onOpenChange, onSuccess }: AddCreden
         onSuccess={handleSubSuccess}
       />
 
-      {/* ── SSO Token import ─────────────────────────────────────── */}
+      {/* ── SSO 令牌导入 ─────────────────────────────────────────── */}
       <SsoTokenImportDialog
         open={open && activeMethod === 'sso-token'}
         onOpenChange={(o) => { if (!o) handleSubDialogClose() }}
         onSuccess={handleSubSuccess}
       />
 
-      {/* ── Kiro local cache import ──────────────────────────────── */}
-      <KiroCacheImportDialog
-        open={open && activeMethod === 'kiro-cache'}
+      {/* ── Local cache import ───────────────────────────────────── */}
+      <LocalCacheImportDialog
+        open={open && activeMethod === 'local-cache'}
         onOpenChange={(o) => { if (!o) handleSubDialogClose() }}
         onSuccess={handleSubSuccess}
       />
 
-      {/* ── Credentials JSON import ──────────────────────────────── */}
-      <ImportJsonDialog
-        open={open && activeMethod === 'credentials-json'}
+      {/* ── 凭据导入 ─────────────────────────────────────────────── */}
+      <CredentialImportDialog
+        open={open && activeMethod === 'credential-import'}
         onOpenChange={(o) => { if (!o) handleSubDialogClose() }}
+        onSuccess={handleSubSuccess}
       />
 
-      {/* ── Kiro Web Cookie import ───────────────────────────────── */}
-      <KiroCookieImportDialog
-        open={open && activeMethod === 'kiro-cookie'}
+      {/* ── 浏览器 Cookie 导入 ────────────────────────────────────── */}
+      <WebCookieImportDialog
+        open={open && activeMethod === 'web-cookie'}
         onOpenChange={(o) => { if (!o) handleSubDialogClose() }}
         onSuccess={handleSubSuccess}
       />

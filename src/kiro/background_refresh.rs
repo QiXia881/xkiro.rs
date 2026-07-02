@@ -1,7 +1,7 @@
-//! 后台 Token 刷新模块
+//! 后台令牌刷新模块
 #![allow(dead_code)]
 //!
-//! 独立后台任务定期检查并刷新即将过期的 Token，
+//! 独立后台任务定期检查并刷新即将过期的令牌，
 //! 避免请求时的刷新延迟。
 //! 参考 CLIProxyAPIPlus 的实现。
 
@@ -21,7 +21,7 @@ const DEFAULT_BATCH_SIZE: usize = 50;
 const DEFAULT_CONCURRENCY: usize = 10;
 
 /// 默认提前刷新时间（分钟）
-/// Token 在过期前多少分钟开始刷新
+/// 令牌在过期前多少分钟开始刷新
 const DEFAULT_REFRESH_BEFORE_EXPIRY_MINS: i64 = 15;
 
 /// 后台刷新配置
@@ -73,7 +73,7 @@ impl Default for BackgroundRefreshConfig {
 
 /// 后台刷新器
 ///
-/// 管理后台 Token 刷新任务
+/// 管理后台令牌刷新任务
 pub struct BackgroundRefresher {
     config: BackgroundRefreshConfig,
     running: Arc<AtomicBool>,
@@ -133,7 +133,7 @@ impl BackgroundRefresher {
                 interval_secs = %config.check_interval_secs,
                 batch_size = %config.batch_size,
                 concurrency = %config.concurrency,
-                "后台 Token 刷新器已启动"
+                "后台令牌刷新器已启动"
             );
 
             let mut check_interval = interval(Duration::from_secs(config.check_interval_secs));
@@ -149,11 +149,11 @@ impl BackgroundRefresher {
                         let expiring_ids = get_expiring_ids_fn(config.refresh_before_expiry_mins);
 
                         if expiring_ids.is_empty() {
-                            tracing::debug!("没有需要刷新的 Token");
+                            tracing::debug!("没有需要刷新的令牌");
                             continue;
                         }
 
-                        tracing::info!("发现 {} 个即将过期的 Token，开始刷新", expiring_ids.len());
+                        tracing::info!("发现 {} 个即将过期的令牌，开始刷新", expiring_ids.len());
 
                         // 批量刷新
                         let mut success_count = 0;
@@ -189,18 +189,18 @@ impl BackgroundRefresher {
                         tracing::info!(
                             success = %success_count,
                             failed = %fail_count,
-                            "后台 Token 刷新完成"
+                            "后台令牌刷新完成"
                         );
                     }
                     _ = shutdown_notify.notified() => {
-                        tracing::info!("后台 Token 刷新器收到关闭信号");
+                        tracing::info!("后台令牌刷新器收到关闭信号");
                         break;
                     }
                 }
             }
 
             running.store(false, Ordering::SeqCst);
-            tracing::info!("后台 Token 刷新器已停止");
+            tracing::info!("后台令牌刷新器已停止");
         });
 
         Ok(())
@@ -274,7 +274,7 @@ impl RefreshResult {
         }
     }
 
-    /// 创建降级结果（刷新失败但使用现有 Token）
+    /// 创建降级结果（刷新失败但使用现有令牌）
     pub fn fallback(credential_id: u64, existing_expires_at: String) -> Self {
         Self {
             credential_id,

@@ -52,6 +52,14 @@ pub struct SubscriptionInfo {
     #[serde(default)]
     pub subscription_title: Option<String>,
 
+    /// 订阅名称（部分响应不用 subscriptionTitle）
+    #[serde(default)]
+    pub subscription_name: Option<String>,
+
+    /// 订阅类型（FREE / PRO / PRO_PLUS / POWER 等）
+    #[serde(default)]
+    pub subscription_type: Option<String>,
+
     /// 超额资格 (OVERAGE_CAPABLE / OVERAGE_INCAPABLE)
     #[serde(default)]
     pub overage_capability: Option<String>,
@@ -73,7 +81,7 @@ pub struct OverageConfiguration {
 pub struct UsageBreakdown {
     /// 当前使用量
     #[serde(default)]
-    pub current_usage: i64,
+    pub current_usage: f64,
 
     /// 当前使用量（精确值）
     #[serde(default)]
@@ -93,7 +101,7 @@ pub struct UsageBreakdown {
 
     /// 使用限额
     #[serde(default)]
-    pub usage_limit: i64,
+    pub usage_limit: f64,
 
     /// 使用限额（精确值）
     #[serde(default)]
@@ -106,6 +114,14 @@ pub struct UsageBreakdown {
     /// 超额上限（精确值）
     #[serde(default)]
     pub overage_cap_with_precision: f64,
+
+    /// 超额调用单价
+    #[serde(default)]
+    pub overage_rate: f64,
+
+    /// 当前超额消耗
+    #[serde(default)]
+    pub current_overages: f64,
 }
 
 /// 奖励额度
@@ -142,7 +158,7 @@ impl Bonus {
 pub struct FreeTrialInfo {
     /// 当前使用量
     #[serde(default)]
-    pub current_usage: i64,
+    pub current_usage: f64,
 
     /// 当前使用量（精确值）
     #[serde(default)]
@@ -158,7 +174,7 @@ pub struct FreeTrialInfo {
 
     /// 使用限额
     #[serde(default)]
-    pub usage_limit: i64,
+    pub usage_limit: f64,
 
     /// 使用限额（精确值）
     #[serde(default)]
@@ -180,9 +196,35 @@ impl FreeTrialInfo {
 impl UsageLimitsResponse {
     /// 获取订阅标题
     pub fn subscription_title(&self) -> Option<&str> {
-        self.subscription_info
-            .as_ref()
-            .and_then(|info| info.subscription_title.as_deref())
+        let info = self.subscription_info.as_ref()?;
+        info.subscription_title
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                info.subscription_name
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+            })
+    }
+
+    /// 获取规范化订阅类型（FREE / PRO / PRO_PLUS / POWER / ENTERPRISE / TEAMS）
+    pub fn subscription_type(&self) -> Option<String> {
+        let info = self.subscription_info.as_ref()?;
+        let raw = info
+            .subscription_title
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                info.subscription_name
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+            })
+            .or_else(|| {
+                info.subscription_type
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+            })?;
+        Some(normalize_subscription_type(raw))
     }
 
     /// 获取超额资格 (OVERAGE_CAPABLE / OVERAGE_INCAPABLE)
@@ -213,6 +255,18 @@ impl UsageLimitsResponse {
         }
     }
 
+    pub fn overage_rate(&self) -> f64 {
+        self.primary_breakdown()
+            .map(|breakdown| breakdown.overage_rate)
+            .unwrap_or_default()
+    }
+
+    pub fn current_overages(&self) -> f64 {
+        self.primary_breakdown()
+            .map(|breakdown| breakdown.current_overages)
+            .unwrap_or_default()
+    }
+
     /// 获取第一个使用量明细
     fn primary_breakdown(&self) -> Option<&UsageBreakdown> {
         self.usage_breakdown_list.first()
@@ -226,12 +280,14 @@ impl UsageLimitsResponse {
             return 0.0;
         };
 
-        let mut total = breakdown.usage_limit_with_precision;
+        let mut total =
+            numeric_with_precision(breakdown.usage_limit_with_precision, breakdown.usage_limit);
 
         // 累加激活的 free trial 额度
         if let Some(trial) = &breakdown.free_trial_info {
             if trial.is_active() {
-                total += trial.usage_limit_with_precision;
+                total +=
+                    numeric_with_precision(trial.usage_limit_with_precision, trial.usage_limit);
             }
         }
 
@@ -253,12 +309,16 @@ impl UsageLimitsResponse {
             return 0.0;
         };
 
-        let mut total = breakdown.current_usage_with_precision;
+        let mut total = numeric_with_precision(
+            breakdown.current_usage_with_precision,
+            breakdown.current_usage,
+        );
 
         // 累加激活的 free trial 使用量
         if let Some(trial) = &breakdown.free_trial_info {
             if trial.is_active() {
-                total += trial.current_usage_with_precision;
+                total +=
+                    numeric_with_precision(trial.current_usage_with_precision, trial.current_usage);
             }
         }
 
@@ -270,5 +330,171 @@ impl UsageLimitsResponse {
         }
 
         total
+    }
+
+    pub fn primary_remaining(&self) -> f64 {
+        (self.usage_limit() - self.current_usage()).max(0.0)
+    }
+
+    pub fn usage_ratio(&self) -> f64 {
+        let usage_limit = self.usage_limit();
+        if usage_limit > 0.0 {
+            self.current_usage() / usage_limit
+        } else {
+            0.0
+        }
+    }
+
+    pub fn primary_overage_used(&self) -> f64 {
+        (self.current_usage() - self.usage_limit()).max(0.0)
+    }
+
+    pub fn current_overages_or_primary(&self) -> f64 {
+        let current_overages = self.current_overages();
+        if current_overages > 0.0 {
+            current_overages
+        } else {
+            self.primary_overage_used()
+        }
+    }
+
+    pub fn primary_overage_remaining(&self) -> f64 {
+        if self.overage_status() == Some("ENABLED") {
+            (self.overage_cap() - self.primary_overage_used()).max(0.0)
+        } else {
+            0.0
+        }
+    }
+
+    pub fn trial_usage_current(&self) -> Option<f64> {
+        let trial = self.primary_breakdown()?.free_trial_info.as_ref()?;
+        Some(numeric_with_precision(
+            trial.current_usage_with_precision,
+            trial.current_usage,
+        ))
+    }
+
+    pub fn trial_usage_limit(&self) -> Option<f64> {
+        let trial = self.primary_breakdown()?.free_trial_info.as_ref()?;
+        Some(numeric_with_precision(
+            trial.usage_limit_with_precision,
+            trial.usage_limit,
+        ))
+    }
+
+    pub fn trial_status(&self) -> Option<&str> {
+        self.primary_breakdown()?
+            .free_trial_info
+            .as_ref()?
+            .free_trial_status
+            .as_deref()
+    }
+
+    pub fn trial_expires_at(&self) -> Option<i64> {
+        let expires_at = self
+            .primary_breakdown()?
+            .free_trial_info
+            .as_ref()?
+            .free_trial_expiry?;
+        if expires_at > 0.0 {
+            Some(expires_at.floor() as i64)
+        } else {
+            None
+        }
+    }
+}
+
+fn numeric_with_precision(precision: f64, base: f64) -> f64 {
+    if precision > 0.0 { precision } else { base }
+}
+
+pub(crate) fn normalize_subscription_type(raw: &str) -> String {
+    let upper = raw.to_ascii_uppercase();
+    if upper.contains("PRO_PLUS") || upper.contains("PROPLUS") || upper.contains("PRO+") {
+        return "PRO_PLUS".to_string();
+    }
+    if upper.contains("POWER") {
+        return "POWER".to_string();
+    }
+    if upper.contains("ENTERPRISE") {
+        return "ENTERPRISE".to_string();
+    }
+    if upper.contains("TEAMS") {
+        return "TEAMS".to_string();
+    }
+    if upper.contains("PRO") {
+        return "PRO".to_string();
+    }
+    "FREE".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UsageLimitsResponse;
+
+    #[test]
+    fn parses_overage_fields_from_usage_limits() {
+        let usage: UsageLimitsResponse = serde_json::from_value(serde_json::json!({
+            "subscriptionInfo": {
+                "subscriptionTitle": "KIRO PRO+",
+                "overageCapability": "OVERAGE_CAPABLE"
+            },
+            "overageConfiguration": {
+                "overageStatus": "ENABLED"
+            },
+            "usageBreakdownList": [{
+                "currentUsageWithPrecision": 12.5,
+                "usageLimitWithPrecision": 10.0,
+                "overageCapWithPrecision": 50.0,
+                "overageRate": 0.04,
+                "currentOverages": 2.5
+            }]
+        }))
+        .expect("usage limits should parse");
+
+        assert_eq!(usage.overage_status(), Some("ENABLED"));
+        assert_eq!(usage.overage_capability(), Some("OVERAGE_CAPABLE"));
+        assert_eq!(usage.subscription_type().as_deref(), Some("PRO_PLUS"));
+        assert_eq!(usage.overage_cap(), 50.0);
+        assert_eq!(usage.overage_rate(), 0.04);
+        assert_eq!(usage.current_overages(), 2.5);
+        assert_eq!(usage.primary_remaining(), 0.0);
+        assert_eq!(usage.usage_ratio(), 1.25);
+        assert_eq!(usage.primary_overage_used(), 2.5);
+        assert_eq!(usage.current_overages_or_primary(), 2.5);
+        assert_eq!(usage.primary_overage_remaining(), 47.5);
+    }
+
+    #[test]
+    fn usage_limits_plain_fields_and_subscription_fallback_are_normalized() {
+        let usage: UsageLimitsResponse = serde_json::from_value(serde_json::json!({
+            "subscriptionInfo": {
+                "subscriptionName": "KIRO POWER"
+            },
+            "usageBreakdownList": [{
+                "currentUsage": 7.5,
+                "usageLimit": 20.0,
+                "freeTrialInfo": {
+                    "currentUsage": 1.5,
+                    "usageLimit": 5.0,
+                    "freeTrialStatus": "ACTIVE",
+                    "freeTrialExpiry": 1893555000.9
+                }
+            }]
+        }))
+        .expect("usage limits should parse plain numeric fields");
+
+        assert_eq!(usage.subscription_title(), Some("KIRO POWER"));
+        assert_eq!(usage.subscription_type().as_deref(), Some("POWER"));
+        assert_eq!(usage.current_usage(), 9.0);
+        assert_eq!(usage.usage_limit(), 25.0);
+        assert_eq!(usage.primary_remaining(), 16.0);
+        assert_eq!(usage.usage_ratio(), 9.0 / 25.0);
+        assert_eq!(usage.primary_overage_used(), 0.0);
+        assert_eq!(usage.current_overages_or_primary(), 0.0);
+        assert_eq!(usage.trial_usage_current(), Some(1.5));
+        assert_eq!(usage.trial_usage_limit(), Some(5.0));
+        assert_eq!(usage.trial_status(), Some("ACTIVE"));
+        assert_eq!(usage.trial_expires_at(), Some(1_893_555_000));
     }
 }

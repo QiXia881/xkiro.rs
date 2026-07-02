@@ -33,7 +33,7 @@ export function useCredentialBalance(id: number | null, force = false) {
     queryKey: ['credential-balance', id, force],
     queryFn: () => getCredentialBalance(id!, force),
     enabled: id !== null,
-    retry: false, // 余额查询失败时不重试（避免重复请求被封禁的账号）
+    retry: false, // 余额查询失败时不重试（避免重复请求被封禁的凭据）
   })
 }
 
@@ -99,7 +99,7 @@ export function useResetFailure() {
   })
 }
 
-// 强制刷新 Token
+// 强制刷新令牌
 export function useForceRefreshToken() {
   const queryClient = useQueryClient()
   return useMutation({

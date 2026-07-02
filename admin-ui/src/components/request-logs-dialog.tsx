@@ -9,8 +9,16 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import { getRequestLogs, clearRequestLogs, type RequestLogEntry } from '@/api/credentials'
+import { getRequestLogs, clearRequestLogs } from '@/api/credentials'
+import {
+  getRequestLogErrorTypeDisplay,
+  getRequestLogRowClass,
+  REQUEST_LOG_FILTERS,
+  requestLogMatchesFilter,
+  type RequestLogFilter,
+} from '@/lib/request-logs'
 import { extractErrorMessage } from '@/lib/utils'
+import type { RequestLogEntry } from '@/types/api'
 
 interface RequestLogsDialogProps {
   open: boolean
@@ -21,7 +29,7 @@ export function RequestLogsDialog({ open, onOpenChange }: RequestLogsDialogProps
   const [logs, setLogs] = useState<RequestLogEntry[]>([])
   const [stats, setStats] = useState({ total: 0, success: 0, errors: 0 })
   const [autoRefresh, setAutoRefresh] = useState(false)
-  const [filter, setFilter] = useState<'all' | 'success' | 'error'>('all')
+  const [filter, setFilter] = useState<RequestLogFilter>(REQUEST_LOG_FILTERS.all)
   const refreshTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   useEffect(() => {
@@ -67,23 +75,11 @@ export function RequestLogsDialog({ open, onOpenChange }: RequestLogsDialogProps
     }
   }
 
-  const filteredLogs = logs.filter(log => {
-    if (filter === 'success') return log.status === 'success'
-    if (filter === 'error') return log.status === 'error'
-    return true
-  })
+  const filteredLogs = logs.filter(log => requestLogMatchesFilter(log, filter))
 
   const getErrorBadge = (errorType?: string) => {
-    if (!errorType) return null
-    const variants: Record<string, { label: string; className: string }> = {
-      quota: { label: 'Quota', className: 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-400' },
-      overage: { label: 'Overage', className: 'bg-orange-100 text-orange-800 dark:bg-orange-900/30 dark:text-orange-400' },
-      suspended: { label: 'Suspended', className: 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400' },
-      auth: { label: 'Auth', className: 'bg-purple-100 text-purple-800 dark:bg-purple-900/30 dark:text-purple-400' },
-      profile: { label: 'Profile', className: 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400' },
-      unknown: { label: 'Unknown', className: 'bg-gray-100 text-gray-800 dark:bg-gray-900/30 dark:text-gray-400' },
-    }
-    const variant = variants[errorType] || variants.unknown
+    const variant = getRequestLogErrorTypeDisplay(errorType)
+    if (!variant) return null
     return (
       <Badge variant="outline" className={`text-xs ${variant.className}`}>
         {variant.label}
@@ -114,23 +110,23 @@ export function RequestLogsDialog({ open, onOpenChange }: RequestLogsDialogProps
         <div className="flex items-center gap-2 shrink-0">
           <div className="flex gap-1">
             <Button
-              variant={filter === 'all' ? 'default' : 'outline'}
+              variant={filter === REQUEST_LOG_FILTERS.all ? 'default' : 'outline'}
               size="sm"
-              onClick={() => setFilter('all')}
+              onClick={() => setFilter(REQUEST_LOG_FILTERS.all)}
             >
               全部
             </Button>
             <Button
-              variant={filter === 'success' ? 'default' : 'outline'}
+              variant={filter === REQUEST_LOG_FILTERS.success ? 'default' : 'outline'}
               size="sm"
-              onClick={() => setFilter('success')}
+              onClick={() => setFilter(REQUEST_LOG_FILTERS.success)}
             >
               成功
             </Button>
             <Button
-              variant={filter === 'error' ? 'default' : 'outline'}
+              variant={filter === REQUEST_LOG_FILTERS.error ? 'default' : 'outline'}
               size="sm"
-              onClick={() => setFilter('error')}
+              onClick={() => setFilter(REQUEST_LOG_FILTERS.error)}
             >
               失败
             </Button>
@@ -164,14 +160,10 @@ export function RequestLogsDialog({ open, onOpenChange }: RequestLogsDialogProps
               {filteredLogs.map((log, i) => (
                 <div
                   key={i}
-                  className={`p-3 rounded-md text-sm border ${
-                    log.status === 'success'
-                      ? 'bg-green-50/50 dark:bg-green-950/20 border-green-200 dark:border-green-800'
-                      : 'bg-red-50/50 dark:bg-red-950/20 border-red-200 dark:border-red-800'
-                  }`}
+                  className={`p-3 rounded-md text-sm border ${getRequestLogRowClass(log.status)}`}
                 >
                   <div className="flex items-center gap-3">
-                    {log.status === 'success' ? (
+                    {log.status === REQUEST_LOG_FILTERS.success ? (
                       <CheckCircle2 className="h-4 w-4 text-green-600 shrink-0" />
                     ) : (
                       <XCircle className="h-4 w-4 text-red-600 shrink-0" />
@@ -185,7 +177,7 @@ export function RequestLogsDialog({ open, onOpenChange }: RequestLogsDialogProps
                     </Badge>
                     <span className="font-mono text-xs">{log.model}</span>
                     <span className="text-xs text-muted-foreground">
-                      #{log.credential_id}
+                      #{log.credentialId}
                     </span>
                     {log.tokens && (
                       <span className="text-xs text-muted-foreground">
@@ -193,9 +185,9 @@ export function RequestLogsDialog({ open, onOpenChange }: RequestLogsDialogProps
                       </span>
                     )}
                     <span className="text-xs text-muted-foreground">
-                      {log.duration_ms}ms
+                      {log.durationMs}ms
                     </span>
-                    {getErrorBadge(log.error_type)}
+                    {getErrorBadge(log.errorType)}
                   </div>
                   {log.error && (
                     <p className="mt-1 text-xs text-red-600 pl-7">{log.error}</p>

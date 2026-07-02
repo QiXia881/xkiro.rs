@@ -8,16 +8,29 @@ use chrono::Utc;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 
+use crate::anthropic::converter::convert_request_with_thinking_suffix;
 use crate::anthropic::middleware::{PromptCacheRuntime, SharedApiKeys, ThinkingRuntimeConfig};
+use crate::anthropic::types::{Message, MessagesRequest, Metadata};
 use crate::common::utf8::floor_char_boundary;
 use crate::http_client::ProxyConfig;
 use crate::kiro::auth::{idc, kiro_sso, oauth_callback, social};
-use crate::kiro::endpoint::{CLI_ENDPOINT_NAME, CODEWHISPERER_ENDPOINT_NAME, IDE_ENDPOINT_NAME};
+use crate::kiro::endpoint::{
+    AMAZONQ_ENDPOINT_NAME, CLI_ENDPOINT_NAME, CODEWHISPERER_ENDPOINT_NAME, IDE_ENDPOINT_NAME,
+};
+use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::model::events::Event;
+use crate::kiro::model::requests::kiro::{InferenceConfig, KiroRequest};
+use crate::kiro::model::usage_limits::{UsageLimitsResponse, normalize_subscription_type};
+use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
-use crate::kiro::token_manager::{LOW_BALANCE_THRESHOLD, MultiTokenManager, refresh_token};
+use crate::kiro::proxy_manager::{ProxyEntry, ProxyManager};
+use crate::kiro::token_manager::{
+    LOW_BALANCE_THRESHOLD, MultiTokenManager, get_usage_limits, refresh_token,
+};
 use crate::model::config::{
-    CompressionConfig, PromptFilterConfig, SystemPromptPosition, UserPreset,
+    CompressionConfig, CredentialMachineIdStrategy, PromptFilterConfig, SystemPromptPosition,
+    UserPreset,
 };
 use crate::model::runtime::SharedPromptConfig;
 use tokio::sync::Semaphore;
@@ -25,34 +38,63 @@ use tokio::task::JoinSet;
 
 use super::error::AdminServiceError;
 use super::types::{
-    AddCredentialRequest, AddCredentialResponse, ApiKeyEntry, ApiKeyListResponse, BalanceResponse,
-    BatchOperationRequest, BatchOperationResponse, BatchOperationResultItem,
-    BatchRefreshBalanceResponse, BatchRefreshBalanceResultItem, BatchRefreshResponse,
-    BatchRefreshResultItem, CachedBalanceItem, CachedBalancesResponse, CompleteIamSsoLoginRequest,
-    CompleteKiroSsoLoginRequest, CompleteKiroSsoLoginResponse, CompleteSocialCallbackRequest,
-    CompleteSocialLoginRequest, CompressionConfigResponse, CreateApiKeyRequest,
-    CreateApiKeyResponse, CredentialStatusItem, CredentialTestResponse, CredentialsStatusResponse,
-    EndpointConfigResponse, ExportKamItem, ExportTokenJsonItem, GenerateMachineIdResponse,
-    GlobalConfigResponse, ImportAction, ImportItemResult, ImportSsoTokenRequest,
-    ImportSsoTokenResponse, ImportSummary, ImportTokenJsonRequest, ImportTokenJsonResponse,
-    KiroGoImportCredentialsRequest, KiroGoProxyConfigResponse, KiroGoUpdateAccountRequest,
-    KiroSsoAccountResponse, PollBuilderIdLoginResponse, PollIdcLoginResponse,
-    PollKiroSsoLoginResponse, PollSocialLoginResponse, PresetItem, PromptFilterConfigResponse,
-    PromptFilterRuleDto, ProxyConfigResponse, RequestLogsResponse, RuntimeBalanceSnapshot,
-    RuntimeStatsItem, RuntimeStatsResponse, SettingsResponse, SsoTokenImportResultItem,
+    AccessSettingsResponse, AddCredentialRequest, AddCredentialResponse, ApiKeyEntry,
+    ApiKeyListResponse, BalanceResponse, BatchOperationRequest, BatchOperationResponse,
+    BatchOperationResultItem, BatchRefreshBalanceResponse, BatchRefreshBalanceResultItem,
+    BatchRefreshResponse, BatchRefreshResultItem, CachedBalanceItem, CachedBalancesResponse,
+    CachedCredentialModelsResponse, CommonConfigResponse, CompleteIamSsoLoginRequest,
+    CompleteIamSsoLoginResponse, CompleteKiroSsoLoginRequest, CompleteKiroSsoLoginResponse,
+    CompleteSocialCallbackRequest, CompleteSocialLoginRequest, CompressionConfigResponse,
+    CreateApiKeyRequest, CreateApiKeyResponse, CredentialAliasUpdateRequest,
+    CredentialAliasViewItem, CredentialBackup, CredentialBackupEntry, CredentialBackupSource,
+    CredentialBatchRequest, CredentialBatchResponse, CredentialCacheItem, CredentialExportMaterial,
+    CredentialFullExportResponse, CredentialImportAction, CredentialImportItem,
+    CredentialImportMode, CredentialImportSummary, CredentialLoginDetailsResponse,
+    CredentialModelsResponse, CredentialOverageResponse, CredentialProbeResponse,
+    CredentialRefreshInfo, CredentialRefreshResponse, CredentialSnapshotExportData,
+    CredentialSnapshotExportItem, CredentialSnapshotExportSubscription,
+    CredentialSnapshotExportUsage, CredentialStatusItem, CredentialTestResponse,
+    CredentialsStatusResponse, EndpointConfigResponse, GenerateMachineIdResponse,
+    GlobalConfigResponse, ImportCredentialRecordRequest, ImportCredentialsRequest,
+    ImportCredentialsResponse, ImportSsoTokenRequest, ImportSsoTokenResponse,
+    PollBuilderIdLoginResponse, PollIdcLoginResponse, PollKiroSsoLoginResponse,
+    PollSocialLoginResponse, PresetItem, PromptFilterConfigResponse, PromptFilterRuleDto,
+    ProxyAutoAssignRequest, ProxyAutoAssignResponse, ProxyConfigResponse, ProxyImportRequest,
+    ProxyImportResponse, ProxyItem, ProxyListResponse, ProxyTestResponse, ProxyUpsertRequest,
+    ProxyUrlConfigResponse, RequestLogsResponse, RuntimeBalanceSnapshot, RuntimeStatsItem,
+    RuntimeStatsResponse, SetCredentialProxyByRegionRequest, SsoTokenImportResultItem,
     StartBuilderIdLoginRequest, StartBuilderIdLoginResponse, StartIamSsoLoginResponse,
     StartIdcLoginRequest, StartIdcLoginResponse, StartKiroSsoLoginRequest,
     StartKiroSsoLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse, StatsResponse,
-    SystemPromptResponse, SystemStatusResponse, ThinkingConfigResponse, TokenJsonItem,
-    UpdateApiKeyRequest, UpdateCompressionConfigRequest, UpdateEndpointConfigRequest,
-    UpdateGlobalConfigRequest, UpdatePromptFilterConfigRequest, UpdateProxyConfigRequest,
-    UpdateSettingsRequest, UpdateSystemPromptRequest, UpdateThinkingConfigRequest,
-    UpsertUserPresetRequest, VersionResponse,
+    SystemPromptResponse, SystemStatusResponse, ThinkingConfigResponse,
+    UpdateAccessSettingsRequest, UpdateApiKeyRequest, UpdateCommonConfigRequest,
+    UpdateCompressionConfigRequest, UpdateEndpointConfigRequest, UpdateGlobalConfigRequest,
+    UpdatePromptFilterConfigRequest, UpdateProxyConfigRequest, UpdateSystemPromptRequest,
+    UpdateThinkingConfigRequest, UpsertUserPresetRequest, VersionResponse,
 };
-use crate::kiro::token_manager::CachedBalanceInfo;
+use crate::kiro::token_manager::{CachedBalanceInfo, CredentialEntrySnapshot};
 
 /// 余额缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
+const CREDENTIAL_BACKUP_FORMAT: &str = "xkiro.credentials.bundle";
+const CREDENTIAL_BACKUP_VERSION: u32 = 1;
+const CREDENTIAL_BACKUP_SCHEMA: &str = "native-credential-bundle";
+const SOURCE_FORMAT_CREDENTIAL_SNAPSHOT: &str = "external.account-export";
+const SOURCE_FORMAT_CACHED_CREDENTIAL: &str = "compatible.cache-record";
+const SOURCE_FORMAT_FLAT_CREDENTIAL: &str = "flat.credentials";
+const KIRO_SOCIAL_PROFILE_ARN: &str =
+    "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK";
+const KIRO_BUILDER_ID_CLIENT_ID_HASH: &str = "e909a0580879b06ece1202964fbe9dda95ea4ce3";
+
+struct ParsedCredentialImport {
+    source_format: String,
+    credentials: Vec<KiroCredentials>,
+}
+
+struct ExistingCredentialMatch {
+    id: u64,
+    reason: String,
+}
 
 #[derive(Default)]
 struct RefreshBalanceStats {
@@ -71,13 +113,33 @@ fn overage_remaining(balance: &BalanceResponse) -> f64 {
     }
 }
 
+fn balance_response_from_usage(id: u64, usage: &UsageLimitsResponse) -> BalanceResponse {
+    let current_usage = usage.current_usage();
+    let usage_limit = usage.usage_limit();
+    let remaining = usage.primary_remaining();
+    let usage_percentage = (usage.usage_ratio() * 100.0).min(100.0);
+    BalanceResponse {
+        id,
+        subscription_title: usage.subscription_title().map(str::to_string),
+        subscription_type: usage.subscription_type(),
+        current_usage,
+        usage_limit,
+        remaining,
+        usage_percentage,
+        next_reset_at: usage.next_date_reset,
+        overage_cap: usage.overage_cap(),
+        overage_capability: usage.overage_capability().map(str::to_string),
+        overage_status: usage.overage_status().map(str::to_string),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SocialAuthSessionKind {
     Manual,
     Helper,
 }
 
-/// Social OAuth 登录进行中的会话状态
+/// 社交 OAuth 登录进行中的会话状态
 struct SocialAuthSession {
     kind: SocialAuthSessionKind,
     auth_endpoint: String,
@@ -165,13 +227,14 @@ const MODELS_CACHE_TTL_SECS: u64 = 30 * 60;
 /// 封装所有 Admin API 的业务逻辑
 pub struct AdminService {
     token_manager: Arc<MultiTokenManager>,
-    /// Kiro Provider 引用，用于 region/endpoint/global_proxy 热更新双层同步
+    proxy_manager: Arc<ProxyManager>,
+    /// Kiro Provider 引用，用于区域/端点/global_proxy 热更新双层同步
     kiro_provider: Option<Arc<KiroProvider>>,
     /// 共享压缩配置，与 AppState 同源（运行时热更新）
     compression_config: Arc<RwLock<CompressionConfig>>,
-    /// 客户端 API Key 运行时状态
+    /// 客户端 API 密钥运行时状态
     client_api_key_runtime: Arc<RwLock<String>>,
-    /// 客户端 API Key 强制开关运行时状态
+    /// 客户端 API 密钥强制开关运行时状态
     require_api_key_runtime: Arc<std::sync::atomic::AtomicBool>,
     /// Admin 密钥运行时状态
     admin_api_key_runtime: Arc<RwLock<String>>,
@@ -195,11 +258,11 @@ pub struct AdminService {
     balance_semaphore: Arc<Semaphore>,
     /// 模型列表缓存（仅内存，TTL 30 分钟；按 (id, provider) 区分）
     models_cache: Mutex<HashMap<(u64, Option<String>), CachedModels>>,
-    /// 进行中的 Social OAuth 登录会话（session_id → SocialAuthSession）
+    /// 进行中的社交 OAuth 登录会话（session_id → SocialAuthSession）
     social_sessions: Mutex<HashMap<String, SocialAuthSession>>,
-    /// 进行中的 AWS IdC 设备授权会话（session_id → IdcAuthSession）
+    /// 进行中的 IAM Identity Center 设备授权会话（session_id → IdcAuthSession）
     idc_sessions: Mutex<HashMap<String, IdcAuthSession>>,
-    /// 进行中的 Kiro-Go IAM SSO authorization-code 会话
+    /// 进行中的 IAM SSO authorization-code 会话
     iam_sso_code_sessions: Mutex<HashMap<String, IamSsoCodeAuthSession>>,
     /// 请求日志和统计
     request_stats: super::stats::SharedRequestStats,
@@ -207,13 +270,14 @@ pub struct AdminService {
     builder_id_sessions: Mutex<HashMap<String, BuilderIdAuthSession>>,
     /// 进行中的 Kiro hosted SSO 登录会话（Microsoft 365 / Entra ID）
     kiro_sso_sessions: Mutex<HashMap<String, KiroSsoAuthSession>>,
-    /// API Key 列表（多 API Key 系统）
+    /// API 密钥列表（多 API 密钥系统）
     api_keys: SharedApiKeys,
 }
 
 impl AdminService {
     pub fn new(
         token_manager: Arc<MultiTokenManager>,
+        proxy_manager: Arc<ProxyManager>,
         kiro_provider: Option<Arc<KiroProvider>>,
         compression_config: Arc<RwLock<CompressionConfig>>,
         client_api_key_runtime: Arc<RwLock<String>>,
@@ -234,6 +298,7 @@ impl AdminService {
 
         Self {
             token_manager,
+            proxy_manager,
             kiro_provider,
             compression_config,
             client_api_key_runtime,
@@ -261,6 +326,141 @@ impl AdminService {
     /// 获取 token_manager 快照（用于批量操作）
     pub fn token_manager_snapshot(&self) -> crate::kiro::token_manager::ManagerSnapshot {
         self.token_manager.snapshot()
+    }
+
+    pub fn export_credentials_by_ids(&self, ids: &[u64]) -> Vec<KiroCredentials> {
+        self.token_manager.export_credentials_by_ids(ids)
+    }
+
+    fn validate_proxy_id_exists(&self, proxy_id: Option<u64>) -> Result<(), AdminServiceError> {
+        if let Some(proxy_id) = proxy_id
+            && self.proxy_manager.get(proxy_id).is_none()
+        {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "代理 #{} 不存在",
+                proxy_id
+            )));
+        }
+        Ok(())
+    }
+
+    fn assign_proxy_before_validation(
+        &self,
+        credential: &mut KiroCredentials,
+    ) -> Result<(), AdminServiceError> {
+        if credential
+            .proxy_url
+            .as_deref()
+            .is_some_and(|url| url.trim().is_empty())
+        {
+            credential.proxy_url = None;
+            credential.proxy_username = None;
+            credential.proxy_password = None;
+        }
+
+        if let Some(proxy_id) = credential.proxy_id {
+            if self.proxy_manager.get(proxy_id).is_none() {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "代理 #{} 不存在",
+                    proxy_id
+                )));
+            }
+            if !self.proxy_manager.is_usable(proxy_id) {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "代理 #{} 不可用",
+                    proxy_id
+                )));
+            }
+            return Ok(());
+        }
+
+        if credential
+            .proxy_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .is_some()
+        {
+            return Ok(());
+        }
+
+        let Some(proxy_id) = self.pick_proxy_for_new_credential(credential) else {
+            tracing::warn!(
+                region = credential.region.as_deref().unwrap_or("<none>"),
+                "新凭据验活前未找到可用代理，降级使用全局代理或直连"
+            );
+            return Ok(());
+        };
+        credential.proxy_id = Some(proxy_id);
+        tracing::info!(
+            proxy_id,
+            region = credential.region.as_deref().unwrap_or("<none>"),
+            "新凭据验活前已自动分配代理"
+        );
+        Ok(())
+    }
+
+    fn pick_proxy_for_new_credential(&self, credential: &KiroCredentials) -> Option<u64> {
+        let mut load: HashMap<u64, usize> = HashMap::new();
+        for (_, _, proxy_id, disabled) in self.token_manager.credential_region_bindings() {
+            if disabled {
+                continue;
+            }
+            if let Some(proxy_id) = proxy_id {
+                *load.entry(proxy_id).or_insert(0) += 1;
+            }
+        }
+
+        let credential_region = credential.region.as_deref();
+        let mut candidates: Vec<_> = self
+            .proxy_manager
+            .list()
+            .into_iter()
+            .filter(|view| !view.entry.disabled && !view.health.dead)
+            .filter_map(|view| {
+                let proxy_id = view.entry.id?;
+                let region_mismatch = match (credential_region, view.entry.region.as_deref()) {
+                    (Some(credential_region), Some(proxy_region)) => {
+                        credential_region != proxy_region
+                    }
+                    _ => false,
+                };
+                let current_load = *load.get(&proxy_id).unwrap_or(&0);
+                let available_permits = view.available_permits.unwrap_or(usize::MAX);
+                Some((
+                    proxy_id,
+                    region_mismatch,
+                    current_load,
+                    std::cmp::Reverse(available_permits),
+                ))
+            })
+            .collect();
+
+        candidates.sort_by_key(|(_, region_mismatch, current_load, available_permits)| {
+            (*region_mismatch, *current_load, *available_permits)
+        });
+        candidates.first().map(|(proxy_id, _, _, _)| *proxy_id)
+    }
+
+    fn proxy_for_validation(
+        &self,
+        credential: &KiroCredentials,
+        fallback_proxy: Option<&ProxyConfig>,
+    ) -> Result<Option<ProxyConfig>, AdminServiceError> {
+        if let Some(proxy_id) = credential.proxy_id {
+            if !self.proxy_manager.is_usable(proxy_id) {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "代理 #{} 不可用",
+                    proxy_id
+                )));
+            }
+            let entry = self.proxy_manager.get(proxy_id).ok_or_else(|| {
+                AdminServiceError::InvalidCredential(format!("代理 #{} 不存在", proxy_id))
+            })?;
+            return Ok(Some(entry.to_proxy_config()));
+        }
+
+        Ok(credential.effective_proxy(fallback_proxy))
     }
 
     /// 启动后并行预取所有未禁用凭据的余额，写入 disk-cache
@@ -405,26 +605,7 @@ impl AdminService {
                 };
                 match token_manager.get_usage_limits_for(id).await {
                     Ok(usage) => {
-                        let current_usage = usage.current_usage();
-                        let usage_limit = usage.usage_limit();
-                        let remaining = (usage_limit - current_usage).max(0.0);
-                        let usage_percentage = if usage_limit > 0.0 {
-                            (current_usage / usage_limit * 100.0).min(100.0)
-                        } else {
-                            0.0
-                        };
-                        let resp = BalanceResponse {
-                            id,
-                            subscription_title: usage.subscription_title().map(|s| s.to_string()),
-                            current_usage,
-                            usage_limit,
-                            remaining,
-                            usage_percentage,
-                            next_reset_at: usage.next_date_reset,
-                            overage_cap: usage.overage_cap(),
-                            overage_capability: usage.overage_capability().map(|s| s.to_string()),
-                            overage_status: usage.overage_status().map(|s| s.to_string()),
-                        };
+                        let resp = balance_response_from_usage(id, &usage);
                         (id, Some(resp), None)
                     }
                     Err(e) => (id, None, Some(e.to_string())),
@@ -508,7 +689,68 @@ impl AdminService {
                 failure_count: entry.failure_count,
                 expires_at: entry.expires_at,
                 auth_method: entry.auth_method,
+                provider: entry.provider,
+                user_id: entry.user_id,
+                source_account_id: entry.source_account_id,
+                label: entry.label,
+                status: entry.status,
+                added_at: entry.added_at,
+                nickname: entry.nickname,
+                group_id: entry.group_id,
+                tag_links: entry.tag_links,
+                usage_data: entry.usage_data,
+                has_available_models_cache: entry.has_available_models_cache,
+                source_failure_count: entry.source_failure_count,
+                source_last_failure_at: entry.source_last_failure_at,
+                source_disabled_reason: entry.source_disabled_reason,
+                source_success_count: entry.source_success_count,
                 has_profile_arn: entry.has_profile_arn,
+                has_token: entry.has_token,
+                has_refresh_token: entry.has_refresh_token,
+                has_client_id: entry.has_client_id,
+                has_client_secret: entry.has_client_secret,
+                has_id_token: entry.has_id_token,
+                has_api_key: entry.has_api_key,
+                has_proxy_credentials: entry.has_proxy_credentials,
+                region: entry.region,
+                auth_region: entry.auth_region,
+                api_region: entry.api_region,
+                machine_id: entry.machine_id,
+                start_url: entry.start_url,
+                client_id_hash: entry.client_id_hash,
+                sso_session_id: entry.sso_session_id,
+                token_endpoint: entry.token_endpoint,
+                issuer_url: entry.issuer_url,
+                scopes: entry.scopes,
+                subscription_type: entry.subscription_type,
+                subscription_title: entry.subscription_title,
+                days_remaining: entry.days_remaining,
+                overage_status: entry.overage_status,
+                overage_capability: entry.overage_capability,
+                overage_cap: entry.overage_cap,
+                overage_rate: entry.overage_rate,
+                current_overages: entry.current_overages,
+                overage_checked_at: entry.overage_checked_at,
+                ban_status: entry.ban_status,
+                ban_reason: entry.ban_reason,
+                ban_time: entry.ban_time,
+                usage_current: entry.usage_current,
+                usage_limit: entry.usage_limit,
+                usage_percent: entry.usage_percent,
+                next_reset_date: entry.next_reset_date,
+                last_refresh: entry.last_refresh,
+                trial_usage_current: entry.trial_usage_current,
+                trial_usage_limit: entry.trial_usage_limit,
+                trial_usage_percent: entry.trial_usage_percent,
+                trial_status: entry.trial_status,
+                trial_expires_at: entry.trial_expires_at,
+                request_count: entry.request_count,
+                error_count: entry.error_count,
+                total_tokens: entry.total_tokens,
+                total_credits: entry.total_credits,
+                last_used: entry.last_used,
+                created_at: entry.created_at,
+                tags: entry.tags,
                 refresh_token_hash: entry.refresh_token_hash,
                 api_key_hash: entry.api_key_hash,
                 masked_api_key: entry.masked_api_key,
@@ -517,6 +759,7 @@ impl AdminService {
                 last_used_at: entry.last_used_at.clone(),
                 has_proxy: entry.has_proxy,
                 proxy_url: entry.proxy_url,
+                proxy_id: entry.proxy_id,
                 refresh_failure_count: entry.refresh_failure_count,
                 disabled_reason: entry.disabled_reason,
                 endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
@@ -536,6 +779,176 @@ impl AdminService {
         }
     }
 
+    pub fn list_credential_alias_views(&self) -> Vec<CredentialAliasViewItem> {
+        self.token_manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .map(|entry| {
+                let id = entry
+                    .source_account_id
+                    .clone()
+                    .unwrap_or_else(|| entry.id.to_string());
+                CredentialAliasViewItem {
+                    id,
+                    email: entry.email.unwrap_or_default(),
+                    user_id: entry.user_id.unwrap_or_default(),
+                    nickname: entry.nickname.unwrap_or_default(),
+                    auth_method: entry.auth_method.unwrap_or_default(),
+                    provider: entry.provider.unwrap_or_default(),
+                    region: entry.region.unwrap_or_default(),
+                    enabled: !entry.disabled,
+                    ban_status: entry.ban_status.unwrap_or_default(),
+                    ban_reason: entry.ban_reason.unwrap_or_default(),
+                    ban_time: entry.ban_time.unwrap_or_default(),
+                    expires_at: Self::rfc3339_seconds(entry.expires_at.as_deref()),
+                    has_token: entry.has_token,
+                    machine_id: entry.machine_id.unwrap_or_default(),
+                    weight: entry.weight,
+                    overage_status: entry.overage_status.unwrap_or_default(),
+                    overage_capability: entry.overage_capability.unwrap_or_default(),
+                    overage_cap: entry.overage_cap.unwrap_or_default(),
+                    overage_rate: entry.overage_rate.unwrap_or_default(),
+                    current_overages: entry.current_overages.unwrap_or_default(),
+                    overage_checked_at: entry.overage_checked_at.unwrap_or_default(),
+                    proxy_url: entry.proxy_url.unwrap_or_default(),
+                    subscription_type: entry.subscription_type.unwrap_or_default(),
+                    subscription_title: entry.subscription_title.unwrap_or_default(),
+                    days_remaining: entry.days_remaining.unwrap_or_default(),
+                    usage_current: entry.usage_current.unwrap_or_default(),
+                    usage_limit: entry.usage_limit.unwrap_or_default(),
+                    usage_percent: entry.usage_percent.unwrap_or_default(),
+                    next_reset_date: entry.next_reset_date.unwrap_or_default(),
+                    last_refresh: entry.last_refresh.unwrap_or_default(),
+                    trial_usage_current: entry.trial_usage_current.unwrap_or_default(),
+                    trial_usage_limit: entry.trial_usage_limit.unwrap_or_default(),
+                    trial_usage_percent: entry.trial_usage_percent.unwrap_or_default(),
+                    trial_status: entry.trial_status.unwrap_or_default(),
+                    trial_expires_at: entry.trial_expires_at.unwrap_or_default(),
+                    request_count: entry.request_count.unwrap_or_default(),
+                    error_count: entry.error_count.unwrap_or_default(),
+                    total_tokens: entry.total_tokens.unwrap_or_default(),
+                    total_credits: entry.total_credits.unwrap_or_default(),
+                    last_used: entry
+                        .last_used
+                        .or_else(|| Self::rfc3339_seconds_opt(entry.last_used_at.as_deref()))
+                        .unwrap_or_default(),
+                }
+            })
+            .collect()
+    }
+
+    pub fn get_credential_full_export_by_path_id(
+        &self,
+        path_id: &str,
+    ) -> Result<CredentialFullExportResponse, AdminServiceError> {
+        let id = self.resolve_credential_id(path_id)?;
+        let snapshot = self.token_manager.snapshot();
+        let entry = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .ok_or(AdminServiceError::NotFound { id })?;
+        let credentials = self
+            .export_credentials_by_ids(&[id])
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                AdminServiceError::InvalidCredential("credential is not exportable".to_string())
+            })?;
+        let refresh_token = credentials
+            .refresh_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| {
+                AdminServiceError::InvalidCredential("credential is not exportable".to_string())
+            })?
+            .to_string();
+        let auth_method = credentials
+            .auth_method
+            .clone()
+            .unwrap_or_else(|| "social".to_string());
+        if auth_method.eq_ignore_ascii_case("api_key") {
+            return Err(AdminServiceError::InvalidCredential(
+                "credential is not exportable".to_string(),
+            ));
+        }
+        let export_id = credentials
+            .source_account_id
+            .clone()
+            .unwrap_or_else(|| id.to_string());
+        let nickname = credentials
+            .nickname
+            .clone()
+            .or_else(|| credentials.email.clone())
+            .unwrap_or_else(|| format!("凭据 #{}", id));
+        let user_id = credentials
+            .user_id
+            .clone()
+            .or_else(|| credentials.email.clone());
+
+        Ok(CredentialFullExportResponse {
+            id: export_id,
+            email: credentials.email.clone(),
+            user_id,
+            nickname,
+            access_token: credentials.access_token.clone(),
+            refresh_token,
+            client_id: credentials.client_id.clone(),
+            client_secret: credentials.client_secret.clone(),
+            auth_method,
+            provider: credentials.provider.clone(),
+            region: credentials.region.clone(),
+            start_url: credentials.start_url.clone(),
+            expires_at: Self::rfc3339_seconds_opt(credentials.expires_at.as_deref()),
+            machine_id: credentials.machine_id.clone(),
+            weight: entry.weight,
+            profile_arn: credentials.profile_arn.clone(),
+            token_endpoint: credentials.token_endpoint.clone(),
+            issuer_url: credentials.issuer_url.clone(),
+            scopes: credentials.scopes.clone(),
+            client_id_hash: credentials.client_id_hash.clone(),
+            id_token: credentials.id_token.clone(),
+            sso_session_id: credentials.sso_session_id.clone(),
+            proxy_url: entry.proxy_url.clone(),
+            proxy_id: entry.proxy_id,
+            overage_status: credentials.overage_status.clone(),
+            overage_capability: credentials.overage_capability.clone(),
+            overage_cap: credentials.overage_cap.unwrap_or_default(),
+            overage_rate: credentials.overage_rate.unwrap_or_default(),
+            current_overages: credentials.current_overages.unwrap_or_default(),
+            overage_checked_at: credentials.overage_checked_at.unwrap_or_default(),
+            enabled: !entry.disabled,
+            ban_status: credentials.ban_status.clone(),
+            ban_reason: credentials.ban_reason.clone(),
+            ban_time: credentials.ban_time.unwrap_or_default(),
+            subscription_type: credentials.subscription_type.clone(),
+            subscription_title: credentials.subscription_title.clone(),
+            days_remaining: credentials.days_remaining.unwrap_or_default(),
+            usage_current: credentials.usage_current.unwrap_or_default(),
+            usage_limit: credentials.usage_limit.unwrap_or_default(),
+            usage_percent: credentials.usage_percent.unwrap_or_default(),
+            next_reset_date: credentials.next_reset_date.clone(),
+            last_refresh: credentials.last_refresh.unwrap_or_default(),
+            trial_usage_current: credentials.trial_usage_current.unwrap_or_default(),
+            trial_usage_limit: credentials.trial_usage_limit.unwrap_or_default(),
+            trial_usage_percent: credentials.trial_usage_percent.unwrap_or_default(),
+            trial_status: credentials.trial_status.clone(),
+            trial_expires_at: credentials.trial_expires_at.unwrap_or_default(),
+            request_count: credentials.request_count.unwrap_or(entry.success_count),
+            error_count: credentials
+                .error_count
+                .unwrap_or(entry.failure_count as u64),
+            total_tokens: credentials.total_tokens.unwrap_or_default(),
+            total_credits: credentials.total_credits.unwrap_or_default(),
+            last_used: credentials
+                .last_used_at
+                .or_else(|| Self::rfc3339_seconds_opt(entry.last_used_at.as_deref()))
+                .unwrap_or_default(),
+        })
+    }
+
     /// 设置凭据禁用状态
     pub fn set_disabled(&self, id: u64, disabled: bool) -> Result<(), AdminServiceError> {
         self.token_manager
@@ -551,26 +964,51 @@ impl AdminService {
             .map_err(|e| self.classify_error(e, id))
     }
 
-    pub fn update_kiro_go_account(
+    pub fn update_credential_alias_fields(
         &self,
         id: u64,
-        req: KiroGoUpdateAccountRequest,
+        req: CredentialAliasUpdateRequest,
     ) -> Result<(), AdminServiceError> {
+        let nickname = Self::optional_trimmed_string(req.nickname);
+        let machine_id = Self::optional_trimmed_string(req.machine_id)
+            .map(machine_id::normalize_optional_machine_id);
+        let proxy_url = req.proxy_url.map(|v| {
+            let trimmed = v.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        });
         self.token_manager
-            .update_credential_kiro_go_fields(
-                id,
-                req.enabled,
-                req.weight,
-                req.proxy_url.map(|v| {
-                    let trimmed = v.trim().to_string();
-                    if trimmed.is_empty() {
-                        None
-                    } else {
-                        Some(trimmed)
-                    }
-                }),
-            )
+            .update_credential_fields(id, req.enabled, nickname, machine_id, req.weight, proxy_url)
             .map_err(|e| self.classify_error(e, id))
+    }
+
+    pub fn update_credential_alias_by_path_id(
+        &self,
+        path_id: &str,
+        req: CredentialAliasUpdateRequest,
+    ) -> Result<(), AdminServiceError> {
+        let id = self.resolve_credential_id(path_id)?;
+        self.update_credential_alias_fields(id, req)
+    }
+
+    pub fn delete_credential_by_path_id(&self, path_id: &str) -> Result<(), AdminServiceError> {
+        let id = self.resolve_credential_id(path_id)?;
+        self.set_disabled(id, true)?;
+        self.delete_credential(id)
+    }
+
+    fn optional_trimmed_string(value: Option<String>) -> Option<Option<String>> {
+        value.map(|value| {
+            let trimmed = value.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        })
     }
 
     /// 设置单凭据独立并发上限（None=回退到全局 per_credential_concurrency）
@@ -670,32 +1108,12 @@ impl AdminService {
             .await
             .map_err(|e| self.classify_balance_error(e, id))?;
 
-        let current_usage = usage.current_usage();
-        let usage_limit = usage.usage_limit();
-        let remaining = (usage_limit - current_usage).max(0.0);
-        let usage_percentage = if usage_limit > 0.0 {
-            (current_usage / usage_limit * 100.0).min(100.0)
-        } else {
-            0.0
-        };
-
-        Ok(BalanceResponse {
-            id,
-            subscription_title: usage.subscription_title().map(|s| s.to_string()),
-            current_usage,
-            usage_limit,
-            remaining,
-            usage_percentage,
-            next_reset_at: usage.next_date_reset,
-            overage_cap: usage.overage_cap(),
-            overage_capability: usage.overage_capability().map(|s| s.to_string()),
-            overage_status: usage.overage_status().map(|s| s.to_string()),
-        })
+        Ok(balance_response_from_usage(id, &usage))
     }
 
     /// 拉取指定凭据可用模型列表（30 分钟内存缓存；force=true 跳过缓存）
     ///
-    /// API Key 凭据 / 不存在 / 被禁用 → InvalidCredential / NotFound；
+    /// API 密钥凭据 / 不存在 / 被禁用 → InvalidCredential / NotFound；
     /// 上游 401 / 403 → UpstreamError，由前端展示。
     pub async fn list_available_models(
         &self,
@@ -747,6 +1165,32 @@ impl AdminService {
             },
         );
         Ok(response)
+    }
+
+    pub async fn refresh_credential_models_by_path_id(
+        &self,
+        path_id: &str,
+    ) -> Result<CredentialModelsResponse, AdminServiceError> {
+        let id = self.resolve_credential_id(path_id)?;
+        let response = self.list_available_models(id, None, true).await?;
+        Ok(CredentialModelsResponse {
+            success: true,
+            models: response.available_models,
+        })
+    }
+
+    pub fn get_cached_credential_models_by_path_id(
+        &self,
+        path_id: &str,
+    ) -> CachedCredentialModelsResponse {
+        let models = self
+            .resolve_credential_id(path_id)
+            .map(|id| self.token_manager.get_model_list(id))
+            .unwrap_or_default();
+        CachedCredentialModelsResponse {
+            success: true,
+            models,
+        }
     }
 
     /// 获取所有凭据的缓存余额
@@ -809,6 +1253,7 @@ impl AdminService {
                         remaining: cached.data.remaining,
                         usage_percentage: cached.data.usage_percentage,
                         subscription_title: cached.data.subscription_title.clone(),
+                        subscription_type: cached.data.subscription_type.clone(),
                         next_reset_at: cached.data.next_reset_at,
                         overage_cap: cached.data.overage_cap,
                         overage_capability: cached.data.overage_capability.clone(),
@@ -825,6 +1270,7 @@ impl AdminService {
                         remaining: r.remaining,
                         usage_percentage: 0.0,
                         subscription_title: None,
+                        subscription_type: None,
                         next_reset_at: None,
                         overage_cap: 0.0,
                         overage_capability: None,
@@ -845,6 +1291,7 @@ impl AdminService {
         &self,
         req: AddCredentialRequest,
     ) -> Result<AddCredentialResponse, AdminServiceError> {
+        self.validate_proxy_id_exists(req.proxy_id)?;
         // 校验端点名：未指定则默认合法，指定则必须已注册
         if let Some(ref name) = req.endpoint {
             if !self.known_endpoints.contains(name) {
@@ -858,22 +1305,38 @@ impl AdminService {
             }
         }
 
+        let token_endpoint = Self::clean_import_string(req.token_endpoint);
+        let issuer_url = Self::clean_import_string(req.issuer_url);
+        let scopes = Self::clean_import_string(req.scopes);
+        let auth_method = Self::normalize_import_auth_method(
+            Some(&req.auth_method),
+            req.provider.as_deref(),
+            req.client_id.as_deref(),
+            req.client_secret.as_deref(),
+            token_endpoint.as_deref(),
+            req.api_key.as_deref(),
+        );
+        let provider = Self::normalize_provider_for_auth_method(
+            Self::clean_import_string(req.provider),
+            &auth_method,
+        );
+
         // 构建凭据对象
         let email = req.email.clone();
-        let new_cred = KiroCredentials {
+        let mut new_cred = KiroCredentials {
             id: None,
             access_token: None,
             refresh_token: req.refresh_token,
             profile_arn: None,
             expires_at: None,
-            auth_method: Some(req.auth_method),
-            provider: None,
-            user_id: None,
+            auth_method: Some(auth_method),
+            provider,
+            user_id: Self::clean_import_string(req.user_id),
             client_id: req.client_id,
             client_secret: req.client_secret,
-            token_endpoint: None,
-            issuer_url: None,
-            scopes: None,
+            token_endpoint,
+            issuer_url,
+            scopes,
             start_url: None,
             client_id_hash: None,
             id_token: None,
@@ -887,15 +1350,19 @@ impl AdminService {
             email: req.email,
             subscription_title: None, // 将在首次获取使用额度时自动更新
             overage_status: None,
-            legacy_allow_overage: false,
+            allow_overage_import: false,
             proxy_url: req.proxy_url,
             proxy_username: req.proxy_username,
             proxy_password: req.proxy_password,
+            proxy_id: req.proxy_id,
             disabled: false, // 新添加的凭据默认启用
-            kiro_api_key: req.kiro_api_key,
+            api_key: req.api_key,
             endpoint: req.endpoint,
             concurrency: req.concurrency,
+            ..Default::default()
         };
+        self.assign_machine_id_for_new_credential(&mut new_cred)?;
+        self.assign_proxy_before_validation(&mut new_cred)?;
 
         // 调用 token_manager 添加凭据
         let credential_id = self
@@ -904,28 +1371,25 @@ impl AdminService {
             .await
             .map_err(|e| self.classify_add_error(e))?;
 
-        // 主动获取订阅等级，避免首次请求时 Free 账号绕过 Opus 模型过滤
+        // 主动获取订阅等级，避免首次请求时 Free 订阅绕过 Opus 模型过滤
         if let Err(e) = self.token_manager.get_usage_limits_for(credential_id).await {
             tracing::warn!("添加凭据后获取订阅等级失败（不影响凭据添加）: {}", e);
         }
 
-        Ok(AddCredentialResponse {
-            success: true,
-            message: format!("凭据添加成功，ID: {}", credential_id),
+        Ok(self.add_credential_response_from_stored(
             credential_id,
+            format!("凭据添加成功，ID: {}", credential_id),
             email,
-        })
+        ))
     }
 
-    pub async fn import_kiro_go_credential(
+    pub async fn import_credential_record(
         &self,
-        req: KiroGoImportCredentialsRequest,
+        req: ImportCredentialRecordRequest,
     ) -> Result<AddCredentialResponse, AdminServiceError> {
-        let import_refresh_token =
-            Self::clean_import_string(Some(req.refresh_token)).ok_or_else(|| {
-                AdminServiceError::InvalidRequest("refreshToken is required".to_string())
-            })?;
+        self.validate_proxy_id_exists(req.proxy_id)?;
         let access_token = Self::clean_import_string(req.access_token);
+        let api_key = Self::clean_import_string(req.api_key);
         let client_id = Self::clean_import_string(req.client_id);
         let client_secret = Self::clean_import_string(req.client_secret);
         let provider = Self::clean_import_string(req.provider);
@@ -959,15 +1423,17 @@ impl AdminService {
                 )));
             }
         }
-        let preferred_id = Self::parse_kiro_go_import_id(req.id.as_ref());
-        let disabled = Self::kiro_go_import_disabled(req.disabled, req.enabled);
+        let preferred_id = Self::parse_credential_record_id(req.id.as_ref());
+        let disabled = Self::credential_record_import_disabled(req.disabled, req.enabled);
         let concurrency = req.concurrency.filter(|value| *value > 0);
 
-        let mut auth_method = Self::normalize_kiro_go_import_auth_method(
+        let mut auth_method = Self::normalize_credential_record_auth_method(
             req.auth_method.as_deref(),
+            provider.as_deref(),
             client_id.as_deref(),
             client_secret.as_deref(),
             token_endpoint.as_deref(),
+            api_key.as_deref(),
         );
 
         let derived = kiro_sso::derive_external_idp_endpoints(
@@ -1016,11 +1482,26 @@ impl AdminService {
                 })?;
             }
         }
+        let import_refresh_token = if auth_method == "api_key" {
+            if api_key.is_none() {
+                return Err(AdminServiceError::InvalidRequest(
+                    "apiKey is required".to_string(),
+                ));
+            }
+            None
+        } else {
+            Some(Self::clean_import_string(req.refresh_token).ok_or_else(|| {
+                AdminServiceError::InvalidRequest("refreshToken is required".to_string())
+            })?)
+        };
+        let provider = Self::normalize_provider_for_auth_method(provider, &auth_method);
+        let source_account_id = Self::clean_import_string(req.source_account_id)
+            .or_else(|| Self::credential_record_import_source_id(req.id.as_ref()));
 
         let mut credential = KiroCredentials {
             id: preferred_id,
             access_token: None,
-            refresh_token: Some(import_refresh_token),
+            refresh_token: import_refresh_token,
             profile_arn,
             expires_at: None,
             auth_method: Some(auth_method.clone()),
@@ -1043,15 +1524,59 @@ impl AdminService {
             api_region,
             machine_id: Self::clean_import_string(req.machine_id),
             email,
-            subscription_title: None,
+            source_account_id,
+            label: Self::clean_import_string(req.label),
+            status: Self::clean_import_string(req.status),
+            added_at: Self::clean_import_string(req.added_at),
+            password: Self::clean_import_string(req.password),
+            subscription_title: Self::clean_import_string(req.subscription_title),
             overage_status,
-            legacy_allow_overage: false,
+            usage_data: req.usage_data,
+            group_id: Self::clean_import_string(req.group_id),
+            tag_links: req.tag_links,
+            available_models_cache: req.available_models_cache,
+            failure_count: req.failure_count,
+            last_failure_at: Self::clean_import_string(req.last_failure_at),
+            disabled_reason: Self::clean_import_string(req.disabled_reason),
+            success_count: req.success_count,
+            csrf_token: Self::clean_import_string(req.csrf_token),
+            nickname: Self::clean_import_string(req.nickname),
+            ban_status: Self::clean_import_string(req.ban_status),
+            ban_reason: Self::clean_import_string(req.ban_reason),
+            ban_time: req.ban_time,
+            subscription_type: Self::clean_import_string(req.subscription_type),
+            days_remaining: req.days_remaining,
+            usage_current: req.usage_current,
+            usage_limit: req.usage_limit,
+            usage_percent: req.usage_percent,
+            next_reset_date: Self::clean_import_string(req.next_reset_date),
+            last_refresh: req.last_refresh,
+            trial_usage_current: req.trial_usage_current,
+            trial_usage_limit: req.trial_usage_limit,
+            trial_usage_percent: req.trial_usage_percent,
+            trial_status: Self::clean_import_string(req.trial_status),
+            trial_expires_at: req.trial_expires_at,
+            overage_capability: Self::clean_import_string(req.overage_capability),
+            overage_cap: req.overage_cap,
+            overage_rate: req.overage_rate,
+            current_overages: req.current_overages,
+            overage_checked_at: req.overage_checked_at,
+            request_count: req.request_count,
+            error_count: req.error_count,
+            total_tokens: req.total_tokens,
+            total_credits: req.total_credits,
+            last_used_at: req.last_used_at,
+            created_at: req.created_at,
+            tags: req.tags,
+            allow_overage_import: false,
             proxy_url,
             proxy_username,
             proxy_password,
+            proxy_id: req.proxy_id,
             disabled,
-            kiro_api_key: None,
+            api_key,
             endpoint,
+            ..Default::default()
         };
 
         let mut trusted_on_import = false;
@@ -1066,8 +1591,10 @@ impl AdminService {
                 credential.expires_at = Some(expires_at.to_rfc3339());
             }
         }
+        self.assign_machine_id_for_new_credential(&mut credential)?;
+        self.assign_proxy_before_validation(&mut credential)?;
 
-        if credential.access_token.is_none() {
+        if auth_method != "api_key" && credential.access_token.is_none() {
             let config = self.token_manager.config();
             let global_proxy = config.proxy_url.as_deref().map(|url| {
                 let proxy = ProxyConfig::new(url);
@@ -1100,18 +1627,25 @@ impl AdminService {
             && !trusted_on_import
             && let Err(e) = self.token_manager.get_usage_limits_for(credential_id).await
         {
-            tracing::warn!(
-                "导入 Kiro-Go 凭据后获取订阅等级失败（不影响凭据添加）: {}",
-                e
-            );
+            tracing::warn!("导入凭据记录后获取订阅等级失败（不影响凭据添加）: {}", e);
         }
 
-        Ok(AddCredentialResponse {
-            success: true,
-            message: format!("凭据添加成功，ID: {}", credential_id),
+        Ok(self.add_credential_response_from_stored(
             credential_id,
+            format!("凭据添加成功，ID: {}", credential_id),
             email,
-        })
+        ))
+    }
+
+    fn add_credential_response_from_stored(
+        &self,
+        credential_id: u64,
+        message: String,
+        email_hint: Option<String>,
+    ) -> AddCredentialResponse {
+        let details =
+            self.credential_login_details_from_stored_with_email_hint(credential_id, email_hint);
+        AddCredentialResponse::from_login_details(message, details)
     }
 
     fn clean_import_string(value: Option<String>) -> Option<String> {
@@ -1120,30 +1654,63 @@ impl AdminService {
             .filter(|value| !value.is_empty())
     }
 
-    fn normalize_kiro_go_import_auth_method(
+    fn has_import_string(value: &Option<String>) -> bool {
+        value
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+    }
+
+    fn normalize_credential_record_auth_method(
         auth_method: Option<&str>,
+        provider: Option<&str>,
         client_id: Option<&str>,
         client_secret: Option<&str>,
         token_endpoint: Option<&str>,
+        api_key: Option<&str>,
     ) -> String {
-        let method = auth_method
-            .map(str::trim)
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        match method.as_str() {
-            "external_idp" | "azuread" | "azure" | "entra" | "entra-id" | "entra_id"
-            | "microsoft" | "m365" | "office365" | "external" => "external_idp".to_string(),
-            _ if token_endpoint.is_some() => "external_idp".to_string(),
-            "social" | "google" | "github" => "social".to_string(),
-            "idc" | "builderid" | "builder-id" | "enterprise" | "iam" => "idc".to_string(),
-            "" if client_id.is_some() => "idc".to_string(),
-            "" => "social".to_string(),
-            _ if client_id.is_some() && client_secret.is_some() => "idc".to_string(),
-            _ => "social".to_string(),
+        Self::normalize_import_auth_method(
+            auth_method,
+            provider,
+            client_id,
+            client_secret,
+            token_endpoint,
+            api_key,
+        )
+    }
+
+    fn canonical_explicit_auth_method(
+        auth_method: Option<&str>,
+        allow_api_key: bool,
+    ) -> Option<String> {
+        let method = auth_method?.trim();
+        if method.is_empty() {
+            return None;
+        }
+        let canonical = KiroCredentials::canonical_auth_method_name(method);
+        match canonical {
+            "social" | "idc" | "external_idp" => Some(canonical.to_string()),
+            "api_key" if allow_api_key => Some(canonical.to_string()),
+            _ => None,
         }
     }
 
-    fn parse_kiro_go_import_id(value: Option<&serde_json::Value>) -> Option<u64> {
+    fn is_external_idp_provider_alias(value: &str) -> bool {
+        KiroCredentials::is_external_idp_provider_alias(value)
+    }
+
+    fn is_external_idp_provider_alias_option(value: Option<&str>) -> bool {
+        KiroCredentials::provider_implies_external_idp(value)
+    }
+
+    fn normalize_provider_for_auth_method(
+        provider: Option<String>,
+        auth_method: &str,
+    ) -> Option<String> {
+        KiroCredentials::normalize_provider_for_auth_method(provider, auth_method)
+    }
+
+    fn parse_credential_record_id(value: Option<&serde_json::Value>) -> Option<u64> {
         match value {
             Some(serde_json::Value::Number(number)) => number.as_u64().filter(|id| *id > 0),
             Some(serde_json::Value::String(value)) => {
@@ -1153,7 +1720,17 @@ impl AdminService {
         }
     }
 
-    fn kiro_go_import_disabled(disabled: Option<bool>, enabled: Option<bool>) -> bool {
+    fn credential_record_import_source_id(value: Option<&serde_json::Value>) -> Option<String> {
+        match value {
+            Some(serde_json::Value::String(value)) => {
+                let value = value.trim();
+                (!value.is_empty() && value.parse::<u64>().is_err()).then(|| value.to_string())
+            }
+            _ => None,
+        }
+    }
+
+    fn credential_record_import_disabled(disabled: Option<bool>, enabled: Option<bool>) -> bool {
         disabled.unwrap_or_else(|| enabled.map(|value| !value).unwrap_or(false))
     }
 
@@ -1179,6 +1756,47 @@ impl AdminService {
             .force_refresh_token_for(id)
             .await
             .map_err(|e| self.classify_balance_error(e, id))
+    }
+
+    pub async fn refresh_credential_by_path_id(
+        &self,
+        path_id: &str,
+    ) -> Result<CredentialRefreshResponse, AdminServiceError> {
+        let id = self.resolve_credential_id(path_id)?;
+        self.force_refresh_token(id).await?;
+        self.get_balance(id, true).await?;
+        let snapshot = self.token_manager.snapshot();
+        let entry = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .ok_or(AdminServiceError::NotFound { id })?;
+        Ok(CredentialRefreshResponse {
+            success: true,
+            info: Self::credential_refresh_info_from_entry(entry),
+        })
+    }
+
+    fn credential_refresh_info_from_entry(
+        entry: &CredentialEntrySnapshot,
+    ) -> CredentialRefreshInfo {
+        CredentialRefreshInfo {
+            email: entry.email.clone().unwrap_or_default(),
+            user_id: entry.user_id.clone().unwrap_or_default(),
+            subscription_type: entry.subscription_type.clone().unwrap_or_default(),
+            subscription_title: entry.subscription_title.clone().unwrap_or_default(),
+            days_remaining: entry.days_remaining.unwrap_or_default(),
+            usage_current: entry.usage_current.unwrap_or_default(),
+            usage_limit: entry.usage_limit.unwrap_or_default(),
+            usage_percent: entry.usage_percent.unwrap_or_default(),
+            next_reset_date: entry.next_reset_date.clone().unwrap_or_default(),
+            last_refresh: entry.last_refresh.unwrap_or_default(),
+            trial_usage_current: entry.trial_usage_current.unwrap_or_default(),
+            trial_usage_limit: entry.trial_usage_limit.unwrap_or_default(),
+            trial_usage_percent: entry.trial_usage_percent.unwrap_or_default(),
+            trial_status: entry.trial_status.clone().unwrap_or_default(),
+            trial_expires_at: entry.trial_expires_at.unwrap_or_default(),
+        }
     }
 
     /// 切换上游 overage 开关（调用 Kiro `setUserPreference`）
@@ -1236,6 +1854,90 @@ impl AdminService {
         Ok(())
     }
 
+    pub async fn get_credential_overage_by_path_id(
+        &self,
+        path_id: &str,
+    ) -> Result<CredentialOverageResponse, AdminServiceError> {
+        let id = self.resolve_credential_id(path_id)?;
+        let balance = self.get_balance(id, true).await?;
+        Ok(self.credential_overage_response(id, Some(&balance), None))
+    }
+
+    pub async fn set_credential_overage_by_path_id(
+        &self,
+        path_id: &str,
+        enabled: bool,
+    ) -> Result<CredentialOverageResponse, AdminServiceError> {
+        let id = self.resolve_credential_id(path_id)?;
+        self.set_overage_status(id, enabled).await?;
+        let status = if enabled { "ENABLED" } else { "DISABLED" }.to_string();
+        let balance = self.get_balance(id, true).await.ok();
+        Ok(self.credential_overage_response(id, balance.as_ref(), Some(status)))
+    }
+
+    fn credential_overage_response(
+        &self,
+        id: u64,
+        balance: Option<&BalanceResponse>,
+        status_override: Option<String>,
+    ) -> CredentialOverageResponse {
+        let snapshot = self
+            .token_manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == id);
+
+        let overage_status = status_override
+            .or_else(|| balance.and_then(|b| b.overage_status.clone()))
+            .or_else(|| {
+                snapshot
+                    .as_ref()
+                    .and_then(|entry| entry.overage_status.clone())
+            });
+        let overage_capability = balance
+            .and_then(|b| b.overage_capability.clone())
+            .or_else(|| {
+                snapshot
+                    .as_ref()
+                    .and_then(|entry| entry.overage_capability.clone())
+            });
+        let subscription_title = balance
+            .and_then(|b| b.subscription_title.clone())
+            .or_else(|| {
+                snapshot
+                    .as_ref()
+                    .and_then(|entry| entry.subscription_title.clone())
+            });
+        let overage_cap = balance
+            .map(|b| b.overage_cap)
+            .filter(|cap| *cap > 0.0)
+            .or_else(|| snapshot.as_ref().and_then(|entry| entry.overage_cap))
+            .unwrap_or_default();
+        let current_overages = snapshot
+            .as_ref()
+            .and_then(|entry| entry.current_overages)
+            .or_else(|| balance.map(|b| (b.current_usage - b.usage_limit).max(0.0)))
+            .unwrap_or_default();
+
+        CredentialOverageResponse {
+            success: true,
+            overage_status,
+            overage_capability,
+            subscription_title,
+            overage_cap,
+            overage_rate: snapshot
+                .as_ref()
+                .and_then(|entry| entry.overage_rate)
+                .unwrap_or_default(),
+            current_overages,
+            overage_checked_at: snapshot
+                .as_ref()
+                .and_then(|entry| entry.overage_checked_at)
+                .unwrap_or_else(|| Utc::now().timestamp()),
+        }
+    }
+
     /// 轻量运行时状态快照（高频轮询用，纯内存读取，不触发任何 IO）
     ///
     /// 字段精简至 dashboard 实时需要的 5 项：
@@ -1254,6 +1956,7 @@ impl AdminService {
                     .get(&entry.id)
                     .map(|cached| RuntimeBalanceSnapshot {
                         subscription_title: cached.data.subscription_title.clone(),
+                        subscription_type: cached.data.subscription_type.clone(),
                         current_usage: cached.data.current_usage,
                         usage_limit: cached.data.usage_limit,
                         remaining: cached.data.remaining,
@@ -1276,11 +1979,11 @@ impl AdminService {
         RuntimeStatsResponse { credentials }
     }
 
-    /// 批量强制刷新 Token（B 端点）
+    /// 批量强制刷新令牌（B 端点）
     ///
     /// 用 `Semaphore(8)` 限制并发，`JoinSet` 收集结果。
     /// 单个失败不影响其他凭据，全部完成后返回 `BatchRefreshResponse`。
-    /// 内部调用 `force_refresh_token_for(id)`，对 API Key 凭据会 `bail` 走 Err 分支。
+    /// 内部调用 `force_refresh_token_for(id)`，对 API 密钥凭据会 `bail` 走 Err 分支。
     pub async fn force_refresh_tokens_batch(&self, ids: Vec<u64>) -> BatchRefreshResponse {
         // 源头过滤：禁用的凭据直接跳过刷新，不占用并发槽位
         let snapshot = self.token_manager.snapshot();
@@ -1407,39 +2110,12 @@ impl AdminService {
                     }
                 };
                 match token_manager.get_usage_limits_for(id).await {
-                    Ok(usage) => {
-                        // 字段聚合复用 UsageLimitsResponse 的便捷方法，
-                        // 公式与 AdminService::fetch_balance 保持一致
-                        let current_usage = usage.current_usage();
-                        let usage_limit = usage.usage_limit();
-                        let remaining = (usage_limit - current_usage).max(0.0);
-                        let usage_percentage = if usage_limit > 0.0 {
-                            (current_usage / usage_limit * 100.0).min(100.0)
-                        } else {
-                            0.0
-                        };
-                        BatchRefreshBalanceResultItem {
-                            id,
-                            success: true,
-                            balance: Some(BalanceResponse {
-                                id,
-                                subscription_title: usage
-                                    .subscription_title()
-                                    .map(|s| s.to_string()),
-                                current_usage,
-                                usage_limit,
-                                remaining,
-                                usage_percentage,
-                                next_reset_at: usage.next_date_reset,
-                                overage_cap: usage.overage_cap(),
-                                overage_capability: usage
-                                    .overage_capability()
-                                    .map(|s| s.to_string()),
-                                overage_status: usage.overage_status().map(|s| s.to_string()),
-                            }),
-                            error: None,
-                        }
-                    }
+                    Ok(usage) => BatchRefreshBalanceResultItem {
+                        id,
+                        success: true,
+                        balance: Some(balance_response_from_usage(id, &usage)),
+                        error: None,
+                    },
                     Err(e) => BatchRefreshBalanceResultItem {
                         id,
                         success: false,
@@ -1536,7 +2212,7 @@ impl AdminService {
             Err(_) => return HashMap::new(),
         };
 
-        // 文件中使用字符串 key 以兼容 JSON 格式
+        // JSON 对象键使用字符串，加载后再解析为凭据 ID。
         let map: HashMap<String, CachedBalance> = match serde_json::from_str(&content) {
             Ok(m) => m,
             Err(e) => {
@@ -1606,19 +2282,19 @@ impl AdminService {
             return AdminServiceError::NotFound { id };
         }
 
-        // 2. API Key 凭据不支持刷新：客户端请求错误，映射为 400
-        if msg.contains("API Key 凭据不支持刷新") {
+        // 2. API 密钥凭据不支持刷新：客户端请求错误，映射为 400
+        if msg.contains("API 密钥凭据不支持刷新") {
             return AdminServiceError::InvalidCredential(msg);
         }
 
         // 3. 上游服务错误特征：HTTP 响应错误或网络错误
         let is_upstream_error =
             // HTTP 响应错误（来自 refresh_*_token 的错误消息）
-            msg.contains("凭证已过期或无效") ||
+            msg.contains("凭据已过期或无效") ||
             msg.contains("权限不足") ||
             msg.contains("已被限流") ||
             msg.contains("服务器错误") ||
-            msg.contains("Token 刷新失败") ||
+            msg.contains("令牌刷新失败") ||
             msg.contains("暂时不可用") ||
             // 网络错误（reqwest 错误）
             msg.contains("error trying to connect") ||
@@ -1645,10 +2321,10 @@ impl AdminService {
             || msg.contains("refreshToken 已被截断")
             || msg.contains("凭据已存在")
             || msg.contains("refreshToken 重复")
-            || msg.contains("kiroApiKey 重复")
-            || msg.contains("缺少 kiroApiKey")
-            || msg.contains("kiroApiKey 为空")
-            || msg.contains("凭证已过期或无效")
+            || msg.contains("apiKey 重复")
+            || msg.contains("缺少 apiKey")
+            || msg.contains("apiKey 为空")
+            || msg.contains("凭据已过期或无效")
             || msg.contains("权限不足")
             || msg.contains("已被限流");
 
@@ -1679,7 +2355,7 @@ impl AdminService {
 
     // ============ 全局代理配置（热更新） ============
 
-    /// 设置凭据 Region（凭据级 region/api_region 覆盖）
+    /// 设置凭据区域（凭据级 region/api_region 覆盖）
     pub fn set_region(
         &self,
         id: u64,
@@ -1697,7 +2373,7 @@ impl AdminService {
             .map_err(|e| self.classify_error(e, id))
     }
 
-    /// 设置凭据 endpoint（凭据级 endpoint 覆盖，须命中已注册端点）
+    /// 设置凭据端点（凭据级 endpoint 覆盖，须命中已注册端点）
     pub fn set_endpoint(&self, id: u64, endpoint: Option<String>) -> Result<(), AdminServiceError> {
         let endpoint = endpoint
             .map(|s| s.trim().to_string())
@@ -1709,7 +2385,7 @@ impl AdminService {
             let mut known: Vec<&str> = self.known_endpoints.iter().map(|s| s.as_str()).collect();
             known.sort_unstable();
             return Err(AdminServiceError::InvalidCredential(format!(
-                "endpoint 必须是已注册值，已注册: {:?}，收到: {}",
+                "端点必须是已注册值，已注册: {:?}，收到: {}",
                 known, name
             )));
         }
@@ -1767,8 +2443,7 @@ impl AdminService {
                 .map_err(|e| AdminServiceError::InternalError(e.to_string()))
         })?;
 
-        // 3. 持久化成功后再应用运行时变更
-        // 贴合 BK admin/service.rs:785-808：先 token_manager 后 provider 双层同步
+        // 3. 持久化成功后再应用运行时变更：先更新 token_manager，再同步 provider。
         self.token_manager.update_proxy(new_proxy.clone());
         if let Some(provider) = &self.kiro_provider {
             if let Err(e) = provider.update_global_proxy(new_proxy) {
@@ -1779,9 +2454,9 @@ impl AdminService {
         Ok(())
     }
 
-    pub fn get_settings(&self) -> SettingsResponse {
+    pub fn get_access_settings(&self) -> AccessSettingsResponse {
         let config = self.token_manager.config();
-        SettingsResponse {
+        AccessSettingsResponse {
             api_key: config.api_key.clone(),
             require_api_key: config.require_api_key,
             port: config.port,
@@ -1790,9 +2465,9 @@ impl AdminService {
         }
     }
 
-    pub async fn update_settings(
+    pub async fn update_access_settings(
         &self,
-        req: UpdateSettingsRequest,
+        req: UpdateAccessSettingsRequest,
     ) -> Result<(), AdminServiceError> {
         let new_api_key = req.api_key.clone();
         let new_require_api_key = req.require_api_key;
@@ -1834,6 +2509,78 @@ impl AdminService {
         Ok(())
     }
 
+    pub fn get_common_config(&self) -> Result<CommonConfigResponse, AdminServiceError> {
+        let machine_id = self.ensure_local_machine_id()?;
+        let config = self.token_manager.config();
+        Ok(CommonConfigResponse {
+            machine_id,
+            credential_machine_id_strategy: config.credential_machine_id_strategy,
+        })
+    }
+
+    pub fn update_common_config(
+        &self,
+        req: UpdateCommonConfigRequest,
+    ) -> Result<CommonConfigResponse, AdminServiceError> {
+        self.token_manager.with_config_mut(|cfg| {
+            if let Some(strategy) = req.credential_machine_id_strategy {
+                cfg.credential_machine_id_strategy = strategy;
+            }
+            let machine_id = cfg
+                .machine_id
+                .as_deref()
+                .and_then(machine_id::normalize_machine_id)
+                .unwrap_or_else(machine_id::generate_account_machine_id);
+            cfg.machine_id = Some(machine_id);
+            cfg.save()
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))
+        })?;
+
+        self.get_common_config()
+    }
+
+    fn ensure_local_machine_id(&self) -> Result<String, AdminServiceError> {
+        self.token_manager.with_config_mut(|cfg| {
+            let old = cfg.machine_id.clone();
+            let machine_id = old
+                .as_deref()
+                .and_then(machine_id::normalize_machine_id)
+                .unwrap_or_else(machine_id::generate_account_machine_id);
+            let changed = old.as_deref() != Some(machine_id.as_str());
+            cfg.machine_id = Some(machine_id.clone());
+            if changed {
+                cfg.save()
+                    .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+            }
+            Ok(machine_id)
+        })
+    }
+
+    fn assign_machine_id_for_new_credential(
+        &self,
+        credential: &mut KiroCredentials,
+    ) -> Result<(), AdminServiceError> {
+        if let Some(machine_id) = credential
+            .machine_id
+            .as_deref()
+            .and_then(machine_id::normalize_machine_id)
+        {
+            credential.machine_id = Some(machine_id);
+            return Ok(());
+        }
+
+        let machine_id = self.machine_id_for_new_credential()?;
+        credential.machine_id = Some(machine_id);
+        Ok(())
+    }
+
+    fn machine_id_for_new_credential(&self) -> Result<String, AdminServiceError> {
+        match self.token_manager.config().credential_machine_id_strategy {
+            CredentialMachineIdStrategy::Local => self.ensure_local_machine_id(),
+            CredentialMachineIdStrategy::Random => Ok(machine_id::generate_account_machine_id()),
+        }
+    }
+
     pub fn get_thinking_config(&self) -> ThinkingConfigResponse {
         let config = self.token_manager.config();
         ThinkingConfigResponse {
@@ -1847,26 +2594,36 @@ impl AdminService {
         &self,
         req: UpdateThinkingConfigRequest,
     ) -> Result<(), AdminServiceError> {
-        fn validate_format(value: &str, field: &str) -> Result<(), AdminServiceError> {
-            if matches!(value, "reasoning_content" | "thinking" | "think") {
-                Ok(())
-            } else {
-                Err(AdminServiceError::InvalidRequest(format!(
-                    "{} 必须是 reasoning_content、thinking 或 think",
-                    field
-                )))
+        fn resolve_format(
+            value: Option<String>,
+            field: &str,
+            default_value: &str,
+        ) -> Result<String, AdminServiceError> {
+            let value = value.unwrap_or_default();
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return Ok(default_value.to_string());
             }
+            if matches!(trimmed, "reasoning_content" | "thinking" | "think") {
+                return Ok(trimmed.to_string());
+            }
+            Err(AdminServiceError::InvalidRequest(format!(
+                "{} 必须是 reasoning_content、thinking 或 think",
+                field
+            )))
         }
 
-        validate_format(&req.openai_format, "openaiFormat")?;
-        validate_format(&req.claude_format, "claudeFormat")?;
-        let suffix = if req.suffix.trim().is_empty() {
-            "-thinking".to_string()
-        } else {
-            req.suffix.trim().to_string()
+        let suffix = {
+            let value = req.suffix.unwrap_or_default();
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                "-thinking".to_string()
+            } else {
+                trimmed.to_string()
+            }
         };
-        let openai_format = req.openai_format;
-        let claude_format = req.claude_format;
+        let openai_format = resolve_format(req.openai_format, "openaiFormat", "reasoning_content")?;
+        let claude_format = resolve_format(req.claude_format, "claudeFormat", "thinking")?;
 
         self.token_manager.with_config_mut(|cfg| {
             cfg.thinking_suffix = suffix.clone();
@@ -1897,11 +2654,12 @@ impl AdminService {
         &self,
         req: UpdateEndpointConfigRequest,
     ) -> Result<(), AdminServiceError> {
-        let internal_endpoint = Self::kiro_go_endpoint_to_internal(&req.preferred_endpoint)?;
+        let preferred_endpoint = req.preferred_endpoint.unwrap_or_default();
+        let internal_endpoint = Self::external_endpoint_alias_to_internal(&preferred_endpoint)?;
         let endpoint_fallback = req.endpoint_fallback;
 
         self.token_manager.with_config_mut(|cfg| {
-            cfg.preferred_endpoint = req.preferred_endpoint.clone();
+            cfg.preferred_endpoint = preferred_endpoint.clone();
             cfg.default_endpoint = internal_endpoint.to_string();
             if let Some(value) = endpoint_fallback {
                 cfg.endpoint_fallback = value;
@@ -1923,21 +2681,289 @@ impl AdminService {
         Ok(())
     }
 
-    pub fn get_kiro_go_proxy_config(&self) -> KiroGoProxyConfigResponse {
+    pub fn get_proxy_url_config(&self) -> ProxyUrlConfigResponse {
         let config = self.token_manager.config();
-        KiroGoProxyConfigResponse {
+        ProxyUrlConfigResponse {
             proxy_url: config.proxy_url.unwrap_or_default(),
         }
     }
 
-    pub async fn update_kiro_go_proxy_config(
+    pub async fn update_proxy_url_config(
         &self,
         req: UpdateProxyConfigRequest,
     ) -> Result<(), AdminServiceError> {
         if let Some(proxy_url) = &req.proxy_url {
-            Self::validate_kiro_go_proxy_url(proxy_url)?;
+            Self::validate_proxy_url(proxy_url)?;
         }
         self.update_proxy_config(req).await
+    }
+
+    pub fn list_proxies(&self) -> ProxyListResponse {
+        let proxies = self
+            .proxy_manager
+            .list()
+            .into_iter()
+            .map(|view| {
+                let id = view.entry.id.unwrap_or(0);
+                ProxyItem {
+                    id,
+                    url: view.entry.url,
+                    username: view.entry.username,
+                    region: view.entry.region,
+                    country: view.entry.country,
+                    max_concurrency: view.entry.max_concurrency,
+                    disabled: view.entry.disabled,
+                    note: view.entry.note,
+                    dead: view.health.dead,
+                    consecutive_failures: view.health.consecutive_failures,
+                    last_error: view.health.last_error,
+                    last_checked: view.health.last_checked.map(|dt| dt.to_rfc3339()),
+                    available_permits: view.available_permits,
+                    bound_credentials: self.token_manager.credentials_bound_to_proxy(id).len(),
+                }
+            })
+            .collect();
+        ProxyListResponse { proxies }
+    }
+
+    pub async fn add_proxy(&self, req: ProxyUpsertRequest) -> Result<u64, AdminServiceError> {
+        let entry = proxy_entry_from_req(req)?;
+        let id = self
+            .proxy_manager
+            .add(entry)
+            .map_err(|e| AdminServiceError::InternalError(format!("新增代理失败: {}", e)))?;
+        if let Some(entry) = self.proxy_manager.get(id)
+            && entry.region.is_none()
+            && let Some(geo) = probe_proxy_geo(&entry).await
+            && let Err(e) = self.proxy_manager.set_geo(id, geo.region, geo.country)
+        {
+            tracing::warn!("新增代理 #{} 回填地理信息失败: {}", id, e);
+        }
+        Ok(id)
+    }
+
+    pub fn update_proxy(&self, id: u64, req: ProxyUpsertRequest) -> Result<(), AdminServiceError> {
+        let entry = proxy_entry_from_req(req)?;
+        self.proxy_manager
+            .update(id, entry)
+            .map_err(|e| AdminServiceError::InternalError(format!("更新代理失败: {}", e)))
+    }
+
+    pub fn delete_proxy(&self, id: u64) -> Result<usize, AdminServiceError> {
+        let bound = self.token_manager.credentials_bound_to_proxy(id);
+        for credential_id in &bound {
+            if let Err(e) = self.token_manager.set_proxy_id(*credential_id, None) {
+                tracing::warn!("删除代理 #{} 时解绑凭据 #{} 失败: {}", id, credential_id, e);
+            }
+        }
+        self.proxy_manager
+            .delete(id)
+            .map_err(|e| AdminServiceError::InternalError(format!("删除代理失败: {}", e)))?;
+        Ok(bound.len())
+    }
+
+    pub fn set_credential_proxy(
+        &self,
+        credential_id: u64,
+        proxy_id: Option<u64>,
+    ) -> Result<(), AdminServiceError> {
+        if let Some(id) = proxy_id
+            && self.proxy_manager.get(id).is_none()
+        {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "代理 #{} 不存在",
+                id
+            )));
+        }
+        self.token_manager
+            .set_proxy_id(credential_id, proxy_id)
+            .map_err(|e| self.classify_error(e, credential_id))
+    }
+
+    pub fn set_credential_proxy_by_region(
+        &self,
+        credential_id: u64,
+        region: Option<&str>,
+    ) -> Result<Option<u64>, AdminServiceError> {
+        let Some(region) = region.map(str::trim).filter(|value| !value.is_empty()) else {
+            self.token_manager
+                .set_proxy_id(credential_id, None)
+                .map_err(|e| self.classify_error(e, credential_id))?;
+            return Ok(None);
+        };
+
+        let mut load: HashMap<u64, usize> = HashMap::new();
+        for (_, _, proxy_id, _) in self.token_manager.credential_region_bindings() {
+            if let Some(proxy_id) = proxy_id {
+                *load.entry(proxy_id).or_insert(0) += 1;
+            }
+        }
+
+        let mut candidates: Vec<u64> = self
+            .proxy_manager
+            .list()
+            .into_iter()
+            .filter(|view| !view.entry.disabled && !view.health.dead)
+            .filter(|view| match view.entry.region.as_deref() {
+                Some(proxy_region) => proxy_region == region,
+                None => true,
+            })
+            .filter_map(|view| view.entry.id)
+            .collect();
+
+        if candidates.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "region '{}' 下无可用代理",
+                region
+            )));
+        }
+        candidates.sort_by_key(|id| *load.get(id).unwrap_or(&0));
+        let proxy_id = candidates[0];
+        self.token_manager
+            .set_proxy_id(credential_id, Some(proxy_id))
+            .map_err(|e| self.classify_error(e, credential_id))?;
+        Ok(Some(proxy_id))
+    }
+
+    pub async fn test_proxy(&self, id: u64) -> ProxyTestResponse {
+        let Some(entry) = self.proxy_manager.get(id) else {
+            return ProxyTestResponse {
+                ok: false,
+                exit_ip: None,
+                latency_ms: None,
+                error: Some(format!("代理 #{} 不存在", id)),
+            };
+        };
+        let result = probe_proxy(&entry).await;
+        self.proxy_manager
+            .record_health(id, result.ok, result.error.clone());
+        result
+    }
+
+    pub async fn import_proxies(&self, req: ProxyImportRequest) -> ProxyImportResponse {
+        let mut added = 0usize;
+        let mut failed = 0usize;
+        let mut errors = Vec::new();
+        let mut new_ids = Vec::new();
+
+        for (lineno, raw) in req.text.lines().enumerate() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (url, username, password) = match parse_proxy_line(line) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    failed += 1;
+                    errors.push(format!("第{}行: {}", lineno + 1, error));
+                    continue;
+                }
+            };
+            let entry = ProxyEntry {
+                id: None,
+                url,
+                username,
+                password,
+                region: clean_proxy_string(req.region.clone()),
+                country: None,
+                max_concurrency: req.max_concurrency.filter(|value| *value > 0),
+                disabled: false,
+                note: None,
+            };
+            match self.proxy_manager.add(entry) {
+                Ok(id) => {
+                    added += 1;
+                    new_ids.push(id);
+                }
+                Err(error) => {
+                    failed += 1;
+                    errors.push(format!("第{}行: {}", lineno + 1, error));
+                }
+            }
+        }
+
+        for id in new_ids {
+            if let Some(entry) = self.proxy_manager.get(id)
+                && let Some(geo) = probe_proxy_geo(&entry).await
+            {
+                let region = if entry.region.is_some() {
+                    None
+                } else {
+                    geo.region
+                };
+                if let Err(error) = self.proxy_manager.set_geo(id, region, geo.country) {
+                    tracing::warn!("代理 #{} 回填地理信息失败: {}", id, error);
+                }
+            }
+        }
+
+        ProxyImportResponse {
+            added,
+            failed,
+            errors,
+        }
+    }
+
+    pub fn auto_assign_proxies(&self, req: ProxyAutoAssignRequest) -> ProxyAutoAssignResponse {
+        let bindings = self.token_manager.credential_region_bindings();
+        let mut load: HashMap<u64, usize> = HashMap::new();
+        for (_, _, proxy_id, _) in &bindings {
+            if let Some(proxy_id) = proxy_id {
+                *load.entry(*proxy_id).or_insert(0) += 1;
+            }
+        }
+        let proxies = self.proxy_manager.list();
+        let mut assigned = Vec::new();
+        let mut skipped = Vec::new();
+
+        for (credential_id, region, current_proxy_id, disabled) in bindings {
+            if !req.credential_ids.is_empty() && !req.credential_ids.contains(&credential_id) {
+                continue;
+            }
+            if disabled || (current_proxy_id.is_some() && !req.reassign_bound) {
+                continue;
+            }
+
+            let mut candidates: Vec<u64> = proxies
+                .iter()
+                .filter(|view| !view.entry.disabled && !view.health.dead)
+                .filter(
+                    |view| match (region.as_deref(), view.entry.region.as_deref()) {
+                        (Some(credential_region), Some(proxy_region)) => {
+                            credential_region == proxy_region
+                        }
+                        (_, None) => true,
+                        (None, Some(_)) => true,
+                    },
+                )
+                .filter_map(|view| view.entry.id)
+                .collect();
+            candidates.sort_by_key(|id| *load.get(id).unwrap_or(&0));
+
+            match candidates.first().copied() {
+                Some(proxy_id) => match self
+                    .token_manager
+                    .set_proxy_id(credential_id, Some(proxy_id))
+                {
+                    Ok(()) => {
+                        *load.entry(proxy_id).or_insert(0) += 1;
+                        assigned.push((credential_id, proxy_id));
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            "自动分配代理: 凭据 #{} 绑定代理 #{} 失败: {}",
+                            credential_id,
+                            proxy_id,
+                            error
+                        );
+                        skipped.push(credential_id);
+                    }
+                },
+                None => skipped.push(credential_id),
+            }
+        }
+
+        ProxyAutoAssignResponse { assigned, skipped }
     }
 
     pub fn get_prompt_filter_config(&self) -> PromptFilterConfigResponse {
@@ -1960,14 +2986,21 @@ impl AdminService {
         req: UpdatePromptFilterConfigRequest,
     ) -> Result<(), AdminServiceError> {
         self.token_manager.with_config_mut(|cfg| {
-            cfg.prompt_filter.filter_claude_code = req.filter_claude_code;
-            cfg.prompt_filter.filter_env_noise = req.filter_env_noise;
-            cfg.prompt_filter.filter_strip_boundaries = req.filter_strip_boundaries;
-            cfg.prompt_filter.rules = req
-                .rules
-                .iter()
-                .map(Self::prompt_filter_rule_from_dto)
-                .collect();
+            if let Some(value) = req.filter_claude_code {
+                cfg.prompt_filter.filter_claude_code = value;
+            }
+            if let Some(value) = req.filter_env_noise {
+                cfg.prompt_filter.filter_env_noise = value;
+            }
+            if let Some(value) = req.filter_strip_boundaries {
+                cfg.prompt_filter.filter_strip_boundaries = value;
+            }
+            if let Some(rules) = req.rules {
+                cfg.prompt_filter.rules = rules
+                    .iter()
+                    .map(Self::prompt_filter_rule_from_dto)
+                    .collect();
+            }
             cfg.save()
                 .map_err(|e| AdminServiceError::InternalError(e.to_string()))
         })?;
@@ -1977,18 +3010,18 @@ impl AdminService {
         Ok(())
     }
 
-    fn kiro_go_endpoint_to_internal(value: &str) -> Result<&'static str, AdminServiceError> {
+    fn external_endpoint_alias_to_internal(value: &str) -> Result<&'static str, AdminServiceError> {
         match value {
             "auto" | "kiro" => Ok(IDE_ENDPOINT_NAME),
             "codewhisperer" => Ok(CODEWHISPERER_ENDPOINT_NAME),
-            "amazonq" => Ok(CLI_ENDPOINT_NAME),
+            "amazonq" => Ok(AMAZONQ_ENDPOINT_NAME),
             _ => Err(AdminServiceError::InvalidRequest(
                 "preferredEndpoint 必须是 auto、kiro、codewhisperer 或 amazonq".to_string(),
             )),
         }
     }
 
-    fn validate_kiro_go_proxy_url(value: &str) -> Result<(), AdminServiceError> {
+    fn validate_proxy_url(value: &str) -> Result<(), AdminServiceError> {
         let value = value.trim();
         if value.is_empty()
             || value.starts_with("http://")
@@ -1999,7 +3032,7 @@ impl AdminService {
             Ok(())
         } else {
             Err(AdminServiceError::InvalidRequest(
-                "proxyURL must start with http://, https://, socks5://, or socks5h://".to_string(),
+                "proxyUrl must start with http://, https://, socks5://, or socks5h://".to_string(),
             ))
         }
     }
@@ -2038,6 +3071,7 @@ impl AdminService {
             region: config.region.clone(),
             prompt_cache_ttl_seconds: config.prompt_cache_ttl_seconds,
             prompt_cache_accounting_enabled: config.prompt_cache_accounting_enabled,
+            prompt_cache_max_ratio: config.prompt_cache_max_ratio,
             default_endpoint: config.default_endpoint.clone(),
             extract_thinking: config.extract_thinking,
             per_credential_concurrency: config.per_credential_concurrency,
@@ -2074,7 +3108,7 @@ impl AdminService {
                 let trimmed = region.trim();
                 if trimmed.is_empty() {
                     return Err(AdminServiceError::InvalidCredential(
-                        "Region 不能为空".to_string(),
+                        "区域不能为空".to_string(),
                     ));
                 }
                 cfg.region = trimmed.to_string();
@@ -2093,11 +3127,20 @@ impl AdminService {
                 cfg.prompt_cache_accounting_enabled = enabled;
             }
 
+            if let Some(max_ratio) = req.prompt_cache_max_ratio {
+                if !(max_ratio > 0.0 && max_ratio <= 1.0) {
+                    return Err(AdminServiceError::InvalidCredential(
+                        "Prompt Cache max ratio 必须大于 0 且不超过 1".to_string(),
+                    ));
+                }
+                cfg.prompt_cache_max_ratio = max_ratio;
+            }
+
             if let Some(ref endpoint) = req.default_endpoint {
                 let trimmed = endpoint.trim();
                 if trimmed.is_empty() {
                     return Err(AdminServiceError::InvalidCredential(
-                        "默认 endpoint 不能为空".to_string(),
+                        "默认端点不能为空".to_string(),
                     ));
                 }
                 if !self.known_endpoints.contains(trimmed) {
@@ -2105,7 +3148,7 @@ impl AdminService {
                         self.known_endpoints.iter().map(|s| s.as_str()).collect();
                     known.sort_unstable();
                     return Err(AdminServiceError::InvalidCredential(format!(
-                        "未知的 endpoint: {}，可用值: {:?}",
+                        "未知的端点: {}，可用值: {:?}",
                         trimmed, known
                     )));
                 }
@@ -2169,7 +3212,7 @@ impl AdminService {
         // 2. 持久化成功后再应用运行时变更
         let config = self.token_manager.config();
 
-        // 关闭 session 亲和后清空已有绑定，避免残留
+        // 关闭调度亲和后清空已有绑定，避免残留
         if let Some(false) = req.session_affinity_enabled {
             self.token_manager.clear_session_affinity();
         }
@@ -2179,8 +3222,7 @@ impl AdminService {
             self.token_manager.update_region(config.region.clone());
         }
 
-        // 热更新 default_endpoint
-        // 贴合 BK admin/service.rs:910-925：token_manager 先 + provider 后双层同步
+        // 热更新 default_endpoint：先更新 token_manager，再同步 provider。
         if req.default_endpoint.is_some() {
             self.token_manager
                 .update_default_endpoint(config.default_endpoint.clone());
@@ -2192,10 +3234,14 @@ impl AdminService {
         }
 
         // 热更新 Prompt Cache 运行时配置
-        if req.prompt_cache_ttl_seconds.is_some() || req.prompt_cache_accounting_enabled.is_some() {
+        if req.prompt_cache_ttl_seconds.is_some()
+            || req.prompt_cache_accounting_enabled.is_some()
+            || req.prompt_cache_max_ratio.is_some()
+        {
             self.prompt_cache_runtime.write().update(
                 req.prompt_cache_ttl_seconds,
                 req.prompt_cache_accounting_enabled,
+                req.prompt_cache_max_ratio,
             );
         }
 
@@ -2442,368 +3488,1478 @@ impl AdminService {
         }
     }
 
-    // ============ 导出 token.json ============
-
-    /// 按 ID 列表导出凭据为 token.json 兼容格式
-    ///
-    /// - API Key 凭据（无 refreshToken）跳过
-    /// - 不存在的 ID 跳过
-    /// - 输出顺序与 `ids` 一致；可被 `import_token_json` 直接吃回
-    pub fn export_credentials_to_token_json(&self, ids: &[u64]) -> Vec<ExportTokenJsonItem> {
-        let creds = self.token_manager.export_credentials_by_ids(ids);
-        creds
-            .into_iter()
-            .filter_map(|c| {
-                let refresh_token = c.refresh_token.clone()?;
-                if refresh_token.is_empty() {
-                    return None;
-                }
-                let auth_method = match c.auth_method.as_deref() {
-                    Some(m) => {
-                        let lower = m.to_lowercase();
-                        match lower.as_str() {
-                            "builder-id" | "builderid" | "iam" | "idc" => "idc".to_string(),
-                            "api_key" => return None, // API Key 不可导出为 token.json
-                            other => other.to_string(),
-                        }
-                    }
-                    None => "social".to_string(),
-                };
-                let provider = c
-                    .provider
-                    .clone()
-                    .unwrap_or_else(|| match auth_method.as_str() {
-                        "idc" => "BuilderId".to_string(),
-                        _ => "Social".to_string(),
-                    });
-                Some(ExportTokenJsonItem {
-                    provider,
-                    refresh_token,
-                    client_id: c.client_id,
-                    client_secret: c.client_secret,
-                    auth_method,
-                    priority: c.priority,
-                    weight: c.weight,
-                    region: c.region,
-                    api_region: c.api_region,
-                    machine_id: c.machine_id,
-                })
-            })
-            .collect()
-    }
-
-    /// 按 ID 列表导出 KAM 兼容格式（`kiro-account-manager` 可直接 import）
-    ///
-    /// - API Key 凭据跳过（KAM 仅支持 OAuth）
-    /// - `id` 用 UUIDv4 派生（KAM 用字符串 ID，xkiro 用 u64，需重映射避免冲突）
-    /// - `label` 用 email 优先，否则用 `Kiro #{id}` 占位
-    /// - `provider` 优先级：subscription_title 启发 → start_url → email 域名 → 默认
-    ///   - idc + start_url 含 `awsapps.com` → `Enterprise`
-    ///   - idc → `BuilderId`
-    ///   - social + email 含 `gmail` → `Google`
-    ///   - social + email 含 `github` → `Github`
-    ///   - social → `Google`（默认）
-    /// - `authMethod` 取大写 `IdC` / 小写 `social`（KAM 约定）
-    /// - `addedAt` 用 RFC3339 当前时间（xkiro 不存添加时间）
-    pub fn export_credentials_to_kam(&self, ids: &[u64]) -> Vec<ExportKamItem> {
-        let creds = self.token_manager.export_credentials_with_state_by_ids(ids);
-        let now = chrono::Local::now().to_rfc3339();
-        creds
-            .into_iter()
-            .filter_map(|(c, enabled)| {
-                let refresh_token = c.refresh_token.clone()?;
-                if refresh_token.is_empty() {
-                    return None;
-                }
-                let auth_method_lower = c
-                    .auth_method
-                    .as_deref()
-                    .map(|m| m.to_lowercase())
-                    .unwrap_or_else(|| "social".to_string());
-                if auth_method_lower == "api_key" {
-                    return None;
-                }
-                let is_idc = matches!(
-                    auth_method_lower.as_str(),
-                    "idc" | "builder-id" | "builderid" | "iam"
-                );
-                let auth_method = if is_idc {
-                    "IdC".to_string()
-                } else {
-                    "social".to_string()
-                };
-                let provider = c.provider.clone().unwrap_or_else(|| {
-                    if is_idc {
-                        if c.start_url
-                            .as_deref()
-                            .map(|s| {
-                                let url = s.trim().trim_end_matches('/');
-                                !url.is_empty() && url != "https://view.awsapps.com/start"
-                            })
-                            .unwrap_or(false)
-                            || c.client_secret
-                                .as_deref()
-                                .map(|s| {
-                                    s.contains("awsapps.com") || s.contains("initiateLoginUri")
-                                })
-                                .unwrap_or(false)
-                        {
-                            "Enterprise".to_string()
-                        } else {
-                            "BuilderId".to_string()
-                        }
-                    } else if let Some(email) = c.email.as_deref() {
-                        if email.contains("gmail") {
-                            "Google".to_string()
-                        } else if email.contains("github") {
-                            "Github".to_string()
-                        } else {
-                            "Google".to_string()
-                        }
-                    } else {
-                        "Google".to_string()
-                    }
-                });
-                let user_id = c.user_id.clone().or_else(|| c.email.clone());
-                let id_str =
-                    c.id.map(|n| format!("xkiro-{}", n))
-                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                let label = c.email.clone().unwrap_or_else(|| match c.id {
-                    Some(n) => format!("Kiro #{}", n),
-                    None => "Kiro Account".to_string(),
-                });
-                let status = if enabled { "active" } else { "disabled" };
-                Some(ExportKamItem {
-                    id: id_str,
-                    email: c.email.clone(),
-                    label,
-                    status: status.to_string(),
-                    added_at: now.clone(),
-                    access_token: c.access_token,
-                    refresh_token: Some(refresh_token),
-                    expires_at: c.expires_at,
-                    provider: Some(provider),
-                    user_id,
-                    auth_method: Some(auth_method),
-                    client_id: c.client_id,
-                    client_secret: c.client_secret,
-                    region: c.region,
-                    client_id_hash: c.client_id_hash,
-                    sso_session_id: c.sso_session_id,
-                    id_token: c.id_token,
-                    start_url: c.start_url,
-                    profile_arn: c.profile_arn,
-                    machine_id: c.machine_id,
-                    enabled,
-                })
-            })
-            .collect()
-    }
-
-    // ============ 批量导入 token.json ============
-
-    /// 批量导入 token.json
-    ///
-    /// 解析官方 token.json 格式，按 provider 字段自动映射 authMethod：
-    /// - BuilderId/builder-id/idc → idc
-    /// - Social/social → social
-    pub async fn import_token_json(&self, req: ImportTokenJsonRequest) -> ImportTokenJsonResponse {
-        let items = req.items.into_vec();
-        let dry_run = req.dry_run;
-
-        let mut results = Vec::with_capacity(items.len());
-        let mut added = 0usize;
-        let mut skipped = 0usize;
-        let mut invalid = 0usize;
-
-        for (index, item) in items.into_iter().enumerate() {
-            let result = self.process_token_json_item(index, item, dry_run).await;
-            match result.action {
-                ImportAction::Added => added += 1,
-                ImportAction::Skipped => skipped += 1,
-                ImportAction::Invalid => invalid += 1,
-            }
-            results.push(result);
-        }
-
-        ImportTokenJsonResponse {
-            summary: ImportSummary {
-                parsed: results.len(),
-                added,
-                skipped,
-                invalid,
-            },
-            items: results,
-        }
-    }
-
-    /// 处理单个 token.json 项
-    async fn process_token_json_item(
+    pub fn export_credential_snapshot(
         &self,
-        index: usize,
-        item: TokenJsonItem,
-        dry_run: bool,
-    ) -> ImportItemResult {
-        // 生成指纹（用于识别和去重）
-        let fingerprint = Self::generate_fingerprint(&item);
+        ids: &[serde_json::Value],
+    ) -> CredentialSnapshotExportData {
+        let requested_ids = Self::credential_export_id_filter(ids);
+        let snapshot = self.token_manager.snapshot();
+        let selected_ids: Vec<u64> = snapshot
+            .entries
+            .iter()
+            .filter(|entry| {
+                requested_ids.is_empty()
+                    || requested_ids.contains(&entry.id.to_string())
+                    || entry
+                        .source_account_id
+                        .as_deref()
+                        .is_some_and(|id| requested_ids.contains(id))
+            })
+            .map(|entry| entry.id)
+            .collect();
+        let now = Utc::now().timestamp_millis();
+        let credentials: Vec<_> = self
+            .token_manager
+            .export_credentials_with_state_by_ids(&selected_ids)
+            .into_iter()
+            .map(|(credential, enabled)| {
+                Self::credential_snapshot_export_item(credential, enabled, now)
+            })
+            .collect();
+        CredentialSnapshotExportData {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            exported_at: now,
+            credentials,
+            groups: Vec::new(),
+            tags: Vec::new(),
+        }
+    }
 
-        // 验证必填字段
-        let refresh_token = match &item.refresh_token {
-            Some(rt) if !rt.is_empty() => rt.clone(),
-            _ => {
-                return ImportItemResult {
-                    index,
-                    fingerprint,
-                    action: ImportAction::Invalid,
-                    reason: Some("缺少 refreshToken".to_string()),
-                    credential_id: None,
-                };
+    fn credential_export_id_filter(ids: &[serde_json::Value]) -> HashSet<String> {
+        ids.iter()
+            .filter_map(|id| match id {
+                serde_json::Value::String(value) => {
+                    let value = value.trim();
+                    (!value.is_empty()).then(|| value.to_string())
+                }
+                serde_json::Value::Number(value) => value.as_u64().map(|id| id.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn credential_snapshot_export_item(
+        credential: KiroCredentials,
+        enabled: bool,
+        now: i64,
+    ) -> CredentialSnapshotExportItem {
+        let auth_method = credential
+            .auth_method
+            .as_deref()
+            .map(KiroCredentials::canonical_auth_method_name)
+            .map(str::to_string);
+        let provider = credential
+            .provider
+            .clone()
+            .or_else(|| {
+                credential.auth_method.as_deref().map(|method| {
+                    if method.eq_ignore_ascii_case("social") {
+                        "Google".to_string()
+                    } else {
+                        "BuilderId".to_string()
+                    }
+                })
+            })
+            .unwrap_or_else(|| "BuilderId".to_string());
+        let id = credential
+            .source_account_id
+            .clone()
+            .or_else(|| credential.id.map(|id| id.to_string()))
+            .unwrap_or_default();
+        let status = credential.status.clone().unwrap_or_else(|| {
+            if enabled {
+                "active".to_string()
+            } else {
+                "disabled".to_string()
+            }
+        });
+
+        CredentialSnapshotExportItem {
+            id,
+            email: credential.email.unwrap_or_default(),
+            nickname: credential.nickname.unwrap_or_default(),
+            provider,
+            user_id: credential.user_id,
+            machine_id: credential.machine_id,
+            credentials: CredentialExportMaterial {
+                access_token: credential.access_token.unwrap_or_default(),
+                csrf_token: credential.csrf_token.unwrap_or_default(),
+                refresh_token: credential.refresh_token.unwrap_or_default(),
+                client_id: credential.client_id,
+                client_secret: credential.client_secret,
+                region: credential.region,
+                expires_at: Self::rfc3339_millis(credential.expires_at.as_deref()),
+                auth_method,
+                provider: credential.provider,
+            },
+            subscription: CredentialSnapshotExportSubscription {
+                subscription_type: Self::credential_export_subscription_type(
+                    credential
+                        .subscription_type
+                        .as_deref()
+                        .or(credential.subscription_title.as_deref()),
+                ),
+                title: credential.subscription_title,
+            },
+            usage: CredentialSnapshotExportUsage {
+                current: credential.usage_current.unwrap_or_default(),
+                limit: credential.usage_limit.unwrap_or_default(),
+                percent_used: credential.usage_percent.unwrap_or_default(),
+                last_updated: credential.last_refresh.unwrap_or(now),
+            },
+            tags: Self::credential_export_tags(credential.tags.as_ref()),
+            status,
+            created_at: credential.created_at.unwrap_or(now),
+            last_used_at: credential.last_used_at.unwrap_or(now),
+        }
+    }
+
+    fn credential_export_subscription_type(raw: Option<&str>) -> String {
+        match normalize_subscription_type(raw.unwrap_or_default()).as_str() {
+            "PRO_PLUS" | "POWER" => "Pro_Plus".to_string(),
+            "PRO" => "Pro".to_string(),
+            "ENTERPRISE" => "Enterprise".to_string(),
+            "TEAMS" => "Teams".to_string(),
+            _ => "Free".to_string(),
+        }
+    }
+
+    fn credential_export_tags(value: Option<&serde_json::Value>) -> Vec<String> {
+        value
+            .and_then(serde_json::Value::as_array)
+            .map(|tags| {
+                tags.iter()
+                    .filter_map(|tag| tag.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn rfc3339_millis(value: Option<&str>) -> i64 {
+        value
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .map(|dt| dt.timestamp_millis())
+            .unwrap_or_default()
+    }
+
+    fn rfc3339_seconds(value: Option<&str>) -> i64 {
+        Self::rfc3339_seconds_opt(value).unwrap_or_default()
+    }
+
+    fn rfc3339_seconds_opt(value: Option<&str>) -> Option<i64> {
+        value
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .map(|dt| dt.timestamp())
+    }
+
+    pub fn export_credential_backup(&self, ids: &[u64]) -> CredentialBackup {
+        let credentials: Vec<CredentialBackupEntry> = self
+            .token_manager
+            .export_credentials_with_state_by_ids(ids)
+            .into_iter()
+            .map(|(mut credential, enabled)| {
+                credential.canonicalize_auth_method();
+                credential.disabled = !enabled;
+                CredentialBackupEntry { credential }
+            })
+            .collect();
+
+        CredentialBackup {
+            format: CREDENTIAL_BACKUP_FORMAT.to_string(),
+            version: CREDENTIAL_BACKUP_VERSION,
+            exported_at: Utc::now().to_rfc3339(),
+            source: CredentialBackupSource {
+                app: "xkiro.rs".to_string(),
+                schema: CREDENTIAL_BACKUP_SCHEMA.to_string(),
+                credential_count: credentials.len(),
+            },
+            credentials,
+        }
+    }
+
+    pub fn import_credentials(&self, req: ImportCredentialsRequest) -> ImportCredentialsResponse {
+        let parsed = match self.parse_credential_import(req.input) {
+            Ok(parsed) => parsed,
+            Err(reason) => {
+                return ImportCredentialsResponse::invalid_import(reason);
             }
         };
 
-        // 映射 authMethod
-        let auth_method = Self::map_auth_method(&item);
-
-        // IdC 需要 clientId 和 clientSecret
-        if auth_method == "idc" && (item.client_id.is_none() || item.client_secret.is_none()) {
-            return ImportItemResult {
-                index,
-                fingerprint,
-                action: ImportAction::Invalid,
-                reason: Some(format!("{} 认证需要 clientId 和 clientSecret", auth_method)),
-                credential_id: None,
-            };
+        let source_format = parsed.source_format;
+        let parsed_credentials = parsed.credentials;
+        let mut normalized = Vec::with_capacity(parsed_credentials.len());
+        for credential in parsed_credentials {
+            normalized.push(self.normalize_imported_credential(credential));
         }
 
-        // 检查是否已存在（通过 refreshToken 前缀匹配）
-        if self.token_manager.has_refresh_token_prefix(&refresh_token) {
-            return ImportItemResult {
-                index,
-                fingerprint,
-                action: ImportAction::Skipped,
-                reason: Some("凭据已存在".to_string()),
-                credential_id: None,
-            };
+        let mut machine_counts = HashMap::<String, usize>::new();
+        for credential in normalized.iter().filter_map(|result| result.as_ref().ok()) {
+            if let Some(machine_id) = credential
+                .machine_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                *machine_counts
+                    .entry(machine_id.to_ascii_lowercase())
+                    .or_default() += 1;
+            }
         }
 
-        // dry-run 模式只返回预览
-        if dry_run {
-            return ImportItemResult {
-                index,
-                fingerprint,
-                action: ImportAction::Added,
-                reason: Some("预览模式".to_string()),
-                credential_id: None,
+        let existing_ids: Vec<u64> = self
+            .token_manager
+            .snapshot()
+            .entries
+            .iter()
+            .map(|entry| entry.id)
+            .collect();
+        let existing_credentials = self.token_manager.export_credentials_by_ids(&existing_ids);
+
+        let mut summary = CredentialImportSummary {
+            parsed: normalized.len(),
+            added: 0,
+            skipped: 0,
+            merged: 0,
+            replaced: 0,
+            invalid: 0,
+        };
+        let mut items = Vec::with_capacity(normalized.len());
+
+        for (index, result) in normalized.into_iter().enumerate() {
+            let mut credential = match result {
+                Ok(credential) => credential,
+                Err(reason) => {
+                    summary.invalid += 1;
+                    items.push(CredentialImportItem::invalid(
+                        index,
+                        source_format.clone(),
+                        "(invalid)",
+                        reason,
+                    ));
+                    continue;
+                }
             };
+            if !req.dry_run
+                && let Err(e) = self.assign_machine_id_for_new_credential(&mut credential)
+            {
+                summary.invalid += 1;
+                items.push(CredentialImportItem::invalid(
+                    index,
+                    source_format.clone(),
+                    "(invalid)",
+                    e.to_string(),
+                ));
+                continue;
+            }
+
+            let mut warnings = self.credential_import_warnings(&credential, &existing_credentials);
+            if let Some(machine_id) = credential
+                .machine_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                && machine_counts
+                    .get(&machine_id.to_ascii_lowercase())
+                    .copied()
+                    .unwrap_or_default()
+                    > 1
+            {
+                warnings.push("导入包内存在重复 machineId，默认保留以便真实机器模拟".to_string());
+            }
+
+            let fingerprint = Self::credential_import_fingerprint(&credential);
+            let existing_match =
+                Self::find_existing_import_match(&credential, &existing_credentials);
+            let action_result: Result<
+                (CredentialImportAction, Option<u64>, Option<String>),
+                String,
+            > = match (existing_match, req.mode) {
+                (Some(existing), CredentialImportMode::SkipExisting) => Ok((
+                    CredentialImportAction::Skipped,
+                    Some(existing.id),
+                    Some(existing.reason),
+                )),
+                (Some(existing), CredentialImportMode::MergeMissing) => {
+                    if req.dry_run {
+                        Ok((
+                            CredentialImportAction::Merged,
+                            Some(existing.id),
+                            Some(existing.reason),
+                        ))
+                    } else {
+                        self.token_manager
+                            .merge_imported_credential_missing(existing.id, credential.clone())
+                            .map(|_| {
+                                (
+                                    CredentialImportAction::Merged,
+                                    Some(existing.id),
+                                    Some(existing.reason),
+                                )
+                            })
+                            .map_err(|e| e.to_string())
+                    }
+                }
+                (Some(existing), CredentialImportMode::ReplaceExisting) => {
+                    if req.dry_run {
+                        Ok((
+                            CredentialImportAction::Replaced,
+                            Some(existing.id),
+                            Some(existing.reason),
+                        ))
+                    } else {
+                        self.token_manager
+                            .replace_imported_credential(existing.id, credential.clone())
+                            .map(|_| {
+                                (
+                                    CredentialImportAction::Replaced,
+                                    Some(existing.id),
+                                    Some(existing.reason),
+                                )
+                            })
+                            .map_err(|e| e.to_string())
+                    }
+                }
+                (None, _) => {
+                    if req.dry_run {
+                        Ok((CredentialImportAction::Added, credential.id, None))
+                    } else {
+                        self.token_manager
+                            .add_imported_credential(credential.clone())
+                            .map(|id| (CredentialImportAction::Added, Some(id), None))
+                            .map_err(|e| e.to_string())
+                    }
+                }
+            };
+
+            match action_result {
+                Ok((action, credential_id, reason)) => {
+                    match action {
+                        CredentialImportAction::Added => summary.added += 1,
+                        CredentialImportAction::Skipped => summary.skipped += 1,
+                        CredentialImportAction::Merged => summary.merged += 1,
+                        CredentialImportAction::Replaced => summary.replaced += 1,
+                        CredentialImportAction::Invalid => summary.invalid += 1,
+                    }
+                    items.push(Self::credential_import_item(
+                        index,
+                        action,
+                        source_format.clone(),
+                        fingerprint,
+                        credential_id,
+                        reason,
+                        &credential,
+                        warnings,
+                    ));
+                }
+                Err(reason) => {
+                    summary.invalid += 1;
+                    items.push(Self::credential_import_item(
+                        index,
+                        CredentialImportAction::Invalid,
+                        source_format.clone(),
+                        fingerprint,
+                        None,
+                        Some(reason),
+                        &credential,
+                        warnings,
+                    ));
+                }
+            }
         }
 
-        // 实际添加凭据（trim + 空字符串转 None，与 set_region 逻辑一致）
-        let region = item
-            .region
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-        let api_region = item
-            .api_region
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-        let new_cred = KiroCredentials {
-            id: None,
-            access_token: None,
-            refresh_token: Some(refresh_token),
-            kiro_api_key: None,
-            profile_arn: None,
-            expires_at: None,
-            auth_method: Some(auth_method),
-            provider: item.provider,
-            user_id: None,
-            client_id: item.client_id,
-            client_secret: item.client_secret,
-            token_endpoint: None,
-            issuer_url: None,
-            scopes: None,
-            start_url: None,
-            client_id_hash: None,
-            id_token: None,
-            sso_session_id: None,
-            priority: item.priority,
-            weight: item.weight,
-            region,
-            auth_region: None,
-            api_region,
-            machine_id: item.machine_id,
-            endpoint: None,
-            email: None,
-            subscription_title: None,
-            overage_status: None,
-            legacy_allow_overage: false,
-            proxy_url: None,
-            proxy_username: None,
-            proxy_password: None,
-            disabled: false,
-            concurrency: None,
+        ImportCredentialsResponse { summary, items }
+    }
+
+    fn credential_import_item(
+        index: usize,
+        action: CredentialImportAction,
+        source_format: String,
+        fingerprint: String,
+        credential_id: Option<u64>,
+        reason: Option<String>,
+        credential: &KiroCredentials,
+        warnings: Vec<String>,
+    ) -> CredentialImportItem {
+        CredentialImportItem {
+            index,
+            action,
+            source_format,
+            fingerprint,
+            credential_id,
+            reason,
+            auth_method: credential.auth_method.clone(),
+            provider: credential.provider.clone(),
+            email: credential.email.clone(),
+            user_id: credential.user_id.clone(),
+            machine_id: credential.machine_id.clone(),
+            group_id: credential.group_id.clone(),
+            tag_links: credential.tag_links.clone(),
+            has_usage_data: credential.usage_data.is_some(),
+            has_available_models_cache: credential.available_models_cache.is_some(),
+            source_failure_count: credential.failure_count,
+            source_last_failure_at: credential.last_failure_at.clone(),
+            source_disabled_reason: credential.disabled_reason.clone(),
+            source_success_count: credential.success_count,
+            region: credential.region.clone(),
+            auth_region: credential.auth_region.clone(),
+            api_region: credential.api_region.clone(),
+            start_url: credential.start_url.clone(),
+            client_id_hash: credential.client_id_hash.clone(),
+            sso_session_id: credential.sso_session_id.clone(),
+            token_endpoint: credential.token_endpoint.clone(),
+            issuer_url: credential.issuer_url.clone(),
+            scopes: credential.scopes.clone(),
+            endpoint: credential.endpoint.clone(),
+            will_refresh: false,
+            has_profile_arn: Self::has_import_string(&credential.profile_arn),
+            has_token: Self::has_import_string(&credential.access_token),
+            has_refresh_token: Self::has_import_string(&credential.refresh_token),
+            has_client_id: Self::has_import_string(&credential.client_id),
+            has_client_secret: Self::has_import_string(&credential.client_secret),
+            has_id_token: Self::has_import_string(&credential.id_token),
+            has_api_key: Self::has_import_string(&credential.api_key),
+            has_proxy_credentials: Self::has_import_string(&credential.proxy_username)
+                || Self::has_import_string(&credential.proxy_password),
+            warnings,
+        }
+    }
+
+    fn parse_credential_import(
+        &self,
+        value: serde_json::Value,
+    ) -> Result<ParsedCredentialImport, String> {
+        if let Some(object) = value.as_object() {
+            if let Some(format) = Self::get_clean_string(object, &["format"]) {
+                if format != CREDENTIAL_BACKUP_FORMAT {
+                    return Err(format!("不支持的完整备份格式: {}", format));
+                }
+                let version = Self::get_u32(object, &["version"]).unwrap_or(0);
+                if version != CREDENTIAL_BACKUP_VERSION {
+                    return Err(format!("不支持的完整备份版本: {}", version));
+                }
+                let entries = object
+                    .get("credentials")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or_else(|| "xkiro.rs 完整备份缺少 credentials 数组".to_string())?;
+                let mut credentials = Vec::with_capacity(entries.len());
+                for entry in entries {
+                    let credential_value = entry.get("credential").unwrap_or(entry);
+                    let credential_object = credential_value
+                        .as_object()
+                        .ok_or_else(|| "xkiro.rs 完整备份 credential 必须是对象".to_string())?;
+                    credentials.push(Self::credential_from_import_object(
+                        credential_object,
+                        false,
+                    )?);
+                }
+                return Ok(ParsedCredentialImport {
+                    source_format: CREDENTIAL_BACKUP_FORMAT.to_string(),
+                    credentials,
+                });
+            }
+
+            if let Some(snapshot_items) = Self::credential_snapshot_items(object) {
+                let mut credentials = Vec::with_capacity(snapshot_items.len());
+                for snapshot_item in snapshot_items {
+                    let snapshot_item = snapshot_item
+                        .as_object()
+                        .ok_or_else(|| "凭据快照条目必须是对象".to_string())?;
+                    credentials.push(Self::credential_from_snapshot_item(snapshot_item)?);
+                }
+                return Ok(ParsedCredentialImport {
+                    source_format: SOURCE_FORMAT_CREDENTIAL_SNAPSHOT.to_string(),
+                    credentials,
+                });
+            }
+
+            if let Some(items) = object.get("items") {
+                return Self::parse_cached_credentials(items);
+            }
+
+            if Self::looks_like_cached_credential(object) {
+                return Self::parse_cached_credentials(&value);
+            }
+
+            return Ok(ParsedCredentialImport {
+                source_format: SOURCE_FORMAT_FLAT_CREDENTIAL.to_string(),
+                credentials: vec![Self::credential_from_import_object(object, false)?],
+            });
+        }
+
+        if let Some(array) = value.as_array() {
+            if array.iter().all(|item| {
+                item.as_object()
+                    .is_some_and(Self::looks_like_cached_credential)
+            }) {
+                return Self::parse_cached_credentials(&value);
+            }
+
+            let mut credentials = Vec::with_capacity(array.len());
+            for item in array {
+                let object = item
+                    .as_object()
+                    .ok_or_else(|| "凭据数组元素必须是对象".to_string())?;
+                credentials.push(Self::credential_from_import_object(object, false)?);
+            }
+            return Ok(ParsedCredentialImport {
+                source_format: SOURCE_FORMAT_FLAT_CREDENTIAL.to_string(),
+                credentials,
+            });
+        }
+
+        Err("导入内容必须是对象或数组".to_string())
+    }
+
+    fn credential_snapshot_items(
+        object: &serde_json::Map<String, serde_json::Value>,
+    ) -> Option<&Vec<serde_json::Value>> {
+        object
+            .get("credentials")
+            .and_then(serde_json::Value::as_array)
+            .or_else(|| object.get("accounts").and_then(serde_json::Value::as_array))
+    }
+
+    fn looks_like_cached_credential(object: &serde_json::Map<String, serde_json::Value>) -> bool {
+        if Self::get_value(object, &["refreshToken", "refresh_token"]).is_none() {
+            return false;
+        }
+        let cached_credential_keys = [
+            "provider",
+            "authMethod",
+            "auth_method",
+            "clientId",
+            "client_id",
+            "clientSecret",
+            "client_secret",
+            "priority",
+            "weight",
+            "region",
+            "apiRegion",
+            "api_region",
+            "machineId",
+            "machine_id",
+        ];
+        let full_credential_keys = [
+            "accessToken",
+            "access_token",
+            "profileArn",
+            "profile_arn",
+            "expiresAt",
+            "expires_at",
+            "tokenEndpoint",
+            "token_endpoint",
+            "issuerUrl",
+            "issuer_url",
+            "startUrl",
+            "start_url",
+            "idToken",
+            "id_token",
+            "ssoSessionId",
+            "sso_session_id",
+            "apiKey",
+            "api_key",
+            "kiroApiKey",
+            "kiro_api_key",
+            "proxyUrl",
+            "proxyURL",
+            "proxy_url",
+            "endpoint",
+            "concurrency",
+            "disabled",
+            "subscriptionTitle",
+            "subscription_title",
+            "usageData",
+            "usage_data",
+        ];
+        cached_credential_keys
+            .iter()
+            .any(|key| object.contains_key(*key))
+            && !full_credential_keys
+                .iter()
+                .any(|key| object.contains_key(*key))
+    }
+
+    fn parse_cached_credentials(
+        value: &serde_json::Value,
+    ) -> Result<ParsedCredentialImport, String> {
+        let item_values: Vec<&serde_json::Value> = if let Some(items) = value.as_array() {
+            items.iter().collect()
+        } else {
+            vec![value]
+        };
+        let mut credentials = Vec::with_capacity(item_values.len());
+        for item in item_values {
+            let object = item
+                .as_object()
+                .ok_or_else(|| "缓存凭据条目必须是对象".to_string())?;
+            credentials.push(Self::credential_from_cached_credential(object));
+        }
+        Ok(ParsedCredentialImport {
+            source_format: SOURCE_FORMAT_CACHED_CREDENTIAL.to_string(),
+            credentials,
+        })
+    }
+
+    fn credential_from_cached_credential(
+        object: &serde_json::Map<String, serde_json::Value>,
+    ) -> KiroCredentials {
+        let mut credential = Self::credential_from_normalized_import_object(object, false);
+        if credential.auth_method.is_none()
+            && let Some(provider) = credential.provider.as_deref()
+            && let Some(auth_method) = Self::canonical_explicit_auth_method(Some(provider), false)
+        {
+            credential.auth_method = Some(auth_method);
+        }
+        credential
+    }
+
+    fn credential_from_snapshot_item(
+        snapshot_item: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<KiroCredentials, String> {
+        let numeric_expires_at_is_millis = snapshot_item
+            .get("credentials")
+            .and_then(serde_json::Value::as_object)
+            .is_some();
+        Self::credential_from_import_object(snapshot_item, numeric_expires_at_is_millis)
+    }
+
+    fn credential_from_import_object(
+        object: &serde_json::Map<String, serde_json::Value>,
+        numeric_expires_at_is_millis: bool,
+    ) -> Result<KiroCredentials, String> {
+        let mut merged = if let Some(credentials) = object
+            .get("credentials")
+            .and_then(serde_json::Value::as_object)
+        {
+            let mut merged = credentials.clone();
+            for (key, value) in object {
+                if key == "credentials" {
+                    continue;
+                }
+                merged.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+            merged
+        } else {
+            object.clone()
         };
 
-        match self.token_manager.add_credential(new_cred).await {
-            Ok(credential_id) => ImportItemResult {
-                index,
-                fingerprint,
-                action: ImportAction::Added,
-                reason: None,
-                credential_id: Some(credential_id),
-            },
-            Err(e) => ImportItemResult {
-                index,
-                fingerprint,
-                action: ImportAction::Invalid,
-                reason: Some(e.to_string()),
-                credential_id: None,
-            },
+        if let Some(value) = object.get("idp") {
+            merged
+                .entry("provider".to_string())
+                .or_insert_with(|| value.clone());
         }
-    }
-
-    /// 生成凭据指纹（用于识别）
-    ///
-    /// 使用 refreshToken 前 16 字符作为指纹，floor_char_boundary 安全截断
-    fn generate_fingerprint(item: &TokenJsonItem) -> String {
-        item.refresh_token
-            .as_ref()
-            .map(|rt| {
-                if rt.len() >= 16 {
-                    let end = floor_char_boundary(rt, 16);
-                    format!("{}...", &rt[..end])
-                } else {
-                    rt.clone()
+        if let Some(subscription) = object
+            .get("subscription")
+            .and_then(serde_json::Value::as_object)
+        {
+            if let Some(title) = subscription.get("title") {
+                merged
+                    .entry("subscriptionTitle".to_string())
+                    .or_insert_with(|| title.clone());
+            }
+            if let Some(subscription_type) = subscription.get("type") {
+                merged
+                    .entry("subscriptionType".to_string())
+                    .or_insert_with(|| subscription_type.clone());
+            }
+        }
+        if let Some(usage) = object.get("usage").and_then(serde_json::Value::as_object) {
+            for (target, source) in [
+                ("usageCurrent", "current"),
+                ("usageLimit", "limit"),
+                ("usagePercent", "percentUsed"),
+                ("lastRefresh", "lastUpdated"),
+            ] {
+                if let Some(value) = usage.get(source) {
+                    merged
+                        .entry(target.to_string())
+                        .or_insert_with(|| value.clone());
                 }
-            })
-            .unwrap_or_else(|| "(empty)".to_string())
+            }
+        }
+        Ok(Self::credential_from_normalized_import_object(
+            &merged,
+            numeric_expires_at_is_millis,
+        ))
     }
 
-    /// 映射 provider/authMethod 到标准 authMethod
-    ///
-    /// 优先级：authMethod > provider > 默认 social
-    fn map_auth_method(item: &TokenJsonItem) -> String {
-        // 优先使用 authMethod 字段
-        if let Some(auth) = &item.auth_method {
-            let auth_lower = auth.to_lowercase();
-            return match auth_lower.as_str() {
-                "idc" | "builder-id" | "builderid" => "idc".to_string(),
-                "social" => "social".to_string(),
-                _ => auth_lower,
-            };
+    fn credential_from_normalized_import_object(
+        object: &serde_json::Map<String, serde_json::Value>,
+        numeric_expires_at_is_millis: bool,
+    ) -> KiroCredentials {
+        let mut credential = KiroCredentials {
+            id: Self::get_u64(object, &["id"]),
+            access_token: Self::get_clean_string(object, &["accessToken", "access_token"]),
+            refresh_token: Self::get_clean_string(object, &["refreshToken", "refresh_token"]),
+            profile_arn: Self::get_clean_string(object, &["profileArn", "profile_arn"]),
+            expires_at: Self::parse_import_expires_at(
+                Self::get_value(object, &["expiresAt", "expires_at"]),
+                numeric_expires_at_is_millis,
+            ),
+            auth_method: Self::get_clean_string(object, &["authMethod", "auth_method"]),
+            provider: Self::get_clean_string(object, &["provider", "idp"]),
+            user_id: Self::get_clean_string(object, &["userId", "user_id"]),
+            client_id: Self::get_clean_string(object, &["clientId", "client_id"]),
+            client_secret: Self::get_clean_string(object, &["clientSecret", "client_secret"]),
+            token_endpoint: Self::get_clean_string(object, &["tokenEndpoint", "token_endpoint"]),
+            issuer_url: Self::get_clean_string(object, &["issuerUrl", "issuer_url"]),
+            scopes: Self::get_clean_string(object, &["scopes"]),
+            start_url: Self::get_clean_string(object, &["startUrl", "start_url"]),
+            client_id_hash: Self::get_clean_string(object, &["clientIdHash", "client_id_hash"]),
+            id_token: Self::get_clean_string(object, &["idToken", "id_token"]),
+            sso_session_id: Self::get_clean_string(object, &["ssoSessionId", "sso_session_id"]),
+            priority: Self::get_u32(object, &["priority"]).unwrap_or_default(),
+            weight: Self::get_u32(object, &["weight"]).unwrap_or_default(),
+            concurrency: Self::get_u32(object, &["concurrency"]),
+            region: Self::get_clean_string(object, &["region"]),
+            auth_region: Self::get_clean_string(object, &["authRegion", "auth_region"]),
+            api_region: Self::get_clean_string(object, &["apiRegion", "api_region"]),
+            machine_id: Self::get_clean_string(object, &["machineId", "machine_id"]),
+            email: Self::get_clean_string(object, &["email"]),
+            source_account_id: Self::get_import_source_id(object),
+            label: Self::get_clean_string(object, &["label"]),
+            status: Self::get_clean_string(object, &["status"]),
+            added_at: Self::get_clean_string(object, &["addedAt", "added_at"]),
+            password: Self::get_clean_string(object, &["password"]),
+            subscription_title: Self::get_clean_string(
+                object,
+                &["subscriptionTitle", "subscription_title"],
+            ),
+            overage_status: Self::get_clean_string(object, &["overageStatus", "overage_status"]),
+            usage_data: Self::get_cloned_non_null_value(object, &["usageData", "usage_data"]),
+            group_id: Self::get_clean_string(object, &["groupId", "group_id"]),
+            tag_links: Self::get_cloned_non_null_value(object, &["tagLinks", "tag_links"]),
+            available_models_cache: Self::get_cloned_non_null_value(
+                object,
+                &["availableModelsCache", "available_models_cache"],
+            ),
+            failure_count: Self::get_u32(object, &["failureCount", "failure_count"]),
+            last_failure_at: Self::get_clean_string(object, &["lastFailureAt", "last_failure_at"]),
+            disabled_reason: Self::get_clean_string(object, &["disabledReason", "disabled_reason"]),
+            success_count: Self::get_u64(object, &["successCount", "success_count"]),
+            csrf_token: Self::get_clean_string(object, &["csrfToken", "csrf_token"]),
+            nickname: Self::get_clean_string(object, &["nickname"]),
+            ban_status: Self::get_clean_string(object, &["banStatus", "ban_status"]),
+            ban_reason: Self::get_clean_string(object, &["banReason", "ban_reason"]),
+            ban_time: Self::get_i64(object, &["banTime", "ban_time"]),
+            subscription_type: Self::get_clean_string(
+                object,
+                &["subscriptionType", "subscription_type"],
+            ),
+            days_remaining: Self::get_i64(object, &["daysRemaining", "days_remaining"]),
+            usage_current: Self::get_f64(object, &["usageCurrent", "usage_current"]),
+            usage_limit: Self::get_f64(object, &["usageLimit", "usage_limit"]),
+            usage_percent: Self::get_f64(object, &["usagePercent", "usage_percent"]),
+            next_reset_date: Self::get_clean_string(object, &["nextResetDate", "next_reset_date"]),
+            last_refresh: Self::get_i64(object, &["lastRefresh", "last_refresh"]),
+            trial_usage_current: Self::get_f64(
+                object,
+                &["trialUsageCurrent", "trial_usage_current"],
+            ),
+            trial_usage_limit: Self::get_f64(object, &["trialUsageLimit", "trial_usage_limit"]),
+            trial_usage_percent: Self::get_f64(
+                object,
+                &["trialUsagePercent", "trial_usage_percent"],
+            ),
+            trial_status: Self::get_clean_string(object, &["trialStatus", "trial_status"]),
+            trial_expires_at: Self::get_i64(object, &["trialExpiresAt", "trial_expires_at"]),
+            overage_capability: Self::get_clean_string(
+                object,
+                &["overageCapability", "overage_capability"],
+            ),
+            overage_cap: Self::get_f64(object, &["overageCap", "overage_cap"]),
+            overage_rate: Self::get_f64(object, &["overageRate", "overage_rate"]),
+            current_overages: Self::get_f64(object, &["currentOverages", "current_overages"]),
+            overage_checked_at: Self::get_i64(object, &["overageCheckedAt", "overage_checked_at"]),
+            request_count: Self::get_u64(object, &["requestCount", "request_count"]),
+            error_count: Self::get_u64(object, &["errorCount", "error_count"]),
+            total_tokens: Self::get_u64(object, &["totalTokens", "total_tokens"]),
+            total_credits: Self::get_f64(object, &["totalCredits", "total_credits"]),
+            last_used_at: Self::get_i64(object, &["lastUsedAt", "last_used_at", "lastUsed"]),
+            created_at: Self::get_i64(object, &["createdAt", "created_at"]),
+            tags: Self::get_cloned_non_null_value(object, &["tags"]),
+            allow_overage_import: false,
+            proxy_url: Self::get_clean_string(object, &["proxyUrl", "proxyURL", "proxy_url"]),
+            proxy_username: Self::get_clean_string(object, &["proxyUsername", "proxy_username"]),
+            proxy_password: Self::get_clean_string(object, &["proxyPassword", "proxy_password"]),
+            proxy_id: Self::get_u64(object, &["proxyId", "proxy_id"]),
+            disabled: Self::get_bool(object, &["disabled"]).unwrap_or_else(|| {
+                Self::get_bool(object, &["enabled"])
+                    .map(|enabled| !enabled)
+                    .unwrap_or(false)
+            }),
+            api_key: Self::get_clean_string(
+                object,
+                &["apiKey", "api_key", "kiroApiKey", "kiro_api_key"],
+            ),
+            endpoint: Self::get_clean_string(object, &["endpoint"]),
+            ..Default::default()
+        };
+
+        if credential.proxy_url.is_none()
+            && let Some(proxy_config) = object
+                .get("proxyConfig")
+                .or_else(|| object.get("proxy_config"))
+                .and_then(serde_json::Value::as_object)
+        {
+            let (proxy_url, username, password) = Self::proxy_from_source_config(proxy_config);
+            credential.proxy_url = proxy_url;
+            credential.proxy_username = credential.proxy_username.or(username);
+            credential.proxy_password = credential.proxy_password.or(password);
+        }
+        if credential.overage_status.is_none()
+            && Self::get_bool(object, &["allowOverage"]).unwrap_or(false)
+        {
+            credential.overage_status = Some("ENABLED".to_string());
+        }
+        credential
+    }
+
+    fn normalize_imported_credential(
+        &self,
+        mut credential: KiroCredentials,
+    ) -> Result<KiroCredentials, String> {
+        Self::clean_import_credential_strings(&mut credential);
+        let derived_external_idp = kiro_sso::derive_external_idp_endpoints(
+            credential.user_id.as_deref().unwrap_or_default(),
+            credential.client_id.as_deref().unwrap_or_default(),
+            credential.access_token.as_deref().unwrap_or_default(),
+        );
+        let mut auth_method = Self::normalize_import_auth_method(
+            credential.auth_method.as_deref(),
+            credential.provider.as_deref(),
+            credential.client_id.as_deref(),
+            credential.client_secret.as_deref(),
+            credential.token_endpoint.as_deref(),
+            credential.api_key.as_deref(),
+        );
+        if let Some((derived_endpoint, _, _)) = derived_external_idp.as_ref()
+            && kiro_sso::validate_external_idp_endpoint(derived_endpoint).is_ok()
+            && auth_method != "external_idp"
+        {
+            auth_method = "external_idp".to_string();
+        }
+        credential.auth_method = Some(auth_method.clone());
+        if credential.provider.is_none() {
+            credential.provider = Self::infer_import_provider(&credential, &auth_method);
+        }
+        credential.provider =
+            Self::normalize_provider_for_auth_method(credential.provider.take(), &auth_method);
+        if auth_method == "idc" {
+            Self::normalize_import_idc_metadata(&mut credential)?;
+        }
+        if auth_method == "external_idp" {
+            if let Some((token_endpoint, issuer_url, scopes)) = derived_external_idp {
+                if credential.token_endpoint.is_none() {
+                    credential.token_endpoint = Some(token_endpoint);
+                }
+                if credential.issuer_url.is_none() {
+                    credential.issuer_url = Some(issuer_url);
+                }
+                if credential.scopes.is_none() {
+                    credential.scopes = Some(scopes);
+                }
+            }
+            if credential.client_id.is_none() || credential.token_endpoint.is_none() {
+                return Err(
+                    "external_idp requires clientId and tokenEndpoint (or userId/accessToken to derive it)"
+                        .to_string(),
+                );
+            }
+            if let Some(endpoint) = credential.token_endpoint.as_deref() {
+                kiro_sso::validate_external_idp_endpoint(endpoint)
+                    .map_err(|e| format!("external IdP endpoint rejected: {}", e))?;
+            }
+            if let Some(issuer) = credential.issuer_url.as_deref() {
+                kiro_sso::validate_external_idp_endpoint(issuer)
+                    .map_err(|e| format!("external IdP issuer rejected: {}", e))?;
+            }
+            if credential.expires_at.is_none()
+                && let Some(access_token) = credential.access_token.as_deref()
+                && let Some(exp) = kiro_sso::exp_from_access_token_jwt(access_token)
+                && let Some(expires_at) = chrono::DateTime::<Utc>::from_timestamp(exp, 0)
+            {
+                credential.expires_at = Some(expires_at.to_rfc3339());
+            }
+        }
+        if let Some(endpoint) = credential.endpoint.as_deref()
+            && !self.known_endpoints.contains(endpoint)
+        {
+            let mut known: Vec<&str> = self.known_endpoints.iter().map(String::as_str).collect();
+            known.sort();
+            return Err(format!(
+                "未知端点 \"{}\"，已注册端点: {:?}",
+                endpoint, known
+            ));
+        }
+        if credential.concurrency == Some(0) {
+            return Err("concurrency 必须 >= 1".to_string());
+        }
+        credential.machine_id = machine_id::normalize_optional_machine_id(credential.machine_id);
+        credential.canonicalize_auth_method();
+        Ok(credential)
+    }
+
+    fn clean_import_credential_strings(credential: &mut KiroCredentials) {
+        credential.access_token = Self::clean_import_string(credential.access_token.take());
+        credential.refresh_token = Self::clean_import_string(credential.refresh_token.take());
+        credential.profile_arn = Self::clean_import_string(credential.profile_arn.take());
+        credential.expires_at = Self::clean_import_string(credential.expires_at.take());
+        credential.auth_method = Self::clean_import_string(credential.auth_method.take());
+        credential.provider = Self::clean_import_string(credential.provider.take());
+        credential.user_id = Self::clean_import_string(credential.user_id.take());
+        credential.client_id = Self::clean_import_string(credential.client_id.take());
+        credential.client_secret = Self::clean_import_string(credential.client_secret.take());
+        credential.token_endpoint = Self::clean_import_string(credential.token_endpoint.take());
+        credential.issuer_url = Self::clean_import_string(credential.issuer_url.take());
+        credential.scopes = Self::clean_import_string(credential.scopes.take());
+        credential.start_url = Self::clean_import_string(credential.start_url.take());
+        credential.client_id_hash = Self::clean_import_string(credential.client_id_hash.take());
+        credential.id_token = Self::clean_import_string(credential.id_token.take());
+        credential.sso_session_id = Self::clean_import_string(credential.sso_session_id.take());
+        credential.region = Self::clean_import_string(credential.region.take());
+        credential.auth_region = Self::clean_import_string(credential.auth_region.take());
+        credential.api_region = Self::clean_import_string(credential.api_region.take());
+        credential.machine_id = Self::clean_import_string(credential.machine_id.take());
+        credential.email = Self::clean_import_string(credential.email.take());
+        credential.source_account_id =
+            Self::clean_import_string(credential.source_account_id.take());
+        credential.label = Self::clean_import_string(credential.label.take());
+        credential.status = Self::clean_import_string(credential.status.take());
+        credential.added_at = Self::clean_import_string(credential.added_at.take());
+        credential.password = Self::clean_import_string(credential.password.take());
+        credential.subscription_title =
+            Self::clean_import_string(credential.subscription_title.take());
+        credential.overage_status = Self::clean_import_string(credential.overage_status.take());
+        credential.group_id = Self::clean_import_string(credential.group_id.take());
+        credential.last_failure_at = Self::clean_import_string(credential.last_failure_at.take());
+        credential.disabled_reason = Self::clean_import_string(credential.disabled_reason.take());
+        credential.csrf_token = Self::clean_import_string(credential.csrf_token.take());
+        credential.nickname = Self::clean_import_string(credential.nickname.take());
+        credential.ban_status = Self::clean_import_string(credential.ban_status.take());
+        credential.ban_reason = Self::clean_import_string(credential.ban_reason.take());
+        credential.subscription_type =
+            Self::clean_import_string(credential.subscription_type.take());
+        credential.next_reset_date = Self::clean_import_string(credential.next_reset_date.take());
+        credential.trial_status = Self::clean_import_string(credential.trial_status.take());
+        credential.overage_capability =
+            Self::clean_import_string(credential.overage_capability.take());
+        credential.proxy_url = Self::clean_import_string(credential.proxy_url.take());
+        credential.proxy_username = Self::clean_import_string(credential.proxy_username.take());
+        credential.proxy_password = Self::clean_import_string(credential.proxy_password.take());
+        credential.api_key = Self::clean_import_string(credential.api_key.take());
+        credential.endpoint = Self::clean_import_string(credential.endpoint.take());
+    }
+
+    fn normalize_import_auth_method(
+        auth_method: Option<&str>,
+        provider: Option<&str>,
+        client_id: Option<&str>,
+        client_secret: Option<&str>,
+        token_endpoint: Option<&str>,
+        api_key: Option<&str>,
+    ) -> String {
+        if api_key.is_some() {
+            return "api_key".to_string();
+        }
+        let method_is_empty = auth_method
+            .map(str::trim)
+            .filter(|method| !method.is_empty())
+            .is_none();
+        let explicit = Self::canonical_explicit_auth_method(auth_method, true);
+        let provider_implies_external_idp = Self::is_external_idp_provider_alias_option(provider);
+        if explicit.as_deref() == Some("api_key") {
+            "api_key".to_string()
+        } else if explicit.as_deref() == Some("external_idp") || token_endpoint.is_some() {
+            "external_idp".to_string()
+        } else if let Some(method @ ("social" | "idc")) = explicit.as_deref() {
+            method.to_string()
+        } else if method_is_empty && provider_implies_external_idp {
+            "external_idp".to_string()
+        } else if method_is_empty && client_id.is_some() {
+            "idc".to_string()
+        } else if method_is_empty {
+            "social".to_string()
+        } else if client_id.is_some() && client_secret.is_some() {
+            "idc".to_string()
+        } else {
+            "social".to_string()
+        }
+    }
+
+    fn infer_import_provider(credential: &KiroCredentials, auth_method: &str) -> Option<String> {
+        match auth_method {
+            "external_idp" => Some("AzureAD".to_string()),
+            "idc" => {
+                if let Some(start_url) = credential.start_url.as_deref() {
+                    Some(Self::idc_provider_for_start_url(start_url).to_string())
+                } else {
+                    Some("BuilderId".to_string())
+                }
+            }
+            "social" => {
+                if let Some(email) = credential.email.as_deref() {
+                    let email = email.to_ascii_lowercase();
+                    if email.contains("github") {
+                        return Some("GitHub".to_string());
+                    }
+                    if email.contains("gmail") || email.contains("google") {
+                        return Some("Google".to_string());
+                    }
+                }
+                Some("Google".to_string())
+            }
+            _ => None,
+        }
+    }
+
+    fn normalize_import_idc_metadata(credential: &mut KiroCredentials) -> Result<(), String> {
+        credential.start_url = credential
+            .start_url
+            .take()
+            .map(|value| Self::normalize_start_url(&value))
+            .filter(|value| !value.is_empty());
+
+        if credential.start_url.is_none()
+            && let Some(start_url) = credential
+                .client_secret
+                .as_deref()
+                .and_then(Self::extract_start_url_from_client_secret)
+        {
+            credential.start_url = Some(start_url);
         }
 
-        // 回退到 provider 字段
-        if let Some(provider) = &item.provider {
-            let provider_lower = provider.to_lowercase();
-            return match provider_lower.as_str() {
-                "builderid" | "builder-id" | "idc" => "idc".to_string(),
-                "social" => "social".to_string(),
-                _ => "social".to_string(),
-            };
+        let provider = Self::canonical_idc_provider(
+            credential.provider.as_deref(),
+            credential.start_url.as_deref(),
+        );
+        credential.provider = Some(provider.to_string());
+        credential.client_id_hash = Some(Self::resolve_idc_client_id_hash(
+            provider,
+            credential.client_id_hash.as_deref(),
+            credential.start_url.as_deref(),
+        )?);
+        Ok(())
+    }
+
+    fn canonical_idc_provider(provider: Option<&str>, start_url: Option<&str>) -> &'static str {
+        if let Some(start_url) = start_url
+            && Self::idc_provider_for_start_url(start_url) == "Enterprise"
+        {
+            return "Enterprise";
         }
 
-        // 默认 social
-        "social".to_string()
+        match provider
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "enterprise" | "iam" | "identitycenter" | "identity-center" | "identity_center"
+            | "aws-sso" | "aws_sso" => "Enterprise",
+            _ => "BuilderId",
+        }
+    }
+
+    fn resolve_idc_client_id_hash(
+        provider: &str,
+        client_id_hash: Option<&str>,
+        start_url: Option<&str>,
+    ) -> Result<String, String> {
+        let hash = if let Some(hash) = client_id_hash
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            hash.to_string()
+        } else {
+            match provider {
+                "BuilderId" => start_url
+                    .map(Self::calculate_client_id_hash)
+                    .unwrap_or_else(|| KIRO_BUILDER_ID_CLIENT_ID_HASH.to_string()),
+                "Enterprise" => {
+                    let start_url = start_url
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .ok_or("Enterprise 凭据必须提供 startUrl 或 clientIdHash")?;
+                    Self::calculate_client_id_hash(start_url)
+                }
+                other => return Err(format!("未知的 IAM Identity Center provider: {}", other)),
+            }
+        };
+
+        if provider == "Enterprise" && hash.eq_ignore_ascii_case(KIRO_BUILDER_ID_CLIENT_ID_HASH) {
+            return Err(
+                "Enterprise 凭据不能使用 BuilderId 默认 clientIdHash，请检查 startUrl/clientIdHash"
+                    .to_string(),
+            );
+        }
+        Ok(hash)
+    }
+
+    fn normalize_start_url(start_url: &str) -> String {
+        start_url.trim().trim_end_matches('/').to_string()
+    }
+
+    fn calculate_client_id_hash(start_url: &str) -> String {
+        let normalized = Self::normalize_start_url(start_url);
+        let input = serde_json::json!({ "startUrl": normalized }).to_string();
+        let mut hasher = sha1_smol::Sha1::new();
+        hasher.update(input.as_bytes());
+        hasher.digest().to_string()
+    }
+
+    fn extract_start_url_from_client_secret(client_secret: &str) -> Option<String> {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+        let payload = client_secret.split('.').nth(1)?;
+        let decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;
+        let payload_json: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+        let serialized = payload_json.get("serialized")?.as_str()?;
+        let serialized_json: serde_json::Value = serde_json::from_str(serialized).ok()?;
+        serialized_json
+            .get("initiateLoginUri")?
+            .as_str()
+            .map(Self::normalize_start_url)
+            .filter(|value| !value.is_empty())
+    }
+
+    fn credential_import_warnings(
+        &self,
+        credential: &KiroCredentials,
+        existing_credentials: &[KiroCredentials],
+    ) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if let Some(machine_id) = credential
+            .machine_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let incoming_id = credential.id;
+            if existing_credentials.iter().any(|existing| {
+                existing.id != incoming_id
+                    && existing
+                        .machine_id
+                        .as_deref()
+                        .map(str::trim)
+                        .map(|value| value.eq_ignore_ascii_case(machine_id))
+                        .unwrap_or(false)
+            }) {
+                warnings.push("machineId 与已有凭据重复，默认保留以便真实机器模拟".to_string());
+            }
+        }
+        warnings
+    }
+
+    fn find_existing_import_match(
+        credential: &KiroCredentials,
+        existing_credentials: &[KiroCredentials],
+    ) -> Option<ExistingCredentialMatch> {
+        if let Some(id) = credential.id.filter(|id| *id > 0)
+            && existing_credentials
+                .iter()
+                .any(|existing| existing.id == Some(id))
+        {
+            return Some(ExistingCredentialMatch {
+                id,
+                reason: "id 已存在".to_string(),
+            });
+        }
+
+        if let Some(api_key) = credential
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            && let Some(existing) = existing_credentials.iter().find(|existing| {
+                existing
+                    .api_key
+                    .as_deref()
+                    .map(str::trim)
+                    .map(|value| value == api_key)
+                    .unwrap_or(false)
+            })
+            && let Some(id) = existing.id
+        {
+            return Some(ExistingCredentialMatch {
+                id,
+                reason: "apiKey 已存在".to_string(),
+            });
+        }
+
+        if let Some(refresh_token) = credential
+            .refresh_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            && let Some(existing) = existing_credentials.iter().find(|existing| {
+                existing
+                    .refresh_token
+                    .as_deref()
+                    .map(str::trim)
+                    .map(|value| value == refresh_token)
+                    .unwrap_or(false)
+            })
+            && let Some(id) = existing.id
+        {
+            return Some(ExistingCredentialMatch {
+                id,
+                reason: "refreshToken 已存在".to_string(),
+            });
+        }
+
+        if let Some(user_id) = credential
+            .user_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            && let Some(existing) = existing_credentials.iter().find(|existing| {
+                existing
+                    .user_id
+                    .as_deref()
+                    .map(str::trim)
+                    .map(|value| value == user_id)
+                    .unwrap_or(false)
+            })
+            && let Some(id) = existing.id
+        {
+            return Some(ExistingCredentialMatch {
+                id,
+                reason: "userId 已存在".to_string(),
+            });
+        }
+
+        if Self::imported_credential_is_social(credential)
+            && let Some(email) = credential
+                .email
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            && let Some(existing) = existing_credentials.iter().find(|existing| {
+                Self::imported_credential_is_social(existing)
+                    && existing
+                        .email
+                        .as_deref()
+                        .map(str::trim)
+                        .map(|value| value.eq_ignore_ascii_case(email))
+                        .unwrap_or(false)
+                    && Self::provider_matches(
+                        credential.provider.as_deref(),
+                        existing.provider.as_deref(),
+                    )
+            })
+            && let Some(id) = existing.id
+        {
+            return Some(ExistingCredentialMatch {
+                id,
+                reason: "social provider + email 已存在".to_string(),
+            });
+        }
+
+        None
+    }
+
+    fn imported_credential_is_social(credential: &KiroCredentials) -> bool {
+        credential
+            .canonical_auth_method()
+            .is_some_and(|method| method == "social")
+            || matches!(
+                Self::normalize_provider_for_match(credential.provider.as_deref(), "social")
+                    .as_deref(),
+                Some("Google") | Some("GitHub")
+            )
+    }
+
+    fn provider_matches(left: Option<&str>, right: Option<&str>) -> bool {
+        match (left, right) {
+            (Some(left), Some(right)) => {
+                let left = Self::normalize_provider_for_match(Some(left), "social");
+                let right = Self::normalize_provider_for_match(Some(right), "social");
+                left.as_deref()
+                    .zip(right.as_deref())
+                    .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right))
+            }
+            _ => true,
+        }
+    }
+
+    fn normalize_provider_for_match(provider: Option<&str>, auth_method: &str) -> Option<String> {
+        KiroCredentials::normalize_provider_for_auth_method(
+            provider.map(str::to_string),
+            auth_method,
+        )
+    }
+
+    fn credential_import_fingerprint(credential: &KiroCredentials) -> String {
+        if let Some(email) = credential.email.as_deref() {
+            return email.to_string();
+        }
+        if let Some(user_id) = credential.user_id.as_deref() {
+            return user_id.to_string();
+        }
+        if let Some(refresh_token) = credential.refresh_token.as_deref() {
+            let end = floor_char_boundary(refresh_token, refresh_token.len().min(16));
+            return format!("{}...", &refresh_token[..end]);
+        }
+        if let Some(api_key) = credential.api_key.as_deref() {
+            let end = floor_char_boundary(api_key, api_key.len().min(10));
+            return format!("{}...", &api_key[..end]);
+        }
+        credential
+            .id
+            .map(|id| format!("id:{}", id))
+            .unwrap_or_else(|| "(unknown)".to_string())
+    }
+
+    fn get_value<'a>(
+        object: &'a serde_json::Map<String, serde_json::Value>,
+        keys: &[&str],
+    ) -> Option<&'a serde_json::Value> {
+        keys.iter().find_map(|key| object.get(*key))
+    }
+
+    fn get_clean_string(
+        object: &serde_json::Map<String, serde_json::Value>,
+        keys: &[&str],
+    ) -> Option<String> {
+        Self::get_value(object, keys).and_then(|value| match value {
+            serde_json::Value::String(value) => {
+                let value = value.trim();
+                (!value.is_empty()).then(|| value.to_string())
+            }
+            serde_json::Value::Number(value) => Some(value.to_string()),
+            _ => None,
+        })
+    }
+
+    fn get_cloned_non_null_value(
+        object: &serde_json::Map<String, serde_json::Value>,
+        keys: &[&str],
+    ) -> Option<serde_json::Value> {
+        Self::get_value(object, keys)
+            .filter(|value| !value.is_null())
+            .cloned()
+    }
+
+    fn get_import_source_id(object: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+        if let Some(value) =
+            Self::get_clean_string(object, &["sourceAccountId", "source_account_id"])
+        {
+            return Some(value);
+        }
+
+        match object.get("id") {
+            Some(serde_json::Value::String(value)) => {
+                let value = value.trim();
+                (!value.is_empty() && value.parse::<u64>().is_err()).then(|| value.to_string())
+            }
+            _ => None,
+        }
+    }
+
+    fn get_bool(
+        object: &serde_json::Map<String, serde_json::Value>,
+        keys: &[&str],
+    ) -> Option<bool> {
+        Self::get_value(object, keys).and_then(|value| match value {
+            serde_json::Value::Bool(value) => Some(*value),
+            serde_json::Value::String(value) => match value.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" | "y" => Some(true),
+                "false" | "0" | "no" | "n" => Some(false),
+                _ => None,
+            },
+            _ => None,
+        })
+    }
+
+    fn get_u32(object: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> Option<u32> {
+        Self::get_value(object, keys).and_then(|value| match value {
+            serde_json::Value::Number(value) => value.as_u64().and_then(|v| u32::try_from(v).ok()),
+            serde_json::Value::String(value) => value.trim().parse::<u32>().ok(),
+            _ => None,
+        })
+    }
+
+    fn get_u64(object: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> Option<u64> {
+        Self::get_value(object, keys).and_then(|value| match value {
+            serde_json::Value::Number(value) => value.as_u64(),
+            serde_json::Value::String(value) => value.trim().parse::<u64>().ok(),
+            _ => None,
+        })
+    }
+
+    fn get_i64(object: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> Option<i64> {
+        Self::get_value(object, keys).and_then(|value| match value {
+            serde_json::Value::Number(value) => value
+                .as_i64()
+                .or_else(|| value.as_u64().and_then(|v| i64::try_from(v).ok())),
+            serde_json::Value::String(value) => value.trim().parse::<i64>().ok(),
+            _ => None,
+        })
+    }
+
+    fn get_f64(object: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> Option<f64> {
+        Self::get_value(object, keys).and_then(|value| match value {
+            serde_json::Value::Number(value) => value.as_f64(),
+            serde_json::Value::String(value) => value.trim().parse::<f64>().ok(),
+            _ => None,
+        })
+    }
+
+    fn parse_import_expires_at(
+        value: Option<&serde_json::Value>,
+        numeric_is_millis: bool,
+    ) -> Option<String> {
+        match value? {
+            serde_json::Value::String(value) => {
+                let value = value.trim();
+                if value.is_empty() {
+                    None
+                } else if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(value) {
+                    Some(dt.with_timezone(&Utc).to_rfc3339())
+                } else {
+                    Some(value.to_string())
+                }
+            }
+            serde_json::Value::Number(value) => {
+                let raw = value
+                    .as_i64()
+                    .or_else(|| value.as_u64().and_then(|v| i64::try_from(v).ok()))?;
+                let use_millis = numeric_is_millis || raw.abs() >= 1_000_000_000_000;
+                if use_millis {
+                    let seconds = raw.div_euclid(1000);
+                    let nanos = (raw.rem_euclid(1000) as u32) * 1_000_000;
+                    chrono::DateTime::<Utc>::from_timestamp(seconds, nanos)
+                        .map(|dt| dt.to_rfc3339())
+                } else {
+                    chrono::DateTime::<Utc>::from_timestamp(raw, 0).map(|dt| dt.to_rfc3339())
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn proxy_from_source_config(
+        object: &serde_json::Map<String, serde_json::Value>,
+    ) -> (Option<String>, Option<String>, Option<String>) {
+        if !Self::get_bool(object, &["enabled"]).unwrap_or(false) {
+            return (None, None, None);
+        }
+        let host = match Self::get_clean_string(object, &["host"]) {
+            Some(host) => host,
+            None => return (None, None, None),
+        };
+        let port = match Self::get_u32(object, &["port"]) {
+            Some(port) if port > 0 => port,
+            _ => return (None, None, None),
+        };
+        let protocol = Self::get_clean_string(object, &["protocol"])
+            .unwrap_or_else(|| "http".to_string())
+            .to_ascii_lowercase();
+        let proxy_url = Some(format!("{}://{}:{}", protocol, host, port));
+        let username = Self::get_clean_string(object, &["username"]);
+        let password = Self::get_clean_string(object, &["password"]);
+        (proxy_url, username, password)
     }
 }
 
@@ -2852,22 +5008,96 @@ impl CreditUsageObserver for AdminService {
 }
 
 impl AdminService {
-    // ── Social OAuth 登录 ────────────────────────────────────────────────────
+    // ── 社交 OAuth 登录 ────────────────────────────────────────────────────
+
+    fn social_profile_arn_or_default(profile_arn: Option<String>) -> String {
+        profile_arn
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| KIRO_SOCIAL_PROFILE_ARN.to_string())
+    }
+
+    async fn enrich_social_login_credential(
+        &self,
+        credential: &mut KiroCredentials,
+        proxy: Option<&ProxyConfig>,
+    ) -> Result<(), AdminServiceError> {
+        let access_token = credential
+            .access_token
+            .as_deref()
+            .ok_or_else(|| {
+                AdminServiceError::InvalidCredential("社交登录缺少 accessToken".to_string())
+            })?
+            .to_string();
+        let config = self.token_manager.config();
+        let usage = get_usage_limits(credential, &config, &access_token, proxy, true)
+            .await
+            .map_err(|e| {
+                AdminServiceError::InternalError(format!("社交登录后获取身份信息失败: {}", e))
+            })?;
+
+        if let Some(user_id) = usage
+            .user_info
+            .as_ref()
+            .and_then(|user| user.user_id.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            credential.user_id = Some(user_id.to_string());
+        }
+
+        if credential
+            .email
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_none()
+            && let Some(email) = usage
+                .user_info
+                .as_ref()
+                .and_then(|user| user.email.as_deref())
+                .or(usage.email.as_deref())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        {
+            credential.email = Some(email.to_string());
+        }
+
+        credential.subscription_title = usage.subscription_title().map(str::to_string);
+        credential.overage_status = usage.overage_status().map(str::to_string);
+
+        match crate::kiro::models::fetch_all_available_models(
+            credential,
+            &config,
+            &access_token,
+            proxy,
+            None,
+        )
+        .await
+        {
+            Ok(_) => {}
+            Err(message) if message.starts_with("BANNED:") => {
+                return Err(AdminServiceError::InvalidCredential(
+                    "BANNED: 凭据已被封禁".to_string(),
+                ));
+            }
+            Err(message) => {
+                tracing::warn!("社交登录后检测可用模型失败（不影响凭据添加）: {}", message);
+            }
+        }
+
+        Ok(())
+    }
 
     pub async fn start_social_login(
         &self,
         req: StartSocialLoginRequest,
     ) -> Result<StartSocialLoginResponse, AdminServiceError> {
-        let provider = match req.provider.trim() {
-            "Google" => "Google",
-            "Github" => "Github",
-            other => {
-                return Err(AdminServiceError::InvalidCredential(format!(
-                    "不支持的 Social 提供方: {}",
-                    other
-                )));
-            }
-        };
+        let provider = social::resolve_provider_names(&req.provider)
+            .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))?;
+        let credential_provider = provider.credential_provider.to_string();
 
         let global_proxy = {
             let config = self.token_manager.config();
@@ -2888,20 +5118,17 @@ impl AdminService {
         let expires_at = Utc::now() + chrono::Duration::minutes(10);
         let session_id = uuid::Uuid::new_v4().to_string();
 
-        let machine_id = if is_helper {
-            None
-        } else {
-            Some(self.generate_machine_id().machine_id)
-        };
-
-        let cred_template = KiroCredentials {
+        let mut cred_template = KiroCredentials {
             auth_method: Some("social".to_string()),
+            provider: Some(credential_provider),
             priority: req.priority,
             email: req.email,
             proxy_url: req.proxy_url,
-            machine_id,
             ..Default::default()
         };
+        if !is_helper {
+            self.assign_machine_id_for_new_credential(&mut cred_template)?;
+        }
 
         let (mode, portal_url, session) = if is_helper {
             let session = SocialAuthSession {
@@ -2923,7 +5150,7 @@ impl AdminService {
             let redirect_uri = social::manual_redirect_uri();
             let portal_url = social::build_login_url(
                 &auth_endpoint,
-                provider,
+                provider.portal_idp,
                 &state,
                 &code_challenge,
                 &redirect_uri,
@@ -2993,7 +5220,8 @@ impl AdminService {
             }
             PollOutcome::HelperSucceeded(credential_id) => {
                 self.social_sessions.lock().remove(session_id);
-                Ok(PollSocialLoginResponse::Success { credential_id })
+                let details = self.credential_login_details_from_stored(credential_id);
+                Ok(PollSocialLoginResponse::success(credential_id, details))
             }
             PollOutcome::HelperFailed(message) => {
                 self.social_sessions.lock().remove(session_id);
@@ -3052,8 +5280,10 @@ impl AdminService {
         let machine_id = session
             .cred_template
             .machine_id
-            .clone()
-            .unwrap_or_else(|| self.generate_machine_id().machine_id);
+            .as_deref()
+            .and_then(machine_id::normalize_machine_id)
+            .map(Ok)
+            .unwrap_or_else(|| self.machine_id_for_new_credential())?;
 
         let config = self.token_manager.config();
         let token_resp = social::exchange_code_for_token(
@@ -3068,13 +5298,18 @@ impl AdminService {
         .await
         .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
-        let mut new_cred = session.cred_template;
+        let SocialAuthSession {
+            cred_template,
+            proxy,
+            ..
+        } = session;
+        let mut new_cred = cred_template;
         if new_cred.machine_id.is_none() {
             new_cred.machine_id = Some(machine_id);
         }
         new_cred.access_token = Some(token_resp.access_token);
         new_cred.refresh_token = token_resp.refresh_token;
-        new_cred.profile_arn = token_resp.profile_arn;
+        new_cred.profile_arn = Some(Self::social_profile_arn_or_default(token_resp.profile_arn));
 
         if let Some(expires_at) = token_resp.expires_at {
             new_cred.expires_at = Some(expires_at);
@@ -3082,15 +5317,20 @@ impl AdminService {
             let ea = Utc::now() + chrono::Duration::seconds(expires_in);
             new_cred.expires_at = Some(ea.to_rfc3339());
         }
+        self.assign_proxy_before_validation(&mut new_cred)?;
+        let validation_proxy = self.proxy_for_validation(&new_cred, proxy.as_ref())?;
+
+        self.enrich_social_login_credential(&mut new_cred, validation_proxy.as_ref())
+            .await?;
 
         let credential_id = self
             .token_manager
-            .add_credential(new_cred)
-            .await
+            .upsert_prevalidated_social_credential(new_cred)
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
-        tracing::info!("Social 登录成功，已添加凭据 #{}", credential_id);
-        Ok(PollSocialLoginResponse::Success { credential_id })
+        tracing::info!("社交登录成功，已添加凭据 #{}", credential_id);
+        let details = self.credential_login_details_from_stored(credential_id);
+        Ok(PollSocialLoginResponse::success(credential_id, details))
     }
 
     pub async fn complete_social_login(
@@ -3098,7 +5338,7 @@ impl AdminService {
         session_id: &str,
         req: CompleteSocialLoginRequest,
     ) -> Result<(), AdminServiceError> {
-        let cred_template = {
+        let (cred_template, proxy) = {
             let mut sessions = self.social_sessions.lock();
             let session = sessions
                 .get_mut(session_id)
@@ -3119,16 +5359,17 @@ impl AdminService {
                 ));
             }
             session.helper_completing = true;
-            session.cred_template.clone()
+            (session.cred_template.clone(), session.proxy.clone())
         };
 
         let mut new_cred = cred_template;
         new_cred.access_token = Some(req.access_token);
         new_cred.refresh_token = req.refresh_token;
-        new_cred.profile_arn = req.profile_arn;
+        new_cred.profile_arn = Some(Self::social_profile_arn_or_default(req.profile_arn));
         if req.machine_id.is_some() {
             new_cred.machine_id = req.machine_id;
         }
+        self.assign_machine_id_for_new_credential(&mut new_cred)?;
         if let Some(expires_at) = req.expires_at {
             new_cred.expires_at = Some(expires_at);
         } else if let Some(expires_in) = req.expires_in {
@@ -3140,10 +5381,39 @@ impl AdminService {
             }
         }
 
+        if let Err(e) = self.assign_proxy_before_validation(&mut new_cred) {
+            if let Some(session) = self.social_sessions.lock().get_mut(session_id) {
+                session.helper_completing = false;
+                session.helper_result = Some(Err(e.to_string()));
+            }
+            return Err(e);
+        }
+
+        let validation_proxy = match self.proxy_for_validation(&new_cred, proxy.as_ref()) {
+            Ok(proxy) => proxy,
+            Err(e) => {
+                if let Some(session) = self.social_sessions.lock().get_mut(session_id) {
+                    session.helper_completing = false;
+                    session.helper_result = Some(Err(e.to_string()));
+                }
+                return Err(e);
+            }
+        };
+
+        let enrich_result = self
+            .enrich_social_login_credential(&mut new_cred, validation_proxy.as_ref())
+            .await;
+        if let Err(e) = enrich_result {
+            if let Some(session) = self.social_sessions.lock().get_mut(session_id) {
+                session.helper_completing = false;
+                session.helper_result = Some(Err(e.to_string()));
+            }
+            return Err(e);
+        }
+
         let result = self
             .token_manager
-            .add_credential(new_cred)
-            .await
+            .upsert_prevalidated_social_credential(new_cred)
             .map_err(|e| e.to_string());
 
         // 写回结果并释放占用；会话此时必然仍在（helper_completing 阻止了 poll 清除）
@@ -3154,7 +5424,7 @@ impl AdminService {
 
         match result {
             Ok(credential_id) => {
-                tracing::info!("Social helper 回传成功，已添加凭据 #{}", credential_id);
+                tracing::info!("社交登录 helper 回传成功，已添加凭据 #{}", credential_id);
                 Ok(())
             }
             Err(e) => Err(AdminServiceError::InternalError(e)),
@@ -3188,6 +5458,10 @@ impl AdminService {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .unwrap_or(idc::BUILDER_ID_START_URL);
+        let provider = Self::idc_provider_for_start_url(start_url);
+        let start_url_metadata = Self::idc_start_url_metadata(start_url);
+        let client_id_hash = Self::resolve_idc_client_id_hash(provider, None, Some(start_url))
+            .map_err(AdminServiceError::InvalidCredential)?;
 
         let config = self.token_manager.config();
         let registered = idc::register_client(&region, start_url, &config, proxy.as_ref())
@@ -3210,8 +5484,11 @@ impl AdminService {
 
         let cred_template = KiroCredentials {
             auth_method: Some("idc".to_string()),
+            provider: Some(provider.to_string()),
             client_id: Some(registered.client_id.clone()),
             client_secret: Some(registered.client_secret.clone()),
+            start_url: start_url_metadata,
+            client_id_hash: Some(client_id_hash),
             region: Some(region.clone()),
             priority: req.priority,
             email: req.email,
@@ -3271,6 +5548,10 @@ impl AdminService {
             .ok_or_else(|| {
                 AdminServiceError::InvalidCredential("startUrl is required".to_string())
             })?;
+        let provider = Self::idc_provider_for_start_url(start_url);
+        let start_url_metadata = Self::idc_start_url_metadata(start_url);
+        let client_id_hash = Self::resolve_idc_client_id_hash(provider, None, Some(start_url))
+            .map_err(AdminServiceError::InvalidCredential)?;
 
         let config = self.token_manager.config();
         let started =
@@ -3289,8 +5570,11 @@ impl AdminService {
         let session_id = uuid::Uuid::new_v4().to_string();
         let cred_template = KiroCredentials {
             auth_method: Some("idc".to_string()),
+            provider: Some(provider.to_string()),
             client_id: Some(started.client_id.clone()),
             client_secret: Some(started.client_secret.clone()),
+            start_url: start_url_metadata,
+            client_id_hash: Some(client_id_hash),
             region: Some(region.clone()),
             priority: req.priority,
             email: req.email,
@@ -3323,7 +5607,7 @@ impl AdminService {
     pub async fn complete_iam_sso_login(
         &self,
         req: CompleteIamSsoLoginRequest,
-    ) -> Result<serde_json::Value, AdminServiceError> {
+    ) -> Result<CompleteIamSsoLoginResponse, AdminServiceError> {
         enum SessionState {
             Missing,
             Expired,
@@ -3444,21 +5728,17 @@ impl AdminService {
         ) {
             new_cred.email = Some(email);
         }
+        self.assign_machine_id_for_new_credential(&mut new_cred)?;
+        self.assign_proxy_before_validation(&mut new_cred)?;
 
-        let email = new_cred.email.clone();
         let credential_id = self
             .token_manager
             .add_credential(new_cred)
             .await
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        let details = self.credential_login_details_from_stored(credential_id);
 
-        Ok(serde_json::json!({
-            "success": true,
-            "account": {
-                "id": credential_id,
-                "email": email,
-            },
-        }))
+        Ok(CompleteIamSsoLoginResponse::success(details))
     }
 
     pub async fn poll_idc_login(
@@ -3551,6 +5831,8 @@ impl AdminService {
                     let expires_at = Utc::now() + chrono::Duration::seconds(expires_in);
                     new_cred.expires_at = Some(expires_at.to_rfc3339());
                 }
+                self.assign_machine_id_for_new_credential(&mut new_cred)?;
+                self.assign_proxy_before_validation(&mut new_cred)?;
 
                 let credential_id = self
                     .token_manager
@@ -3558,8 +5840,12 @@ impl AdminService {
                     .await
                     .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
-                tracing::info!("IdC 登录成功，已添加凭据 #{}", credential_id);
-                Ok(PollIdcLoginResponse::Success { credential_id })
+                tracing::info!(
+                    "IAM Identity Center 登录成功，已添加凭据 #{}",
+                    credential_id
+                );
+                let details = self.credential_login_details_from_stored(credential_id);
+                Ok(PollIdcLoginResponse::success(credential_id, details))
             }
         }
     }
@@ -3577,7 +5863,17 @@ impl AdminService {
     pub fn get_request_logs(&self) -> super::types::RequestLogsResponse {
         let logs = self.request_stats.get_logs();
         let total = logs.len();
-        super::types::RequestLogsResponse { logs, total }
+        let success = logs
+            .iter()
+            .filter(|log| log.status == super::stats::REQUEST_LOG_STATUS_SUCCESS)
+            .count();
+        let errors = total.saturating_sub(success);
+        super::types::RequestLogsResponse {
+            logs,
+            total,
+            success,
+            errors,
+        }
     }
 
     /// 清空请求日志
@@ -3590,18 +5886,18 @@ impl AdminService {
         let snapshot = self.token_manager.snapshot();
         let available = snapshot.entries.iter().filter(|e| !e.disabled).count();
 
-        super::types::SystemStatusResponse {
-            status: "ok".to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            uptime: self.request_stats.uptime(),
-            total_requests: self.request_stats.total_requests(),
-            success_requests: self.request_stats.success_requests(),
-            failed_requests: self.request_stats.failed_requests(),
-            total_tokens: self.request_stats.total_tokens(),
-            total_credits: self.request_stats.total_credits(),
-            credentials_total: snapshot.entries.len(),
-            credentials_available: available,
-        }
+        super::types::SystemStatusResponse::new(
+            "ok",
+            env!("CARGO_PKG_VERSION"),
+            self.request_stats.uptime(),
+            self.request_stats.total_requests(),
+            self.request_stats.success_requests(),
+            self.request_stats.failed_requests(),
+            self.request_stats.total_tokens(),
+            self.request_stats.total_credits(),
+            snapshot.entries.len(),
+            available,
+        )
     }
 
     /// 获取详细统计
@@ -3634,11 +5930,9 @@ impl AdminService {
         }
     }
 
-    /// 生成 Machine ID
+    /// 生成机器 ID
     pub fn generate_machine_id(&self) -> super::types::GenerateMachineIdResponse {
-        let uuid = uuid::Uuid::new_v4().to_string();
-        // 格式化为 64 位十六进制字符串（与 Kiro IDE 一致）
-        let machine_id = format!("{:0>64}", uuid.replace('-', ""));
+        let machine_id = machine_id::generate_account_machine_id();
         super::types::GenerateMachineIdResponse { machine_id }
     }
 
@@ -3678,6 +5972,131 @@ impl AdminService {
                 message: "连通性测试失败".to_string(),
                 error: Some(e.to_string()),
             }),
+        }
+    }
+
+    pub async fn test_credential_by_path_id(
+        &self,
+        path_id: &str,
+        model: Option<String>,
+    ) -> Result<CredentialProbeResponse, AdminServiceError> {
+        let id = self.resolve_credential_id(path_id)?;
+        let model =
+            Self::clean_import_string(model).unwrap_or_else(|| "claude-sonnet-4".to_string());
+        let request_body = self.credential_test_request_body(&model)?;
+        let provider = self.kiro_provider.as_ref().ok_or_else(|| {
+            AdminServiceError::UpstreamError("Kiro provider not configured".to_string())
+        })?;
+        let api_result = provider
+            .call_api_with_credential(id, &request_body)
+            .await
+            .map_err(|e| self.classify_balance_error(e, id))?;
+        let body = api_result
+            .response
+            .bytes()
+            .await
+            .map_err(|e| AdminServiceError::UpstreamError(format!("读取响应失败: {}", e)))?;
+        let (reply, credits) = Self::extract_credential_probe_reply(&body)?;
+        if credits > 0.0 {
+            self.token_manager.apply_credit_usage(id, credits);
+        }
+
+        Ok(CredentialProbeResponse {
+            success: true,
+            reply,
+            model,
+        })
+    }
+
+    fn credential_test_request_body(&self, model: &str) -> Result<String, AdminServiceError> {
+        let request = MessagesRequest {
+            model: model.to_string(),
+            max_tokens: 5,
+            temperature: None,
+            top_p: None,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::Value::String("say ok".to_string()),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: Some(Metadata {
+                user_id: None,
+                preserve_tool_names: true,
+            }),
+        };
+        let conversion = convert_request_with_thinking_suffix(
+            &request,
+            &self.compression_config.read().clone(),
+            &self.prompt_filter_config.read().clone(),
+            false,
+            &self.thinking_config.read().suffix,
+        )
+        .map_err(|e| AdminServiceError::InvalidRequest(format!("构建测试请求失败: {}", e)))?;
+        let kiro_request = KiroRequest {
+            conversation_state: conversion.conversation_state,
+            inference_config: Some(InferenceConfig {
+                max_tokens: Some(5),
+                temperature: None,
+                top_p: None,
+            }),
+            profile_arn: None,
+        };
+        serde_json::to_string(&kiro_request)
+            .map_err(|e| AdminServiceError::InternalError(format!("序列化测试请求失败: {}", e)))
+    }
+
+    fn extract_credential_probe_reply(body: &[u8]) -> Result<(String, f64), AdminServiceError> {
+        let mut decoder = EventStreamDecoder::new();
+        decoder
+            .feed(body)
+            .map_err(|e| AdminServiceError::UpstreamError(format!("解析响应失败: {}", e)))?;
+
+        let mut reply = String::new();
+        let mut last_assistant_content = String::new();
+        let mut credits = 0.0;
+        for frame in decoder.decode_iter() {
+            let frame = frame
+                .map_err(|e| AdminServiceError::UpstreamError(format!("解析响应失败: {}", e)))?;
+            let Ok(event) = Event::from_frame(frame) else {
+                continue;
+            };
+            match event {
+                Event::AssistantResponse(resp) => {
+                    Self::append_cumulative_delta(
+                        &mut reply,
+                        &mut last_assistant_content,
+                        &resp.content,
+                    );
+                }
+                Event::Metering(metering) => {
+                    credits = metering.usage;
+                }
+                _ => {}
+            }
+        }
+        Ok((reply, credits))
+    }
+
+    fn append_cumulative_delta(output: &mut String, previous: &mut String, content: &str) {
+        if content.is_empty() {
+            return;
+        }
+        if previous.is_empty() {
+            output.push_str(content);
+            *previous = content.to_string();
+            return;
+        }
+        if let Some(delta) = content.strip_prefix(previous.as_str()) {
+            output.push_str(delta);
+            *previous = content.to_string();
+        } else if !previous.starts_with(content) {
+            output.push_str(content);
+            *previous = content.to_string();
         }
     }
 
@@ -3769,11 +6188,130 @@ impl AdminService {
         })
     }
 
+    pub async fn batch_credentials(
+        &self,
+        request: CredentialBatchRequest,
+    ) -> Result<CredentialBatchResponse, AdminServiceError> {
+        if request.ids.is_empty() {
+            return Err(AdminServiceError::InvalidRequest(
+                "No credential IDs provided".to_string(),
+            ));
+        }
+
+        match request.action.as_str() {
+            "enable" | "disable" => {
+                let disabled = request.action == "disable";
+                for id in self
+                    .resolve_credential_ids(&request.ids)
+                    .into_iter()
+                    .flatten()
+                {
+                    let _ = self.set_disabled(id, disabled);
+                }
+                Ok(CredentialBatchResponse {
+                    success: true,
+                    count: Some(request.ids.len()),
+                    refreshed: None,
+                    failed: None,
+                })
+            }
+            "refresh" => {
+                let mut refreshed = 0;
+                let mut failed = 0;
+                for id in self.resolve_credential_ids(&request.ids) {
+                    let Some(id) = id else {
+                        failed += 1;
+                        continue;
+                    };
+                    match self.force_refresh_token(id).await {
+                        Ok(_) => refreshed += 1,
+                        Err(_) => failed += 1,
+                    }
+                }
+                Ok(CredentialBatchResponse {
+                    success: true,
+                    count: None,
+                    refreshed: Some(refreshed),
+                    failed: Some(failed),
+                })
+            }
+            _ => Err(AdminServiceError::InvalidRequest(format!(
+                "Invalid action: {}",
+                request.action
+            ))),
+        }
+    }
+
+    fn resolve_credential_ids(&self, ids: &[serde_json::Value]) -> Vec<Option<u64>> {
+        let requested = Self::credential_request_id_strings(ids);
+        let entries = self.token_manager.snapshot().entries;
+        let lookup = Self::credential_request_id_lookup(&entries);
+        requested
+            .iter()
+            .map(|requested_id| lookup.get(requested_id).copied())
+            .collect()
+    }
+
+    fn resolve_credential_id(&self, path_id: &str) -> Result<u64, AdminServiceError> {
+        let normalized = path_id.trim();
+        if normalized.is_empty() {
+            return Err(AdminServiceError::ResourceNotFound(
+                "Credential not found".to_string(),
+            ));
+        }
+        let entries = self.token_manager.snapshot().entries;
+        Self::resolve_credential_entry_by_request_id(&entries, normalized)
+            .map(|entry| entry.id)
+            .ok_or_else(|| AdminServiceError::ResourceNotFound("Credential not found".to_string()))
+    }
+
+    fn resolve_credential_entry_by_request_id<'a>(
+        entries: &'a [crate::kiro::token_manager::CredentialEntrySnapshot],
+        requested_id: &str,
+    ) -> Option<&'a crate::kiro::token_manager::CredentialEntrySnapshot> {
+        let requested_local_id = requested_id.parse::<u64>().ok();
+        entries.iter().find(|entry| {
+            requested_local_id == Some(entry.id)
+                || entry.source_account_id.as_deref() == Some(requested_id)
+        })
+    }
+
+    fn credential_request_id_strings(ids: &[serde_json::Value]) -> Vec<String> {
+        ids.iter()
+            .filter_map(|id| match id {
+                serde_json::Value::String(value) => {
+                    let value = value.trim();
+                    (!value.is_empty()).then(|| value.to_string())
+                }
+                serde_json::Value::Number(value) => value.as_u64().map(|id| id.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn credential_request_id_lookup(
+        entries: &[crate::kiro::token_manager::CredentialEntrySnapshot],
+    ) -> HashMap<String, u64> {
+        let mut lookup = HashMap::with_capacity(entries.len().saturating_mul(2));
+        for entry in entries {
+            lookup.entry(entry.id.to_string()).or_insert(entry.id);
+            if let Some(source_id) = entry
+                .source_account_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|source_id| !source_id.is_empty())
+            {
+                lookup.entry(source_id.to_string()).or_insert(entry.id);
+            }
+        }
+        lookup
+    }
+
     // ========================================================================
-    // SSO Token 导入
+    // SSO 令牌导入
     // ========================================================================
 
-    /// 从 SSO Token 导入凭据
+    /// 从 SSO 令牌导入凭据
     pub async fn import_sso_token(
         &self,
         request: super::types::ImportSsoTokenRequest,
@@ -3787,7 +6325,7 @@ impl AdminService {
 
         if tokens.is_empty() {
             return Err(AdminServiceError::InvalidRequest(
-                "未提供有效的 SSO Token".to_string(),
+                "未提供有效的 SSO 令牌".to_string(),
             ));
         }
 
@@ -3836,7 +6374,7 @@ impl AdminService {
         })
     }
 
-    /// 导入单个 SSO Token
+    /// 导入单个 SSO 令牌
     async fn import_single_sso_token(
         &self,
         bearer_token: &str,
@@ -3850,7 +6388,7 @@ impl AdminService {
             proxy
         });
 
-        // 使用完整的 7 步 SSO Token 导入流程
+        // 使用完整的 7 步 SSO 令牌导入流程
         let token = crate::kiro::auth::idc::import_sso_token(
             bearer_token,
             region,
@@ -3858,9 +6396,11 @@ impl AdminService {
             proxy_config.as_ref(),
         )
         .await
-        .map_err(|e| AdminServiceError::InternalError(format!("SSO Token 导入失败: {}", e)))?;
+        .map_err(|e| AdminServiceError::InternalError(format!("SSO 令牌导入失败: {}", e)))?;
 
-        let new_cred = Self::sso_token_credential_from_import(token, region, priority, email);
+        let mut new_cred = Self::sso_token_credential_from_import(token, region, priority, email);
+        self.assign_machine_id_for_new_credential(&mut new_cred)?;
+        self.assign_proxy_before_validation(&mut new_cred)?;
 
         let credential_id = self
             .token_manager
@@ -3868,7 +6408,7 @@ impl AdminService {
             .await
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
-        tracing::info!("SSO Token 导入成功，已添加凭据 #{}", credential_id);
+        tracing::info!("SSO 令牌导入成功，已添加凭据 #{}", credential_id);
         Ok(credential_id)
     }
 
@@ -3882,8 +6422,10 @@ impl AdminService {
             access_token: Some(token.access_token),
             refresh_token: token.refresh_token,
             auth_method: Some("idc".to_string()),
+            provider: Some("BuilderId".to_string()),
             client_id: Some(token.client_id),
             client_secret: Some(token.client_secret),
+            client_id_hash: Some(KIRO_BUILDER_ID_CLIENT_ID_HASH.to_string()),
             priority,
             region: Some(region.to_string()),
             ..Default::default()
@@ -3915,8 +6457,10 @@ impl AdminService {
     ) -> KiroCredentials {
         KiroCredentials {
             auth_method: Some("idc".to_string()),
+            provider: Some("BuilderId".to_string()),
             client_id: Some(client_id),
             client_secret: Some(client_secret),
+            client_id_hash: Some(KIRO_BUILDER_ID_CLIENT_ID_HASH.to_string()),
             priority,
             region: Some(region),
             email,
@@ -3927,6 +6471,21 @@ impl AdminService {
 
     fn builder_id_expires_in(expires_in: i64) -> i64 {
         if expires_in > 0 { expires_in } else { 600 }
+    }
+
+    fn idc_provider_for_start_url(start_url: &str) -> &'static str {
+        let value = start_url.trim().trim_end_matches('/');
+        let builder_id = idc::BUILDER_ID_START_URL.trim_end_matches('/');
+        if value.is_empty() || value == builder_id {
+            "BuilderId"
+        } else {
+            "Enterprise"
+        }
+    }
+
+    fn idc_start_url_metadata(start_url: &str) -> Option<String> {
+        let value = Self::normalize_start_url(start_url);
+        (Self::idc_provider_for_start_url(&value) == "Enterprise").then_some(value)
     }
 
     /// 启动 Builder ID 登录
@@ -4066,8 +6625,8 @@ impl AdminService {
                 ) {
                     new_cred.email = Some(email);
                 }
-                let email = new_cred.email.clone();
-
+                self.assign_machine_id_for_new_credential(&mut new_cred)?;
+                self.assign_proxy_before_validation(&mut new_cred)?;
                 let credential_id = self
                     .token_manager
                     .add_credential(new_cred)
@@ -4075,10 +6634,11 @@ impl AdminService {
                     .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
                 tracing::info!("Builder ID 登录成功，已添加凭据 #{}", credential_id);
-                Ok(super::types::PollBuilderIdLoginResponse::Success {
+                let details = self.credential_login_details_from_stored(credential_id);
+                Ok(super::types::PollBuilderIdLoginResponse::success(
                     credential_id,
-                    email,
-                })
+                    details,
+                ))
             }
             crate::kiro::auth::idc::PollResult::Pending => {
                 Ok(super::types::PollBuilderIdLoginResponse::Pending {
@@ -4146,7 +6706,7 @@ impl AdminService {
             expires_at,
             cred_template: KiroCredentials {
                 region: Some(region),
-                machine_id: Some(self.generate_machine_id().machine_id),
+                machine_id: Some(self.machine_id_for_new_credential()?),
                 ..Default::default()
             },
             proxy: global_proxy,
@@ -4267,7 +6827,7 @@ impl AdminService {
                     completed: false,
                     status: None,
                     error: Some("session not found or expired".to_string()),
-                    account: None,
+                    details: None,
                 });
             };
             if Utc::now() >= session.expires_at {
@@ -4290,7 +6850,7 @@ impl AdminService {
                 completed: false,
                 status: Some("pending".to_string()),
                 error: None,
-                account: None,
+                details: None,
             }),
             Outcome::Expired => {
                 self.kiro_sso_sessions.lock().remove(session_id);
@@ -4299,7 +6859,7 @@ impl AdminService {
                     completed: false,
                     status: None,
                     error: Some("SSO login timed out".to_string()),
-                    account: None,
+                    details: None,
                 })
             }
             Outcome::Cancelled => {
@@ -4309,7 +6869,7 @@ impl AdminService {
                     completed: false,
                     status: None,
                     error: Some("登录已被取消".to_string()),
-                    account: None,
+                    details: None,
                 })
             }
             Outcome::Received(capture) => self.complete_kiro_sso_login(session_id, capture).await,
@@ -4334,7 +6894,8 @@ impl AdminService {
                 let machine_id = new_cred
                     .machine_id
                     .clone()
-                    .unwrap_or_else(|| self.generate_machine_id().machine_id);
+                    .map(Ok)
+                    .unwrap_or_else(|| self.machine_id_for_new_credential())?;
                 new_cred.machine_id = Some(machine_id.clone());
                 let token = kiro_sso::exchange_social_code(
                     &capture.code,
@@ -4351,6 +6912,8 @@ impl AdminService {
                 new_cred.refresh_token = token.refresh_token;
                 new_cred.profile_arn = token.profile_arn;
                 new_cred.auth_method = Some("social".to_string());
+                new_cred.provider =
+                    Some(Self::kiro_sso_provider(kiro_sso::KiroSsoCaptureKind::Social).to_string());
                 new_cred.email = email;
                 if let Some(expires_at) = token.expires_at {
                     new_cred.expires_at = Some(expires_at);
@@ -4382,6 +6945,9 @@ impl AdminService {
                 new_cred.access_token = Some(token.access_token);
                 new_cred.refresh_token = token.refresh_token;
                 new_cred.auth_method = Some("external_idp".to_string());
+                new_cred.provider = Some(
+                    Self::kiro_sso_provider(kiro_sso::KiroSsoCaptureKind::ExternalIdp).to_string(),
+                );
                 new_cred.client_id = Some(client_id.to_string());
                 new_cred.token_endpoint = capture.token_endpoint;
                 new_cred.issuer_url = capture.issuer_url;
@@ -4394,33 +6960,162 @@ impl AdminService {
             }
         }
         drop(config);
+        self.assign_proxy_before_validation(&mut new_cred)?;
 
-        let email = new_cred.email.clone();
-        let auth_method = new_cred.auth_method.clone();
         let credential_id = self
             .token_manager
             .add_credential(new_cred)
             .await
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
-        Ok(PollKiroSsoLoginResponse {
-            success: true,
-            completed: true,
-            status: None,
-            error: None,
-            account: Some(KiroSsoAccountResponse {
-                id: credential_id,
-                email,
-                auth_method,
+        let details = self.credential_login_details_from_stored(credential_id);
+        Ok(PollKiroSsoLoginResponse::success(details))
+    }
+
+    fn credential_login_details_from_stored(
+        &self,
+        credential_id: u64,
+    ) -> CredentialLoginDetailsResponse {
+        self.credential_login_details_from_stored_with_email_hint(credential_id, None)
+    }
+
+    fn credential_login_details_from_stored_with_email_hint(
+        &self,
+        credential_id: u64,
+        email_hint: Option<String>,
+    ) -> CredentialLoginDetailsResponse {
+        let stored = self
+            .token_manager
+            .export_credentials_by_ids(&[credential_id])
+            .into_iter()
+            .next();
+        CredentialLoginDetailsResponse {
+            id: credential_id,
+            email: stored
+                .as_ref()
+                .and_then(|credential| credential.email.clone())
+                .or(email_hint),
+            auth_method: stored
+                .as_ref()
+                .and_then(|credential| credential.auth_method.clone()),
+            provider: stored
+                .as_ref()
+                .and_then(|credential| credential.provider.clone()),
+            user_id: stored
+                .as_ref()
+                .and_then(|credential| credential.user_id.clone()),
+            source_account_id: stored
+                .as_ref()
+                .and_then(|credential| credential.source_account_id.clone()),
+            label: stored
+                .as_ref()
+                .and_then(|credential| credential.label.clone()),
+            status: stored
+                .as_ref()
+                .and_then(|credential| credential.status.clone()),
+            added_at: stored
+                .as_ref()
+                .and_then(|credential| credential.added_at.clone()),
+            nickname: stored
+                .as_ref()
+                .and_then(|credential| credential.nickname.clone()),
+            group_id: stored
+                .as_ref()
+                .and_then(|credential| credential.group_id.clone()),
+            tag_links: stored
+                .as_ref()
+                .and_then(|credential| credential.tag_links.clone()),
+            has_usage_data: stored
+                .as_ref()
+                .is_some_and(|credential| credential.usage_data.is_some()),
+            has_available_models_cache: stored
+                .as_ref()
+                .is_some_and(|credential| credential.available_models_cache.is_some()),
+            source_failure_count: stored
+                .as_ref()
+                .and_then(|credential| credential.failure_count),
+            source_last_failure_at: stored
+                .as_ref()
+                .and_then(|credential| credential.last_failure_at.clone()),
+            source_disabled_reason: stored
+                .as_ref()
+                .and_then(|credential| credential.disabled_reason.clone()),
+            source_success_count: stored
+                .as_ref()
+                .and_then(|credential| credential.success_count),
+            has_profile_arn: stored
+                .as_ref()
+                .is_some_and(|credential| Self::has_import_string(&credential.profile_arn)),
+            has_token: stored
+                .as_ref()
+                .is_some_and(|credential| Self::has_import_string(&credential.access_token)),
+            has_refresh_token: stored
+                .as_ref()
+                .is_some_and(|credential| Self::has_import_string(&credential.refresh_token)),
+            has_client_id: stored
+                .as_ref()
+                .is_some_and(|credential| Self::has_import_string(&credential.client_id)),
+            has_client_secret: stored
+                .as_ref()
+                .is_some_and(|credential| Self::has_import_string(&credential.client_secret)),
+            has_id_token: stored
+                .as_ref()
+                .is_some_and(|credential| Self::has_import_string(&credential.id_token)),
+            has_api_key: stored
+                .as_ref()
+                .is_some_and(|credential| Self::has_import_string(&credential.api_key)),
+            has_proxy_credentials: stored.as_ref().is_some_and(|credential| {
+                Self::has_import_string(&credential.proxy_username)
+                    || Self::has_import_string(&credential.proxy_password)
             }),
-        })
+            region: stored
+                .as_ref()
+                .and_then(|credential| credential.region.clone()),
+            auth_region: stored
+                .as_ref()
+                .and_then(|credential| credential.auth_region.clone()),
+            api_region: stored
+                .as_ref()
+                .and_then(|credential| credential.api_region.clone()),
+            machine_id: stored
+                .as_ref()
+                .and_then(|credential| credential.machine_id.clone()),
+            start_url: stored
+                .as_ref()
+                .and_then(|credential| credential.start_url.clone()),
+            client_id_hash: stored
+                .as_ref()
+                .and_then(|credential| credential.client_id_hash.clone()),
+            sso_session_id: stored
+                .as_ref()
+                .and_then(|credential| credential.sso_session_id.clone()),
+            token_endpoint: stored
+                .as_ref()
+                .and_then(|credential| credential.token_endpoint.clone()),
+            issuer_url: stored
+                .as_ref()
+                .and_then(|credential| credential.issuer_url.clone()),
+            scopes: stored
+                .as_ref()
+                .and_then(|credential| credential.scopes.clone()),
+            endpoint: stored
+                .as_ref()
+                .and_then(|credential| credential.endpoint.clone()),
+        }
+    }
+
+    fn kiro_sso_provider(kind: kiro_sso::KiroSsoCaptureKind) -> &'static str {
+        match kind {
+            kiro_sso::KiroSsoCaptureKind::Social => "Kiro SSO",
+            kiro_sso::KiroSsoCaptureKind::ExternalIdp => "AzureAD",
+        }
     }
 
     // ========================================================================
-    // API Key 管理
+    // API 密钥管理
     // ========================================================================
 
-    /// 从磁盘加载 API Keys
+    /// 从磁盘加载 API 密钥
     fn load_api_keys_from(path: &Option<PathBuf>) -> Vec<super::types::ApiKeyEntry> {
         if let Some(path) = path {
             if path.exists() {
@@ -4428,11 +7123,11 @@ impl AdminService {
                     Ok(data) => match serde_json::from_str(&data) {
                         Ok(keys) => return keys,
                         Err(e) => {
-                            tracing::warn!("解析 API Keys 文件失败: {}", e);
+                            tracing::warn!("解析 API 密钥文件失败: {}", e);
                         }
                     },
                     Err(e) => {
-                        tracing::warn!("读取 API Keys 文件失败: {}", e);
+                        tracing::warn!("读取 API 密钥文件失败: {}", e);
                     }
                 }
             }
@@ -4445,22 +7140,23 @@ impl AdminService {
         Arc::new(RwLock::new(Self::load_api_keys_from(&path)))
     }
 
-    pub fn load_api_keys_runtime_with_legacy(
+    pub fn load_api_keys_runtime_with_config_key(
         cache_dir: Option<&std::path::Path>,
-        legacy_api_key: Option<&str>,
+        config_api_key: Option<&str>,
         require_api_key: bool,
     ) -> SharedApiKeys {
         let path = cache_dir.map(|d| d.join("kiro_api_keys.json"));
         let mut keys = Self::load_api_keys_from(&path);
-        let legacy_api_key = legacy_api_key.map(str::trim).filter(|key| !key.is_empty());
+        let config_api_key = config_api_key.map(str::trim).filter(|key| !key.is_empty());
 
         if keys.is_empty() {
-            if let Some(legacy_api_key) = legacy_api_key {
+            if let Some(config_api_key) = config_api_key {
                 keys.push(super::types::ApiKeyEntry {
                     id: uuid::Uuid::new_v4().to_string(),
-                    name: Some("legacy-api-key".to_string()),
-                    key: legacy_api_key.to_string(),
+                    name: Some("config-api-key".to_string()),
+                    key: config_api_key.to_string(),
                     enabled: require_api_key,
+                    migrated: true,
                     created_at: Utc::now().timestamp(),
                     last_used_at: None,
                     token_limit: 0,
@@ -4474,11 +7170,11 @@ impl AdminService {
                     match serde_json::to_string_pretty(&keys) {
                         Ok(data) => {
                             if let Err(e) = std::fs::write(path, data) {
-                                tracing::warn!(error = %e, "持久化迁移 API Key 失败");
+                                tracing::warn!(error = %e, "持久化迁移 API 密钥失败");
                             }
                         }
                         Err(e) => {
-                            tracing::warn!(error = %e, "序列化迁移 API Key 失败");
+                            tracing::warn!(error = %e, "序列化迁移 API 密钥失败");
                         }
                     }
                 }
@@ -4488,7 +7184,7 @@ impl AdminService {
         Arc::new(RwLock::new(keys))
     }
 
-    /// 保存 API Keys 到磁盘
+    /// 保存 API 密钥到磁盘
     fn save_api_keys(&self) -> Result<(), AdminServiceError> {
         let path = self
             .token_manager
@@ -4504,25 +7200,19 @@ impl AdminService {
         Ok(())
     }
 
-    /// 获取所有 API Keys（脱敏）
+    /// 获取所有 API 密钥（脱敏）
     pub fn get_api_keys(&self) -> super::types::ApiKeyListResponse {
         let keys = self.api_keys.read();
         let api_keys = keys.iter().map(to_api_key_view).collect();
         super::types::ApiKeyListResponse { api_keys }
     }
 
-    /// 创建 API Key
+    /// 创建 API 密钥
     pub fn create_api_key(
         &self,
         request: super::types::CreateApiKeyRequest,
     ) -> Result<super::types::CreateApiKeyResponse, AdminServiceError> {
-        let key_value = request
-            .key
-            .as_deref()
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(generate_api_key_value);
+        let key_value = resolve_create_api_key_value(request.key.as_deref())?;
         let id = uuid::Uuid::new_v4().to_string();
         if self.api_keys.read().iter().any(|k| k.key == key_value) {
             return Err(AdminServiceError::InvalidRequest(
@@ -4535,6 +7225,7 @@ impl AdminService {
             name: request.name,
             key: key_value.clone(),
             enabled: request.enabled.unwrap_or(true),
+            migrated: false,
             created_at: Utc::now().timestamp(),
             last_used_at: None,
             token_limit: request.token_limit,
@@ -4558,7 +7249,7 @@ impl AdminService {
         })
     }
 
-    /// 获取单个 API Key
+    /// 获取单个 API 密钥
     pub fn get_api_key(&self, id: &str) -> Result<super::types::ApiKeyView, AdminServiceError> {
         let keys = self.api_keys.read();
         keys.iter()
@@ -4567,7 +7258,7 @@ impl AdminService {
             .ok_or_else(|| AdminServiceError::ResourceNotFound("API key not found".to_string()))
     }
 
-    /// 更新 API Key
+    /// 更新 API 密钥
     pub fn update_api_key(
         &self,
         id: &str,
@@ -4613,7 +7304,7 @@ impl AdminService {
         Ok(view)
     }
 
-    /// 删除 API Key
+    /// 删除 API 密钥
     pub fn delete_api_key(&self, id: &str) -> Result<(), AdminServiceError> {
         let mut keys = self.api_keys.write();
         if let Some(index) = keys.iter().position(|k| k.id == id) {
@@ -4624,7 +7315,7 @@ impl AdminService {
         Ok(())
     }
 
-    /// 重置 API Key 使用量
+    /// 重置 API 密钥使用量
     pub fn reset_api_key_usage(
         &self,
         id: &str,
@@ -4645,13 +7336,13 @@ impl AdminService {
         Ok(view)
     }
 
-    /// 验证 API Key（用于认证中间件）
+    /// 验证 API 密钥（用于认证中间件）
     pub fn validate_api_key(&self, key: &str) -> Option<super::types::ApiKeyEntry> {
         let keys = self.api_keys.read();
         keys.iter().find(|k| k.key == key && k.enabled).cloned()
     }
 
-    /// 记录 API Key 使用量
+    /// 记录 API 密钥使用量
     pub fn record_api_key_usage(&self, key_id: &str, tokens: i64, credits: f64) {
         let mut keys = self.api_keys.write();
         if let Some(entry) = keys.iter_mut().find(|k| k.id == key_id) {
@@ -4666,9 +7357,207 @@ impl AdminService {
         }
         drop(keys);
         if let Err(e) = self.save_api_keys() {
-            tracing::warn!(error = %e, "保存 API Key 使用量失败");
+            tracing::warn!(error = %e, "保存 API 密钥使用量失败");
         }
     }
+}
+
+struct ProxyGeo {
+    region: Option<String>,
+    country: Option<String>,
+}
+
+fn clean_proxy_string(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn proxy_entry_from_req(req: ProxyUpsertRequest) -> Result<ProxyEntry, AdminServiceError> {
+    let url = req.url.trim();
+    if url.is_empty() {
+        return Err(AdminServiceError::InvalidRequest(
+            "代理 URL 不能为空".to_string(),
+        ));
+    }
+    let url = normalize_proxy_scheme(url);
+    AdminService::validate_proxy_url(&url)?;
+    Ok(ProxyEntry {
+        id: None,
+        url,
+        username: clean_proxy_string(req.username),
+        password: clean_proxy_string(req.password),
+        region: clean_proxy_string(req.region),
+        country: None,
+        max_concurrency: req.max_concurrency.filter(|value| *value > 0),
+        disabled: req.disabled,
+        note: clean_proxy_string(req.note),
+    })
+}
+
+fn normalize_proxy_scheme(url: &str) -> String {
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("sock5://") {
+        return format!("socks5://{}", &url[7..]);
+    }
+    if lower.starts_with("sock4://") {
+        return format!("socks4://{}", &url[7..]);
+    }
+    if lower.starts_with("sock://") {
+        return format!("socks5://{}", &url[7..]);
+    }
+    url.to_string()
+}
+
+fn parse_proxy_line(line: &str) -> Result<(String, Option<String>, Option<String>), String> {
+    let normalized = normalize_proxy_scheme(line.trim());
+    let line = normalized.as_str();
+
+    if line.contains(',') {
+        let parts: Vec<&str> = line.splitn(3, ',').map(str::trim).collect();
+        let url = parts.first().copied().unwrap_or_default();
+        if url.is_empty() {
+            return Err("url 为空".to_string());
+        }
+        return Ok((
+            normalize_proxy_scheme(url),
+            parts
+                .get(1)
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            parts
+                .get(2)
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+        ));
+    }
+
+    if let Some(scheme_index) = line.find("://") {
+        let scheme = &line[..scheme_index];
+        let authority = &line[scheme_index + 3..];
+        let authority = authority.split('/').next().unwrap_or(authority);
+        if authority.contains('@') {
+            return Ok((line.to_string(), None, None));
+        }
+        let parts: Vec<&str> = authority.split(':').collect();
+        return match parts.as_slice() {
+            [host, port] if !host.is_empty() && !port.is_empty() => {
+                Ok((line.to_string(), None, None))
+            }
+            [host, port, user, pass] if !host.is_empty() && !port.is_empty() => Ok((
+                format!("{}://{}:{}", scheme, host, port),
+                (!user.is_empty()).then(|| user.to_string()),
+                (!pass.is_empty()).then(|| pass.to_string()),
+            )),
+            _ => Err(format!(
+                "无法识别的代理格式(authority 段应为 host:port 或 host:port:user:pass): {}",
+                line
+            )),
+        };
+    }
+
+    let parts: Vec<&str> = line.split(':').map(str::trim).collect();
+    match parts.as_slice() {
+        [host, port] if !host.is_empty() && !port.is_empty() => {
+            Ok((format!("socks5://{}:{}", host, port), None, None))
+        }
+        [host, port, user, pass] if !host.is_empty() && !port.is_empty() => Ok((
+            format!("socks5://{}:{}", host, port),
+            (!user.is_empty()).then(|| user.to_string()),
+            (!pass.is_empty()).then(|| pass.to_string()),
+        )),
+        _ => Err(format!(
+            "无法识别的代理格式(支持 ip:port[:user:pass] / scheme://host:port[:user:pass] / url,user,pass): {}",
+            line
+        )),
+    }
+}
+
+async fn probe_proxy(entry: &ProxyEntry) -> ProxyTestResponse {
+    let proxy_config = entry.to_proxy_config();
+    let client = match crate::http_client::build_client(
+        Some(&proxy_config),
+        10,
+        crate::model::config::TlsBackend::Rustls,
+    ) {
+        Ok(client) => client,
+        Err(error) => {
+            return ProxyTestResponse {
+                ok: false,
+                exit_ip: None,
+                latency_ms: None,
+                error: Some(format!("构建代理客户端失败: {}", error)),
+            };
+        }
+    };
+
+    let start = std::time::Instant::now();
+    let response = client.get("https://api.ipify.org?format=text").send().await;
+    let latency_ms = start.elapsed().as_millis() as u64;
+
+    match response {
+        Ok(response) if response.status().is_success() => ProxyTestResponse {
+            ok: true,
+            exit_ip: response
+                .text()
+                .await
+                .ok()
+                .map(|value| value.trim().to_string()),
+            latency_ms: Some(latency_ms),
+            error: None,
+        },
+        Ok(response) => ProxyTestResponse {
+            ok: false,
+            exit_ip: None,
+            latency_ms: Some(latency_ms),
+            error: Some(format!("探测端点返回 HTTP {}", response.status())),
+        },
+        Err(error) => ProxyTestResponse {
+            ok: false,
+            exit_ip: None,
+            latency_ms: Some(latency_ms),
+            error: Some(format!("代理连接失败: {}", error)),
+        },
+    }
+}
+
+async fn probe_proxy_geo(entry: &ProxyEntry) -> Option<ProxyGeo> {
+    let proxy_config = entry.to_proxy_config();
+    let client = crate::http_client::build_client(
+        Some(&proxy_config),
+        10,
+        crate::model::config::TlsBackend::Rustls,
+    )
+    .ok()?;
+    let response = client.get("https://ipinfo.io/json").send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let json: serde_json::Value = response.json().await.ok()?;
+    let region_raw = json
+        .get("region")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let country = json
+        .get("country")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if region_raw.is_none() && country.is_none() {
+        return None;
+    }
+    let region = match (&country, &region_raw) {
+        (Some(country), Some(region)) => Some(format!("{}:{}", country, region)),
+        (Some(country), None) => Some(country.clone()),
+        (None, Some(region)) => Some(region.clone()),
+        (None, None) => None,
+    };
+    Some(ProxyGeo { region, country })
 }
 
 fn to_api_key_view(entry: &super::types::ApiKeyEntry) -> super::types::ApiKeyView {
@@ -4677,6 +7566,7 @@ fn to_api_key_view(entry: &super::types::ApiKeyEntry) -> super::types::ApiKeyVie
         name: entry.name.clone(),
         key_masked: mask_api_key(&entry.key),
         enabled: entry.enabled,
+        migrated: entry.migrated,
         created_at: entry.created_at,
         last_used_at: entry.last_used_at,
         token_limit: entry.token_limit,
@@ -4687,13 +7577,28 @@ fn to_api_key_view(entry: &super::types::ApiKeyEntry) -> super::types::ApiKeyVie
     }
 }
 
-/// 生成 API Key 值
+/// 生成 API 密钥值
 fn generate_api_key_value() -> String {
     let bytes: Vec<u8> = (0..32).map(|_| fastrand::u8(..)).collect();
     format!("sk-{}", hex::encode(bytes))
 }
 
-/// 脱敏 API Key
+fn resolve_create_api_key_value(key: Option<&str>) -> Result<String, AdminServiceError> {
+    match key {
+        None | Some("") => Ok(generate_api_key_value()),
+        Some(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return Err(AdminServiceError::InvalidRequest(
+                    "api key value must not be empty".to_string(),
+                ));
+            }
+            Ok(trimmed.to_string())
+        }
+    }
+}
+
+/// 脱敏 API 密钥
 fn mask_api_key(key: &str) -> String {
     if key.is_empty() {
         return String::new();
@@ -4730,6 +7635,10 @@ mod builder_id_login_tests {
         assert_eq!(cred.auth_method.as_deref(), Some("idc"));
         assert_eq!(cred.client_id.as_deref(), Some("client-id"));
         assert_eq!(cred.client_secret.as_deref(), Some("client-secret"));
+        assert_eq!(
+            cred.client_id_hash.as_deref(),
+            Some(KIRO_BUILDER_ID_CLIENT_ID_HASH)
+        );
         assert_eq!(cred.region.as_deref(), Some("us-east-1"));
         assert_eq!(cred.priority, 3);
         assert_eq!(cred.email.as_deref(), Some("user@example.com"));
@@ -4737,7 +7646,7 @@ mod builder_id_login_tests {
     }
 
     #[test]
-    fn builder_id_expires_in_falls_back_like_kiro_go() {
+    fn builder_id_expires_in_uses_default_when_missing() {
         assert_eq!(AdminService::builder_id_expires_in(0), 600);
         assert_eq!(AdminService::builder_id_expires_in(-1), 600);
         assert_eq!(AdminService::builder_id_expires_in(900), 900);
@@ -4768,6 +7677,10 @@ mod sso_token_import_tests {
         assert_eq!(cred.refresh_token.as_deref(), Some("refresh-token"));
         assert_eq!(cred.client_id.as_deref(), Some("client-id"));
         assert_eq!(cred.client_secret.as_deref(), Some("client-secret"));
+        assert_eq!(
+            cred.client_id_hash.as_deref(),
+            Some(KIRO_BUILDER_ID_CLIENT_ID_HASH)
+        );
         assert_eq!(cred.region.as_deref(), Some("us-east-1"));
         assert_eq!(cred.priority, 7);
         assert_eq!(cred.email.as_deref(), Some("user@example.com"));
@@ -4776,87 +7689,279 @@ mod sso_token_import_tests {
 }
 
 #[cfg(test)]
-mod kiro_go_import_tests {
+mod credential_record_import_tests {
     use super::*;
 
     #[test]
     fn normalizes_external_idp_before_social_or_idc_fallbacks() {
         assert_eq!(
-            AdminService::normalize_kiro_go_import_auth_method(
+            AdminService::normalize_credential_record_auth_method(
                 Some("AzureAD"),
+                None,
                 Some("client"),
+                None,
                 None,
                 None,
             ),
             "external_idp"
         );
         assert_eq!(
-            AdminService::normalize_kiro_go_import_auth_method(
+            AdminService::normalize_credential_record_auth_method(
+                None,
                 None,
                 Some("client"),
                 None,
                 Some("https://login.microsoftonline.com/t/oauth2/v2.0/token"),
+                None,
             ),
             "external_idp"
         );
         assert_eq!(
-            AdminService::normalize_kiro_go_import_auth_method(
+            AdminService::normalize_credential_record_auth_method(
+                None,
+                Some("Microsoft"),
+                Some("client"),
+                None,
+                None,
+                None,
+            ),
+            "external_idp"
+        );
+        assert_eq!(
+            AdminService::normalize_credential_record_auth_method(
                 Some("enterprise"),
+                None,
                 Some("client"),
                 Some("secret"),
+                None,
                 None,
             ),
             "idc"
         );
         assert_eq!(
-            AdminService::normalize_kiro_go_import_auth_method(None, Some("client"), None, None),
+            AdminService::normalize_credential_record_auth_method(
+                Some("builder_id"),
+                None,
+                Some("client"),
+                Some("secret"),
+                None,
+                None,
+            ),
             "idc"
         );
         assert_eq!(
-            AdminService::normalize_kiro_go_import_auth_method(
-                Some("weird"),
-                Some("client"),
+            AdminService::normalize_credential_record_auth_method(
+                Some("GitHub"),
+                None,
+                None,
+                None,
                 None,
                 None,
             ),
             "social"
         );
+        assert_eq!(
+            AdminService::normalize_credential_record_auth_method(
+                Some("social"),
+                None,
+                None,
+                None,
+                Some("https://login.microsoftonline.com/t/oauth2/v2.0/token"),
+                None,
+            ),
+            "external_idp"
+        );
+        assert_eq!(
+            AdminService::normalize_credential_record_auth_method(
+                None,
+                None,
+                Some("client"),
+                None,
+                None,
+                None
+            ),
+            "idc"
+        );
+        assert_eq!(
+            AdminService::normalize_credential_record_auth_method(
+                Some("weird"),
+                None,
+                Some("client"),
+                None,
+                None,
+                None,
+            ),
+            "social"
+        );
+        assert_eq!(
+            AdminService::normalize_credential_record_auth_method(
+                Some("api-key"),
+                None,
+                None,
+                None,
+                None,
+                Some("ksk_record_key"),
+            ),
+            "api_key"
+        );
     }
 
     #[test]
-    fn parses_numeric_kiro_go_import_id_only() {
+    fn normalizes_external_idp_provider_to_azuread() {
         assert_eq!(
-            AdminService::parse_kiro_go_import_id(Some(&serde_json::json!(42))),
+            AdminService::normalize_provider_for_auth_method(None, "external_idp").as_deref(),
+            Some("AzureAD")
+        );
+        assert_eq!(
+            AdminService::normalize_provider_for_auth_method(
+                Some("Microsoft".to_string()),
+                "external_idp"
+            )
+            .as_deref(),
+            Some("AzureAD")
+        );
+        assert_eq!(
+            AdminService::normalize_provider_for_auth_method(Some("Google".to_string()), "social")
+                .as_deref(),
+            Some("Google")
+        );
+    }
+
+    #[test]
+    fn import_auth_method_uses_core_alias_canonicalization() {
+        assert_eq!(
+            AdminService::normalize_import_auth_method(
+                Some("api-key"),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            "api_key"
+        );
+        assert_eq!(
+            AdminService::normalize_import_auth_method(
+                Some("builder_id"),
+                None,
+                Some("client"),
+                Some("secret"),
+                None,
+                None,
+            ),
+            "idc"
+        );
+        assert_eq!(
+            AdminService::normalize_import_auth_method(
+                Some("social"),
+                None,
+                None,
+                None,
+                Some("https://login.microsoftonline.com/t/oauth2/v2.0/token"),
+                None,
+            ),
+            "external_idp"
+        );
+    }
+
+    #[test]
+    fn cached_credential_provider_only_auth_method_uses_core_alias_canonicalization() {
+        for (provider, expected) in [
+            ("GitHub", "social"),
+            ("BuilderId", "idc"),
+            ("Enterprise", "idc"),
+            ("Microsoft", "external_idp"),
+        ] {
+            let mut object = serde_json::Map::new();
+            object.insert(
+                "provider".to_string(),
+                serde_json::Value::String(provider.to_string()),
+            );
+
+            let credential = AdminService::credential_from_cached_credential(&object);
+            assert_eq!(
+                credential.auth_method.as_deref(),
+                Some(expected),
+                "{provider}"
+            );
+        }
+    }
+
+    #[test]
+    fn imported_credential_social_matching_uses_core_provider_canonicalization() {
+        let mut provider_only = KiroCredentials {
+            provider: Some("Github".to_string()),
+            ..Default::default()
+        };
+        assert!(AdminService::imported_credential_is_social(&provider_only));
+
+        provider_only.provider = Some("google".to_string());
+        assert!(AdminService::imported_credential_is_social(&provider_only));
+
+        let auth_method_alias = KiroCredentials {
+            auth_method: Some("GitHub".to_string()),
+            ..Default::default()
+        };
+        assert!(AdminService::imported_credential_is_social(
+            &auth_method_alias
+        ));
+
+        assert!(AdminService::provider_matches(
+            Some("Github"),
+            Some("GitHub")
+        ));
+        assert!(AdminService::provider_matches(
+            Some("google"),
+            Some("Google")
+        ));
+        assert!(!AdminService::provider_matches(
+            Some("Google"),
+            Some("GitHub")
+        ));
+    }
+
+    #[test]
+    fn parses_numeric_credential_record_id_only() {
+        assert_eq!(
+            AdminService::parse_credential_record_id(Some(&serde_json::json!(42))),
             Some(42)
         );
         assert_eq!(
-            AdminService::parse_kiro_go_import_id(Some(&serde_json::json!("43"))),
+            AdminService::parse_credential_record_id(Some(&serde_json::json!("43"))),
             Some(43)
         );
         assert_eq!(
-            AdminService::parse_kiro_go_import_id(Some(&serde_json::json!("account-1"))),
+            AdminService::parse_credential_record_id(Some(&serde_json::json!(
+                "source-credential-1"
+            ))),
             None
         );
     }
 
     #[test]
-    fn maps_kiro_go_import_enabled_and_disabled_flags() {
-        assert!(!AdminService::kiro_go_import_disabled(None, None));
-        assert!(AdminService::kiro_go_import_disabled(
+    fn maps_credential_record_import_enabled_and_disabled_flags() {
+        assert!(!AdminService::credential_record_import_disabled(None, None));
+        assert!(AdminService::credential_record_import_disabled(
             Some(true),
             Some(true)
         ));
-        assert!(!AdminService::kiro_go_import_disabled(
+        assert!(!AdminService::credential_record_import_disabled(
             Some(false),
             Some(false)
         ));
-        assert!(AdminService::kiro_go_import_disabled(None, Some(false)));
-        assert!(!AdminService::kiro_go_import_disabled(None, Some(true)));
+        assert!(AdminService::credential_record_import_disabled(
+            None,
+            Some(false)
+        ));
+        assert!(!AdminService::credential_record_import_disabled(
+            None,
+            Some(true)
+        ));
     }
 
     #[test]
-    fn kiro_go_import_request_accepts_reference_metadata_fields() {
-        let req: KiroGoImportCredentialsRequest = serde_json::from_value(serde_json::json!({
+    fn credential_record_request_accepts_reference_metadata_fields() {
+        let req: ImportCredentialRecordRequest = serde_json::from_value(serde_json::json!({
             "refreshToken": "r",
             "provider": "Enterprise",
             "userId": "user-1",
@@ -4881,8 +7986,8 @@ mod kiro_go_import_tests {
     }
 
     #[test]
-    fn token_json_item_accepts_kiro_go_weight_field() {
-        let item: TokenJsonItem = serde_json::from_value(serde_json::json!({
+    fn credential_cache_item_accepts_weight_field() {
+        let item: CredentialCacheItem = serde_json::from_value(serde_json::json!({
             "provider": "Social",
             "refreshToken": "r",
             "authMethod": "social",
@@ -4909,12 +8014,106 @@ mod aws_sso_callback_tests {
     }
 
     #[test]
-    fn parses_path_and_query_callback_like_kiro_account_manager() {
+    fn parses_path_and_query_callback_with_encoded_code() {
         let params =
             parse_aws_sso_callback_params("/oauth/callback?code=abc%2Fdef&state=xyz").unwrap();
 
         assert_eq!(params.get("code").map(String::as_str), Some("abc/def"));
         assert_eq!(params.get("state").map(String::as_str), Some("xyz"));
+    }
+}
+
+#[cfg(test)]
+mod kiro_sso_admin_tests {
+    use super::*;
+
+    #[test]
+    fn kiro_sso_provider_matches_login_result_metadata() {
+        assert_eq!(
+            AdminService::kiro_sso_provider(kiro_sso::KiroSsoCaptureKind::Social),
+            "Kiro SSO"
+        );
+        assert_eq!(
+            AdminService::kiro_sso_provider(kiro_sso::KiroSsoCaptureKind::ExternalIdp),
+            "AzureAD"
+        );
+    }
+}
+
+#[cfg(test)]
+mod idc_auth_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn idc_provider_metadata_matches_reference_auth_results() {
+        assert_eq!(
+            AdminService::idc_provider_for_start_url(idc::BUILDER_ID_START_URL),
+            "BuilderId"
+        );
+        assert_eq!(
+            AdminService::idc_start_url_metadata(idc::BUILDER_ID_START_URL),
+            None
+        );
+
+        let enterprise_start_url = "https://d-1234567890.awsapps.com/start";
+        assert_eq!(
+            AdminService::idc_provider_for_start_url(enterprise_start_url),
+            "Enterprise"
+        );
+        assert_eq!(
+            AdminService::idc_start_url_metadata(enterprise_start_url).as_deref(),
+            Some(enterprise_start_url)
+        );
+        assert_eq!(
+            AdminService::idc_start_url_metadata(&format!("{enterprise_start_url}/")).as_deref(),
+            Some(enterprise_start_url)
+        );
+        assert_eq!(
+            AdminService::resolve_idc_client_id_hash(
+                "Enterprise",
+                None,
+                Some(enterprise_start_url)
+            )
+            .unwrap(),
+            AdminService::calculate_client_id_hash(enterprise_start_url)
+        );
+    }
+
+    #[test]
+    fn builder_id_and_sso_token_credentials_persist_builderid_provider() {
+        let builder = AdminService::builder_id_credential_template(
+            "client-1".to_string(),
+            "secret-1".to_string(),
+            "us-east-1".to_string(),
+            0,
+            None,
+            None,
+        );
+        assert_eq!(builder.auth_method.as_deref(), Some("idc"));
+        assert_eq!(builder.provider.as_deref(), Some("BuilderId"));
+        assert_eq!(
+            builder.client_id_hash.as_deref(),
+            Some(KIRO_BUILDER_ID_CLIENT_ID_HASH)
+        );
+
+        let sso_token = AdminService::sso_token_credential_from_import(
+            idc::ImportedSsoToken {
+                access_token: "access-1".to_string(),
+                refresh_token: Some("refresh-1".to_string()),
+                expires_in: None,
+                client_id: "client-2".to_string(),
+                client_secret: "secret-2".to_string(),
+            },
+            "us-east-1",
+            0,
+            None,
+        );
+        assert_eq!(sso_token.auth_method.as_deref(), Some("idc"));
+        assert_eq!(sso_token.provider.as_deref(), Some("BuilderId"));
+        assert_eq!(
+            sso_token.client_id_hash.as_deref(),
+            Some(KIRO_BUILDER_ID_CLIENT_ID_HASH)
+        );
     }
 }
 
@@ -4954,6 +8153,8 @@ mod settings_tests {
             )
             .unwrap(),
         );
+        let proxy_manager = Arc::new(ProxyManager::new(Vec::new(), None).unwrap());
+        token_manager.set_proxy_manager(Some(proxy_manager.clone()));
         let client_api_key_runtime =
             Arc::new(RwLock::new(config.api_key.clone().unwrap_or_default()));
         let require_api_key_runtime = Arc::new(AtomicBool::new(config.require_api_key));
@@ -4963,6 +8164,7 @@ mod settings_tests {
 
         let service = AdminService::new(
             token_manager,
+            proxy_manager,
             None,
             Arc::new(RwLock::new(config.compression.clone())),
             client_api_key_runtime.clone(),
@@ -4977,10 +8179,15 @@ mod settings_tests {
             Arc::new(RwLock::new(PromptCacheRuntime::new(
                 config.prompt_cache_ttl_seconds,
                 config.prompt_cache_accounting_enabled,
+                config.prompt_cache_max_ratio,
             ))),
             crate::model::runtime::shared_from_config(&config),
             Arc::new(RwLock::new(Vec::new())),
-            Vec::<String>::new(),
+            vec![
+                IDE_ENDPOINT_NAME.to_string(),
+                CLI_ENDPOINT_NAME.to_string(),
+                CODEWHISPERER_ENDPOINT_NAME.to_string(),
+            ],
         );
 
         (
@@ -4998,15 +8205,287 @@ mod settings_tests {
         format!("header.{payload}.sig")
     }
 
+    fn add_test_proxy(service: &AdminService, region: Option<&str>) -> u64 {
+        service
+            .proxy_manager
+            .add(ProxyEntry {
+                url: "http://proxy.local:8080".to_string(),
+                region: region.map(str::to_string),
+                max_concurrency: Some(2),
+                ..Default::default()
+            })
+            .unwrap()
+    }
+
+    fn jwt_with_iss_exp(iss: &str, exp: i64) -> String {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+        let payload =
+            URL_SAFE_NO_PAD.encode(serde_json::json!({ "iss": iss, "exp": exp }).to_string());
+        format!("header.{payload}.sig")
+    }
+
+    fn client_secret_with_start_url(start_url: &str) -> String {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+        let serialized = serde_json::json!({ "initiateLoginUri": start_url }).to_string();
+        let payload = serde_json::json!({ "serialized": serialized }).to_string();
+        let payload = URL_SAFE_NO_PAD.encode(payload);
+        format!("header.{payload}.sig")
+    }
+
+    #[test]
+    fn proxy_url_config_emits_canonical_and_compat_fields() {
+        let dir = temp_test_dir("proxy-url-config-fields");
+        let mut config = crate::model::config::Config::default();
+        config.proxy_url = Some("http://127.0.0.1:8080".to_string());
+        let credentials_path = dir.join("credentials.json");
+        let (service, _, _, _) = test_service(config, credentials_path);
+
+        let value = serde_json::to_value(service.get_proxy_url_config()).unwrap();
+
+        assert_eq!(value["proxyUrl"], "http://127.0.0.1:8080");
+        assert_eq!(value["proxyURL"], "http://127.0.0.1:8080");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn common_config_generates_and_persists_local_machine_id() {
+        let dir = temp_test_dir("common-machine-id");
+        let config_path = dir.join("config.json");
+        let credentials_path = dir.join("credentials.json");
+        let config = crate::model::config::Config::load(&config_path).unwrap();
+        config.save().unwrap();
+        let (service, _, _, _) = test_service(config, credentials_path);
+
+        let common = service.get_common_config().unwrap();
+        let saved = crate::model::config::Config::load(&config_path).unwrap();
+
+        assert_eq!(
+            saved.machine_id.as_deref(),
+            Some(common.machine_id.as_str())
+        );
+        assert!(uuid::Uuid::parse_str(&common.machine_id).is_ok());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
-    async fn import_kiro_go_credential_persists_weight_without_refresh_network() {
-        let dir = temp_test_dir("kiro-go-weight-import");
+    async fn local_machine_id_strategy_reuses_config_machine_id_for_new_imports() {
+        let dir = temp_test_dir("local-machine-id-strategy");
+        let config_path = dir.join("config.json");
+        let credentials_path = dir.join("credentials.json");
+        let mut config = crate::model::config::Config::load(&config_path).unwrap();
+        config.machine_id = Some("2582956E-CC88-4669-B546-07ADBFFCB894".to_string());
+        config.credential_machine_id_strategy =
+            crate::model::config::CredentialMachineIdStrategy::Local;
+        config.save().unwrap();
+        let (service, _, _, _) = test_service(config, credentials_path);
+
+        let req: ImportCredentialRecordRequest = serde_json::from_value(serde_json::json!({
+            "authMethod": "api-key",
+            "apiKey": "ksk_local_machine_id",
+            "disabled": true
+        }))
+        .unwrap();
+
+        let added = service.import_credential_record(req).await.unwrap();
+        let imported = service
+            .token_manager
+            .export_credentials_by_ids(&[added.credential_id])
+            .pop()
+            .unwrap();
+
+        assert_eq!(
+            imported.machine_id.as_deref(),
+            Some("2582956e-cc88-4669-b546-07adbffcb894")
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn random_machine_id_strategy_generates_distinct_machine_ids_for_new_imports() {
+        let dir = temp_test_dir("random-machine-id-strategy");
+        let config_path = dir.join("config.json");
+        let credentials_path = dir.join("credentials.json");
+        let mut config = crate::model::config::Config::load(&config_path).unwrap();
+        config.machine_id = Some("2582956e-cc88-4669-b546-07adbffcb894".to_string());
+        config.credential_machine_id_strategy =
+            crate::model::config::CredentialMachineIdStrategy::Random;
+        config.save().unwrap();
+        let (service, _, _, _) = test_service(config, credentials_path);
+
+        let first: ImportCredentialRecordRequest = serde_json::from_value(serde_json::json!({
+            "authMethod": "api-key",
+            "apiKey": "ksk_random_machine_id_1",
+            "disabled": true
+        }))
+        .unwrap();
+        let second: ImportCredentialRecordRequest = serde_json::from_value(serde_json::json!({
+            "authMethod": "api-key",
+            "apiKey": "ksk_random_machine_id_2",
+            "disabled": true
+        }))
+        .unwrap();
+
+        let first = service.import_credential_record(first).await.unwrap();
+        let second = service.import_credential_record(second).await.unwrap();
+        let credentials = service
+            .token_manager
+            .export_credentials_by_ids(&[first.credential_id, second.credential_id]);
+        let first_machine_id = credentials[0].machine_id.as_deref().unwrap();
+        let second_machine_id = credentials[1].machine_id.as_deref().unwrap();
+
+        assert!(uuid::Uuid::parse_str(first_machine_id).is_ok());
+        assert!(uuid::Uuid::parse_str(second_machine_id).is_ok());
+        assert_ne!(first_machine_id, second_machine_id);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn request_logs_response_includes_summary_counts() {
+        let dir = temp_test_dir("request-logs-summary");
+        let config = crate::model::config::Config::default();
+        let credentials_path = dir.join("credentials.json");
+        let (service, _, _, _) = test_service(config, credentials_path);
+
+        let stats = service.request_stats();
+        stats.record_success("claude", "claude-sonnet-4.5", "7", 1, 2, 0.1, 10);
+        stats.record_failure("openai", "gpt", "8", "HTTP 429", "quota", 3);
+
+        let response = service.get_request_logs();
+        let value = serde_json::to_value(&response).unwrap();
+
+        assert_eq!(value["total"], 2);
+        assert_eq!(value["success"], 1);
+        assert_eq!(value["errors"], 1);
+        assert_eq!(value["logs"][0]["credentialId"], "8");
+        assert_eq!(value["logs"][0]["accountId"], "8");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn social_manual_login_template_preserves_selected_provider_metadata() {
+        let dir = temp_test_dir("social-provider-template");
+        let config_path = dir.join("config.json");
+        let credentials_path = dir.join("credentials.json");
+        let config = crate::model::config::Config::load(&config_path).unwrap();
+        config.save().unwrap();
+        let (service, _, _, _) = test_service(config, credentials_path);
+
+        let response = service
+            .start_social_login(StartSocialLoginRequest {
+                priority: 0,
+                email: None,
+                proxy_url: None,
+                auth_endpoint: None,
+                provider: "GitHub".to_string(),
+                mode: Some("manual".to_string()),
+            })
+            .await
+            .unwrap();
+
+        let sessions = service.social_sessions.lock();
+        let session = sessions.get(&response.session_id).unwrap();
+        assert_eq!(response.mode, "manual");
+        assert!(
+            response
+                .portal_url
+                .as_deref()
+                .unwrap()
+                .contains("idp=Github")
+        );
+        assert_eq!(session.cred_template.auth_method.as_deref(), Some("social"));
+        assert_eq!(session.cred_template.provider.as_deref(), Some("GitHub"));
+
+        drop(sessions);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn import_credential_record_missing_refresh_token_reaches_service_validation() {
+        let dir = temp_test_dir("credential-record-missing-refresh");
+        let config = crate::model::config::Config::default();
+        let credentials_path = dir.join("credentials.json");
+        let (service, _, _, _) = test_service(config, credentials_path);
+
+        let req: ImportCredentialRecordRequest = serde_json::from_value(serde_json::json!({}))
+            .expect("zero-value credential-record import should parse");
+
+        let err = service.import_credential_record(req).await.unwrap_err();
+        match err {
+            AdminServiceError::InvalidRequest(message) => {
+                assert_eq!(message, "refreshToken is required");
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn import_credential_record_accepts_api_key_without_refresh_token() {
+        let dir = temp_test_dir("credential-record-api-key-import");
+        let config = crate::model::config::Config::default();
+        let credentials_path = dir.join("credentials.json");
+        let (service, _, _, _) = test_service(config, credentials_path);
+
+        let req: ImportCredentialRecordRequest = serde_json::from_value(serde_json::json!({
+            "authMethod": "api-key",
+            "apiKey": "ksk_record_import_key",
+            "endpoint": "ide",
+            "disabled": true,
+            "concurrency": 2,
+            "machineId": "machine-api-record",
+            "email": "api@example.com"
+        }))
+        .unwrap();
+
+        let added = service.import_credential_record(req).await.unwrap();
+
+        assert_eq!(added.auth_method.as_deref(), Some("api_key"));
+        assert!(added.has_api_key);
+        assert!(!added.has_refresh_token);
+        assert_eq!(added.endpoint.as_deref(), Some("ide"));
+
+        let imported = service
+            .token_manager
+            .export_credentials_by_ids(&[added.credential_id])
+            .pop()
+            .unwrap();
+        assert_eq!(imported.auth_method.as_deref(), Some("api_key"));
+        assert_eq!(imported.api_key.as_deref(), Some("ksk_record_import_key"));
+        assert!(imported.refresh_token.is_none());
+        assert!(imported.disabled);
+        assert_eq!(imported.concurrency, Some(2));
+        assert_eq!(imported.machine_id.as_deref(), Some("machine-api-record"));
+
+        let status = service.get_all_credentials();
+        let item = status
+            .credentials
+            .iter()
+            .find(|item| item.id == added.credential_id)
+            .unwrap();
+        assert_eq!(item.auth_method.as_deref(), Some("api_key"));
+        assert!(item.has_api_key);
+        assert!(!item.has_refresh_token);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn import_credential_record_persists_weight_without_refresh_network() {
+        let dir = temp_test_dir("credential-record-weight-import");
         let config = crate::model::config::Config::default();
         let credentials_path = dir.join("credentials.json");
         let (service, _, _, _) = test_service(config, credentials_path);
         let access_token = jwt_with_exp((Utc::now() + chrono::Duration::hours(1)).timestamp());
 
-        let req: KiroGoImportCredentialsRequest = serde_json::from_value(serde_json::json!({
+        let req: ImportCredentialRecordRequest = serde_json::from_value(serde_json::json!({
             "refreshToken": "r".repeat(150),
             "accessToken": access_token,
             "authMethod": "external_idp",
@@ -5020,7 +8499,7 @@ mod settings_tests {
         }))
         .unwrap();
 
-        let added = service.import_kiro_go_credential(req).await.unwrap();
+        let added = service.import_credential_record(req).await.unwrap();
         let snapshot = service.token_manager.snapshot();
         let entry = snapshot
             .entries
@@ -5031,12 +8510,142 @@ mod settings_tests {
         assert_eq!(entry.priority, 2);
         assert_eq!(entry.weight, 7);
         assert_eq!(entry.concurrency, Some(3));
+        assert_eq!(entry.provider.as_deref(), Some("AzureAD"));
+        assert_eq!(
+            entry.token_endpoint.as_deref(),
+            Some("https://login.microsoftonline.com/tenant/oauth2/v2.0/token")
+        );
+        assert_eq!(
+            entry.issuer_url.as_deref(),
+            Some("https://login.microsoftonline.com/tenant/v2.0")
+        );
         assert!(entry.disabled);
+
+        let status = service.get_all_credentials();
+        assert_eq!(status.credentials[0].provider.as_deref(), Some("AzureAD"));
+        assert!(status.credentials[0].has_token);
+        assert!(status.credentials[0].has_refresh_token);
+        assert!(status.credentials[0].has_client_id);
+        assert!(!status.credentials[0].has_client_secret);
+        assert_eq!(
+            status.credentials[0].token_endpoint.as_deref(),
+            Some("https://login.microsoftonline.com/tenant/oauth2/v2.0/token")
+        );
+        assert_eq!(
+            status.credentials[0].issuer_url.as_deref(),
+            Some("https://login.microsoftonline.com/tenant/v2.0")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn import_credential_record_assigns_proxy_before_prevalidation() {
+        let dir = temp_test_dir("credential-record-proxy-prevalidation");
+        let config = crate::model::config::Config::default();
+        let credentials_path = dir.join("credentials.json");
+        let (service, _, _, _) = test_service(config, credentials_path);
+        let proxy_id = add_test_proxy(&service, Some("us-east-1"));
+        let access_token = jwt_with_exp((Utc::now() + chrono::Duration::hours(1)).timestamp());
+
+        let req: ImportCredentialRecordRequest = serde_json::from_value(serde_json::json!({
+            "refreshToken": "r".repeat(150),
+            "accessToken": access_token,
+            "authMethod": "external_idp",
+            "clientId": "client-1",
+            "tokenEndpoint": "https://login.microsoftonline.com/tenant/oauth2/v2.0/token",
+            "issuerUrl": "https://login.microsoftonline.com/tenant/v2.0",
+            "region": "us-east-1"
+        }))
+        .unwrap();
+
+        let added = service.import_credential_record(req).await.unwrap();
+
+        let snapshot = service.token_manager.snapshot();
+        let entry = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.id == added.credential_id)
+            .unwrap();
+        assert_eq!(entry.proxy_id, Some(proxy_id));
+        assert!(entry.proxy_url.is_none());
     }
 
     #[test]
-    fn update_kiro_go_account_weight_does_not_change_priority() {
-        let dir = temp_test_dir("kiro-go-weight-update");
+    fn new_oauth_credential_assigns_proxy_before_validation() {
+        let dir = temp_test_dir("oauth-proxy-prevalidation");
+        let config = crate::model::config::Config::default();
+        let credentials_path = dir.join("credentials.json");
+        let (service, _, _, _) = test_service(config, credentials_path);
+        let proxy_id = add_test_proxy(&service, Some("us-east-1"));
+        let mut credential = KiroCredentials {
+            region: Some("us-east-1".to_string()),
+            auth_method: Some("social".to_string()),
+            provider: Some("GitHub".to_string()),
+            refresh_token: Some("r".repeat(150)),
+            ..Default::default()
+        };
+
+        service
+            .assign_proxy_before_validation(&mut credential)
+            .unwrap();
+
+        assert_eq!(credential.proxy_id, Some(proxy_id));
+    }
+
+    #[test]
+    fn assigned_pool_proxy_is_used_for_validation_before_global_proxy() {
+        let dir = temp_test_dir("validation-proxy-resolution");
+        let config = crate::model::config::Config::default();
+        let credentials_path = dir.join("credentials.json");
+        let (service, _, _, _) = test_service(config, credentials_path);
+        let proxy_id = add_test_proxy(&service, Some("us-east-1"));
+        let global_proxy = ProxyConfig::new("http://global-proxy.local:8080");
+        let mut credential = KiroCredentials {
+            region: Some("us-east-1".to_string()),
+            auth_method: Some("social".to_string()),
+            provider: Some("GitHub".to_string()),
+            refresh_token: Some("r".repeat(150)),
+            ..Default::default()
+        };
+
+        service
+            .assign_proxy_before_validation(&mut credential)
+            .unwrap();
+        let validation_proxy = service
+            .proxy_for_validation(&credential, Some(&global_proxy))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(credential.proxy_id, Some(proxy_id));
+        assert_eq!(validation_proxy.url, "http://proxy.local:8080");
+    }
+
+    #[test]
+    fn proxy_preassignment_preserves_explicit_direct_proxy() {
+        let dir = temp_test_dir("proxy-prevalidation-direct");
+        let config = crate::model::config::Config::default();
+        let credentials_path = dir.join("credentials.json");
+        let (service, _, _, _) = test_service(config, credentials_path);
+        add_test_proxy(&service, Some("us-east-1"));
+        let mut credential = KiroCredentials {
+            region: Some("us-east-1".to_string()),
+            proxy_url: Some(KiroCredentials::PROXY_DIRECT.to_string()),
+            ..Default::default()
+        };
+
+        service
+            .assign_proxy_before_validation(&mut credential)
+            .unwrap();
+
+        assert!(credential.proxy_id.is_none());
+        assert_eq!(
+            credential.proxy_url.as_deref(),
+            Some(KiroCredentials::PROXY_DIRECT)
+        );
+    }
+
+    #[test]
+    fn update_credential_alias_weight_does_not_change_priority() {
+        let dir = temp_test_dir("credential-alias-weight-update");
         let config = crate::model::config::Config::default();
         let credentials_path = dir.join("credentials.json");
         let (service, _, _, _) = test_service(config, credentials_path);
@@ -5052,10 +8661,12 @@ mod settings_tests {
             .unwrap();
 
         service
-            .update_kiro_go_account(
+            .update_credential_alias_fields(
                 id,
-                KiroGoUpdateAccountRequest {
+                CredentialAliasUpdateRequest {
                     enabled: None,
+                    nickname: None,
+                    machine_id: None,
                     weight: Some(6),
                     proxy_url: None,
                 },
@@ -5073,72 +8684,2009 @@ mod settings_tests {
     }
 
     #[test]
-    fn export_token_json_preserves_weight() {
-        let dir = temp_test_dir("token-json-weight-export");
+    fn update_credential_alias_accepts_source_id_and_profile_fields() {
+        let dir = temp_test_dir("credential-alias-source-update");
         let config = crate::model::config::Config::default();
         let credentials_path = dir.join("credentials.json");
         let (service, _, _, _) = test_service(config, credentials_path);
 
         let mut cred = KiroCredentials::default();
+        cred.source_account_id = Some("source-credential".to_string());
         cred.refresh_token = Some("r".repeat(150));
         cred.access_token = Some("access-token".to_string());
-        cred.auth_method = Some("social".to_string());
-        cred.priority = 2;
-        cred.weight = 5;
         let id = service
             .token_manager
             .add_prevalidated_credential(cred)
             .unwrap();
 
-        let exported = service.export_credentials_to_token_json(&[id]);
+        service
+            .update_credential_alias_by_path_id(
+                "source-credential",
+                CredentialAliasUpdateRequest {
+                    enabled: Some(false),
+                    nickname: Some("Work Credential".to_string()),
+                    machine_id: Some("machine-updated".to_string()),
+                    weight: Some(8),
+                    proxy_url: Some("http://proxy.local:8080".to_string()),
+                },
+            )
+            .unwrap();
 
-        assert_eq!(exported.len(), 1);
-        assert_eq!(exported[0].priority, 2);
-        assert_eq!(exported[0].weight, 5);
+        let snapshot = service.token_manager.snapshot();
+        let entry = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .unwrap();
+        assert!(entry.disabled);
+        assert_eq!(entry.nickname.as_deref(), Some("Work Credential"));
+        assert_eq!(entry.machine_id.as_deref(), Some("machine-updated"));
+        assert_eq!(entry.weight, 8);
+        assert_eq!(entry.proxy_url.as_deref(), Some("http://proxy.local:8080"));
     }
 
     #[test]
-    fn export_kam_preserves_reference_account_metadata() {
-        let dir = temp_test_dir("kam-metadata-export");
+    fn delete_credential_by_path_id_accepts_source_id() {
+        let dir = temp_test_dir("credential-source-delete");
         let config = crate::model::config::Config::default();
         let credentials_path = dir.join("credentials.json");
         let (service, _, _, _) = test_service(config, credentials_path);
 
         let mut cred = KiroCredentials::default();
-        cred.access_token = Some("access-token".to_string());
+        cred.source_account_id = Some("source-credential".to_string());
         cred.refresh_token = Some("r".repeat(150));
-        cred.auth_method = Some("idc".to_string());
-        cred.provider = Some("Enterprise".to_string());
-        cred.user_id = Some("user-1".to_string());
-        cred.client_id = Some("client-1".to_string());
-        cred.client_secret = Some("secret-1".to_string());
-        cred.region = Some("us-east-1".to_string());
-        cred.start_url = Some("https://d-123.awsapps.com/start".to_string());
-        cred.client_id_hash = Some("hash-1".to_string());
-        cred.id_token = Some("id-token-1".to_string());
-        cred.sso_session_id = Some("session-1".to_string());
+        cred.access_token = Some("access-token".to_string());
+        service
+            .token_manager
+            .add_prevalidated_credential(cred)
+            .unwrap();
 
+        service
+            .delete_credential_by_path_id("source-credential")
+            .unwrap();
+
+        assert!(service.token_manager.snapshot().entries.is_empty());
+    }
+
+    #[test]
+    fn single_credential_id_resolution_preserves_snapshot_order_on_source_id_conflict() {
+        let dir = temp_test_dir("single-credential-id-conflict");
+        let config = crate::model::config::Config::default();
+        let credentials_path = dir.join("credentials.json");
+        let (service, _, _, _) = test_service(config, credentials_path);
+
+        let mut first = KiroCredentials::default();
+        first.refresh_token = Some("r".repeat(150));
+        first.access_token = Some("access-1".to_string());
+        let first_id = service
+            .token_manager
+            .add_prevalidated_credential(first)
+            .unwrap();
+
+        let mut second = KiroCredentials::default();
+        second.source_account_id = Some(first_id.to_string());
+        second.refresh_token = Some("s".repeat(150));
+        second.access_token = Some("access-2".to_string());
+        let second_id = service
+            .token_manager
+            .add_prevalidated_credential(second)
+            .unwrap();
+
+        assert_eq!(
+            service
+                .resolve_credential_id(&first_id.to_string())
+                .unwrap(),
+            first_id
+        );
+        assert_ne!(
+            service
+                .resolve_credential_id(&first_id.to_string())
+                .unwrap(),
+            second_id
+        );
+    }
+
+    #[test]
+    fn list_credential_alias_views_returns_source_metadata_items() {
+        let dir = temp_test_dir("credential-alias-view-list");
+        let config = crate::model::config::Config::default();
+        let credentials_path = dir.join("credentials.json");
+        let (service, _, _, _) = test_service(config, credentials_path);
+
+        let mut cred = KiroCredentials::default();
+        cred.source_account_id = Some("source-credential".to_string());
+        cred.refresh_token = Some("r".repeat(150));
+        cred.access_token = Some("access-token".to_string());
+        cred.expires_at = Some("2026-06-29T00:00:00Z".to_string());
+        cred.auth_method = Some("idc".to_string());
+        cred.provider = Some("BuilderId".to_string());
+        cred.user_id = Some("user-1".to_string());
+        cred.region = Some("us-east-1".to_string());
+        cred.machine_id = Some("machine-1".to_string());
+        cred.email = Some("user@example.com".to_string());
+        cred.nickname = Some("User".to_string());
+        cred.weight = 4;
+        cred.overage_status = Some("ENABLED".to_string());
+        cred.overage_capability = Some("OVERAGE_CAPABLE".to_string());
+        cred.overage_cap = Some(50.0);
+        cred.overage_rate = Some(0.04);
+        cred.current_overages = Some(1.5);
+        cred.overage_checked_at = Some(1_782_691_200);
+        cred.proxy_url = Some("http://proxy.local:8080".to_string());
+        cred.subscription_type = Some("PRO_PLUS".to_string());
+        cred.subscription_title = Some("KIRO PRO+".to_string());
+        cred.days_remaining = Some(20);
+        cred.usage_current = Some(3.0);
+        cred.usage_limit = Some(10.0);
+        cred.usage_percent = Some(30.0);
+        cred.next_reset_date = Some("2026-07-01".to_string());
+        cred.last_refresh = Some(1_782_691_201);
+        cred.trial_usage_current = Some(1.0);
+        cred.trial_usage_limit = Some(5.0);
+        cred.trial_usage_percent = Some(20.0);
+        cred.trial_status = Some("ACTIVE".to_string());
+        cred.trial_expires_at = Some(1_785_283_200);
+        cred.request_count = Some(7);
+        cred.error_count = Some(2);
+        cred.total_tokens = Some(1234);
+        cred.total_credits = Some(12.5);
+        cred.last_used_at = Some(1_782_691_202);
+        service
+            .token_manager
+            .add_prevalidated_credential(cred)
+            .unwrap();
+
+        let alias_views = service.list_credential_alias_views();
+
+        assert_eq!(alias_views.len(), 1);
+        let alias_view = &alias_views[0];
+        assert_eq!(alias_view.id, "source-credential");
+        assert_eq!(alias_view.email, "user@example.com");
+        assert_eq!(alias_view.user_id, "user-1");
+        assert_eq!(alias_view.nickname, "User");
+        assert_eq!(alias_view.auth_method, "idc");
+        assert_eq!(alias_view.provider, "BuilderId");
+        assert_eq!(alias_view.region, "us-east-1");
+        assert!(alias_view.enabled);
+        assert_eq!(alias_view.expires_at, 1_782_691_200);
+        assert!(alias_view.has_token);
+        assert_eq!(alias_view.machine_id, "machine-1");
+        assert_eq!(alias_view.weight, 4);
+        assert_eq!(alias_view.overage_status, "ENABLED");
+        assert_eq!(alias_view.overage_capability, "OVERAGE_CAPABLE");
+        assert_eq!(alias_view.overage_cap, 50.0);
+        assert_eq!(alias_view.overage_rate, 0.04);
+        assert_eq!(alias_view.current_overages, 1.5);
+        assert_eq!(alias_view.overage_checked_at, 1_782_691_200);
+        assert_eq!(alias_view.proxy_url, "http://proxy.local:8080");
+        assert_eq!(alias_view.subscription_type, "PRO_PLUS");
+        assert_eq!(alias_view.subscription_title, "KIRO PRO+");
+        assert_eq!(alias_view.days_remaining, 20);
+        assert_eq!(alias_view.usage_current, 3.0);
+        assert_eq!(alias_view.usage_limit, 10.0);
+        assert_eq!(alias_view.usage_percent, 30.0);
+        assert_eq!(alias_view.next_reset_date, "2026-07-01");
+        assert_eq!(alias_view.last_refresh, 1_782_691_201);
+        assert_eq!(alias_view.trial_usage_current, 1.0);
+        assert_eq!(alias_view.trial_usage_limit, 5.0);
+        assert_eq!(alias_view.trial_usage_percent, 20.0);
+        assert_eq!(alias_view.trial_status, "ACTIVE");
+        assert_eq!(alias_view.trial_expires_at, 1_785_283_200);
+        assert_eq!(alias_view.request_count, 7);
+        assert_eq!(alias_view.error_count, 2);
+        assert_eq!(alias_view.total_tokens, 1234);
+        assert_eq!(alias_view.total_credits, 12.5);
+        assert_eq!(alias_view.last_used, 1_782_691_202);
+
+        let serialized = serde_json::to_value(alias_view).unwrap();
+        assert_eq!(serialized["proxyUrl"], "http://proxy.local:8080");
+        assert_eq!(serialized["proxyURL"], "http://proxy.local:8080");
+    }
+
+    #[test]
+    fn credential_refresh_info_uses_source_refresh_shape() {
+        let dir = temp_test_dir("credential-refresh-info");
+        let config = crate::model::config::Config::default();
+        let credentials_path = dir.join("credentials.json");
+        let (service, _, _, _) = test_service(config, credentials_path);
+
+        let mut cred = KiroCredentials::default();
+        cred.refresh_token = Some("r".repeat(150));
+        cred.access_token = Some("access-token".to_string());
+        cred.email = Some("user@example.com".to_string());
+        cred.user_id = Some("user-1".to_string());
+        cred.subscription_type = Some("PRO_PLUS".to_string());
+        cred.subscription_title = Some("KIRO PRO+".to_string());
+        cred.days_remaining = Some(12);
+        cred.usage_current = Some(4.0);
+        cred.usage_limit = Some(20.0);
+        cred.usage_percent = Some(20.0);
+        cred.next_reset_date = Some("2026-07-01".to_string());
+        cred.last_refresh = Some(1_782_691_201);
+        cred.trial_usage_current = Some(1.0);
+        cred.trial_usage_limit = Some(5.0);
+        cred.trial_usage_percent = Some(20.0);
+        cred.trial_status = Some("ACTIVE".to_string());
+        cred.trial_expires_at = Some(1_785_283_200);
         let id = service
             .token_manager
             .add_prevalidated_credential(cred)
             .unwrap();
-        let exported = service.export_credentials_to_kam(&[id]);
+        let snapshot = service.token_manager.snapshot();
+        let entry = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .unwrap();
 
-        assert_eq!(exported.len(), 1);
-        let item = &exported[0];
-        assert_eq!(item.provider.as_deref(), Some("Enterprise"));
-        assert_eq!(item.user_id.as_deref(), Some("user-1"));
+        let info = AdminService::credential_refresh_info_from_entry(entry);
+        let value = serde_json::to_value(&info).unwrap();
+
+        assert_eq!(value["Email"], "user@example.com");
+        assert_eq!(value["UserId"], "user-1");
+        assert_eq!(value["SubscriptionType"], "PRO_PLUS");
+        assert_eq!(value["SubscriptionTitle"], "KIRO PRO+");
+        assert_eq!(value["DaysRemaining"], 12);
+        assert_eq!(value["UsageCurrent"], 4.0);
+        assert_eq!(value["UsageLimit"], 20.0);
+        assert_eq!(value["UsagePercent"], 20.0);
+        assert_eq!(value["NextResetDate"], "2026-07-01");
+        assert_eq!(value["LastRefresh"], 1_782_691_201);
+        assert_eq!(value["TrialUsageCurrent"], 1.0);
+        assert_eq!(value["TrialUsageLimit"], 5.0);
+        assert_eq!(value["TrialUsagePercent"], 20.0);
+        assert_eq!(value["TrialStatus"], "ACTIVE");
+        assert_eq!(value["TrialExpiresAt"], 1_785_283_200);
+    }
+
+    #[test]
+    fn get_credential_full_export_accepts_source_id_and_returns_string_id() {
+        let dir = temp_test_dir("credential-full-source-id");
+        let config = crate::model::config::Config::default();
+        let credentials_path = dir.join("credentials.json");
+        let (service, _, _, _) = test_service(config, credentials_path);
+
+        let mut cred = KiroCredentials::default();
+        cred.source_account_id = Some("source-credential".to_string());
+        cred.access_token = Some("access-token".to_string());
+        cred.refresh_token = Some("r".repeat(150));
+        cred.client_id = Some("client-id".to_string());
+        cred.client_secret = Some("client-secret".to_string());
+        cred.auth_method = Some("idc".to_string());
+        cred.provider = Some("BuilderId".to_string());
+        cred.email = Some("user@example.com".to_string());
+        cred.user_id = Some("user-1".to_string());
+        cred.nickname = Some("Work".to_string());
+        cred.region = Some("us-east-1".to_string());
+        cred.expires_at = Some("2026-06-29T00:00:00Z".to_string());
+        cred.machine_id = Some("machine-1".to_string());
+        cred.profile_arn = Some("profile-arn".to_string());
+        cred.proxy_url = Some("http://proxy.local:8080".to_string());
+        cred.weight = 5;
+        cred.request_count = Some(7);
+        cred.error_count = Some(2);
+        cred.total_tokens = Some(1234);
+        cred.total_credits = Some(12.5);
+        cred.last_used_at = Some(1_782_691_202);
+        service
+            .token_manager
+            .add_prevalidated_credential(cred)
+            .unwrap();
+
+        let credential_export = service
+            .get_credential_full_export_by_path_id("source-credential")
+            .unwrap();
+        let value = serde_json::to_value(&credential_export).unwrap();
+
+        assert_eq!(credential_export.id, "source-credential");
+        assert_eq!(credential_export.email.as_deref(), Some("user@example.com"));
+        assert_eq!(credential_export.user_id.as_deref(), Some("user-1"));
+        assert_eq!(credential_export.nickname, "Work");
         assert_eq!(
-            item.start_url.as_deref(),
-            Some("https://d-123.awsapps.com/start")
+            credential_export.access_token.as_deref(),
+            Some("access-token")
         );
-        assert_eq!(item.client_id_hash.as_deref(), Some("hash-1"));
-        assert_eq!(item.id_token.as_deref(), Some("id-token-1"));
-        assert_eq!(item.sso_session_id.as_deref(), Some("session-1"));
+        assert_eq!(credential_export.refresh_token, "r".repeat(150));
+        assert_eq!(credential_export.client_id.as_deref(), Some("client-id"));
+        assert_eq!(
+            credential_export.client_secret.as_deref(),
+            Some("client-secret")
+        );
+        assert_eq!(credential_export.auth_method, "idc");
+        assert_eq!(credential_export.provider.as_deref(), Some("BuilderId"));
+        assert_eq!(credential_export.region.as_deref(), Some("us-east-1"));
+        assert_eq!(credential_export.expires_at, Some(1_782_691_200));
+        assert_eq!(credential_export.machine_id.as_deref(), Some("machine-1"));
+        assert_eq!(
+            credential_export.profile_arn.as_deref(),
+            Some("profile-arn")
+        );
+        assert_eq!(
+            credential_export.proxy_url.as_deref(),
+            Some("http://proxy.local:8080")
+        );
+        assert_eq!(credential_export.weight, 5);
+        assert_eq!(credential_export.request_count, 7);
+        assert_eq!(credential_export.error_count, 2);
+        assert_eq!(credential_export.total_tokens, 1234);
+        assert_eq!(credential_export.total_credits, 12.5);
+        assert_eq!(credential_export.last_used, 1_782_691_202);
+        assert_eq!(value["id"], "source-credential");
+        assert!(value["tokenEndpoint"].is_null());
+        assert_eq!(value["proxyUrl"], "http://proxy.local:8080");
+        assert_eq!(value["proxyURL"], "http://proxy.local:8080");
+    }
+
+    #[test]
+    fn cached_credential_models_accepts_source_id_and_returns_model_ids() {
+        let dir = temp_test_dir("credential-cached-models");
+        let config = crate::model::config::Config::default();
+        let credentials_path = dir.join("credentials.json");
+        let (service, _, _, _) = test_service(config, credentials_path);
+
+        let mut cred = KiroCredentials::default();
+        cred.source_account_id = Some("source-credential".to_string());
+        cred.access_token = Some("access-token".to_string());
+        cred.refresh_token = Some("r".repeat(150));
+        let id = service
+            .token_manager
+            .add_prevalidated_credential(cred)
+            .unwrap();
+        service.token_manager.set_model_list(
+            id,
+            [
+                " Claude-Sonnet-4.5 ".to_string(),
+                "claude-haiku-4.5".to_string(),
+            ],
+        );
+
+        let response = service.get_cached_credential_models_by_path_id("source-credential");
+        assert!(response.success);
+        assert_eq!(
+            response.models,
+            vec![
+                "claude-haiku-4.5".to_string(),
+                "claude-sonnet-4.5".to_string()
+            ]
+        );
+
+        let missing = service.get_cached_credential_models_by_path_id("missing");
+        assert!(missing.success);
+        assert!(missing.models.is_empty());
+    }
+
+    #[test]
+    fn credential_overage_uses_source_id_snapshot_shape() {
+        let dir = temp_test_dir("credential-overage-source-id");
+        let config = crate::model::config::Config::default();
+        let credentials_path = dir.join("credentials.json");
+        let (service, _, _, _) = test_service(config, credentials_path);
+
+        let mut cred = KiroCredentials::default();
+        cred.source_account_id = Some("source-credential".to_string());
+        cred.access_token = Some("access-token".to_string());
+        cred.refresh_token = Some("r".repeat(150));
+        cred.subscription_title = Some("KIRO PRO+".to_string());
+        cred.overage_status = Some("ENABLED".to_string());
+        cred.overage_capability = Some("OVERAGE_CAPABLE".to_string());
+        cred.overage_cap = Some(50.0);
+        cred.overage_rate = Some(0.04);
+        cred.current_overages = Some(2.5);
+        cred.overage_checked_at = Some(1_782_691_200);
+        let id = service
+            .token_manager
+            .add_prevalidated_credential(cred)
+            .unwrap();
+
+        assert_eq!(
+            service.resolve_credential_id("source-credential").unwrap(),
+            id
+        );
+
+        let balance = BalanceResponse {
+            id,
+            subscription_title: Some("KIRO PRO+".to_string()),
+            subscription_type: Some("PRO_PLUS".to_string()),
+            current_usage: 12.5,
+            usage_limit: 10.0,
+            remaining: 0.0,
+            usage_percentage: 125.0,
+            next_reset_at: None,
+            overage_cap: 50.0,
+            overage_capability: Some("OVERAGE_CAPABLE".to_string()),
+            overage_status: Some("ENABLED".to_string()),
+        };
+        let response = service.credential_overage_response(id, Some(&balance), None);
+        let value = serde_json::to_value(&response).unwrap();
+
+        assert!(response.success);
+        assert_eq!(value["overageStatus"], "ENABLED");
+        assert_eq!(value["overageCapability"], "OVERAGE_CAPABLE");
+        assert_eq!(value["subscriptionTitle"], "KIRO PRO+");
+        assert_eq!(value["overageCap"], 50.0);
+        assert_eq!(value["overageRate"], 0.04);
+        assert_eq!(value["currentOverages"], 2.5);
+        assert_eq!(value["overageCheckedAt"], 1_782_691_200);
+    }
+
+    #[test]
+    fn credential_test_request_body_uses_minimal_chat() {
+        let dir = temp_test_dir("credential-test-body");
+        let config = crate::model::config::Config::default();
+        let credentials_path = dir.join("credentials.json");
+        let (service, _, _, _) = test_service(config, credentials_path);
+
+        let body = service
+            .credential_test_request_body("claude-sonnet-4")
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(
+            value["conversationState"]["currentMessage"]["userInputMessage"]["content"],
+            "say ok"
+        );
+        assert_eq!(value["inferenceConfig"]["maxTokens"], 5);
+    }
+
+    #[test]
+    fn credential_probe_reply_aggregation_normalizes_cumulative_text() {
+        let mut output = String::new();
+        let mut previous = String::new();
+
+        AdminService::append_cumulative_delta(&mut output, &mut previous, "o");
+        AdminService::append_cumulative_delta(&mut output, &mut previous, "ok");
+        AdminService::append_cumulative_delta(&mut output, &mut previous, "ok");
+        AdminService::append_cumulative_delta(&mut output, &mut previous, "okay");
+
+        assert_eq!(output, "okay");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn batch_credentials_accepts_source_ids_and_returns_account_wire_shape() {
+        let dir = temp_test_dir("credential-batch");
+        let config = crate::model::config::Config::default();
+        let credentials_path = dir.join("credentials.json");
+        let (service, _, _, _) = test_service(config, credentials_path);
+
+        let mut cred = KiroCredentials::default();
+        cred.source_account_id = Some("source-credential".to_string());
+        cred.refresh_token = Some("r".repeat(150));
+        cred.access_token = Some("access-token".to_string());
+        let local_id = service
+            .token_manager
+            .add_prevalidated_credential(cred)
+            .unwrap();
+
+        let response = service
+            .batch_credentials(CredentialBatchRequest {
+                ids: vec![
+                    serde_json::json!("source-credential"),
+                    serde_json::json!("missing"),
+                ],
+                action: "disable".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert!(response.success);
+        assert_eq!(response.count, Some(2));
+        assert_eq!(response.refreshed, None);
+        assert_eq!(response.failed, None);
+        let snapshot = service.token_manager.snapshot();
+        assert!(
+            snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.id == local_id)
+                .unwrap()
+                .disabled
+        );
+
+        let refresh_response = service
+            .batch_credentials(CredentialBatchRequest {
+                ids: vec![serde_json::json!("missing")],
+                action: "refresh".to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(refresh_response.success);
+        assert_eq!(refresh_response.count, None);
+        assert_eq!(refresh_response.refreshed, Some(0));
+        assert_eq!(refresh_response.failed, Some(1));
+    }
+
+    #[test]
+    fn batch_credential_id_lookup_preserves_snapshot_order_on_source_id_conflict() {
+        let dir = temp_test_dir("credential-id-lookup-conflict");
+        let config = crate::model::config::Config::default();
+        let credentials_path = dir.join("credentials.json");
+        let (service, _, _, _) = test_service(config, credentials_path);
+
+        let mut first = KiroCredentials::default();
+        first.refresh_token = Some("r".repeat(150));
+        first.access_token = Some("access-1".to_string());
+        let first_id = service
+            .token_manager
+            .add_prevalidated_credential(first)
+            .unwrap();
+
+        let mut second = KiroCredentials::default();
+        second.source_account_id = Some(first_id.to_string());
+        second.refresh_token = Some("s".repeat(150));
+        second.access_token = Some("access-2".to_string());
+        let second_id = service
+            .token_manager
+            .add_prevalidated_credential(second)
+            .unwrap();
+
+        let resolved = service.resolve_credential_ids(&[serde_json::json!(first_id.to_string())]);
+        assert_eq!(resolved, vec![Some(first_id)]);
+        assert_ne!(resolved, vec![Some(second_id)]);
+    }
+
+    #[test]
+    fn export_credential_snapshot_matches_view_and_filters_by_source_id() {
+        let dir = temp_test_dir("credential-export");
+        let config = crate::model::config::Config::default();
+        let credentials_path = dir.join("credentials.json");
+        let (service, _, _, _) = test_service(config, credentials_path);
+
+        let mut first = KiroCredentials::default();
+        first.source_account_id = Some("source-1".to_string());
+        first.refresh_token = Some("r".repeat(150));
+        first.access_token = Some("access-1".to_string());
+        first.csrf_token = Some("csrf-1".to_string());
+        first.expires_at = Some("2026-06-29T00:00:00Z".to_string());
+        first.auth_method = Some("idc".to_string());
+        first.provider = Some("BuilderId".to_string());
+        first.client_id = Some("client-1".to_string());
+        first.client_secret = Some("secret-1".to_string());
+        first.region = Some("us-east-1".to_string());
+        first.email = Some("first@example.com".to_string());
+        first.nickname = Some("First".to_string());
+        first.user_id = Some("user-1".to_string());
+        first.machine_id = Some("machine-1".to_string());
+        first.subscription_type = Some("POWER".to_string());
+        first.subscription_title = Some("KIRO POWER".to_string());
+        first.usage_current = Some(3.0);
+        first.usage_limit = Some(10.0);
+        first.usage_percent = Some(30.0);
+        first.last_refresh = Some(1_782_691_200_000);
+        first.created_at = Some(1_782_691_100_000);
+        first.last_used_at = Some(1_782_691_150_000);
+        first.tags = Some(serde_json::json!(["alpha", 7, "beta"]));
+        let first_id = service
+            .token_manager
+            .add_prevalidated_credential(first)
+            .unwrap();
+
+        let mut second = KiroCredentials::default();
+        second.source_account_id = Some("source-2".to_string());
+        second.refresh_token = Some("s".repeat(150));
+        second.access_token = Some("access-2".to_string());
+        service
+            .token_manager
+            .add_prevalidated_credential(second)
+            .unwrap();
+
+        let all = service.export_credential_snapshot(&[]);
+        assert_eq!(all.credentials.len(), 2);
+        let all_value = serde_json::to_value(&all).unwrap();
+        assert_eq!(all_value["credentials"], all_value["accounts"]);
+        assert!(all.exported_at > 0);
+        assert!(all.groups.is_empty());
+        assert!(all.tags.is_empty());
+
+        let by_source = service.export_credential_snapshot(&[serde_json::json!("source-1")]);
+        assert_eq!(by_source.credentials.len(), 1);
+        let by_source_value = serde_json::to_value(&by_source).unwrap();
+        assert_eq!(
+            by_source_value["accounts"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(by_source_value["credentials"][0]["provider"], "BuilderId");
+        assert_eq!(by_source_value["credentials"][0]["idp"], "BuilderId");
+        let snapshot_item = &by_source.credentials[0];
+        assert_eq!(snapshot_item.id, "source-1");
+        assert_eq!(snapshot_item.email, "first@example.com");
+        assert_eq!(snapshot_item.nickname, "First");
+        assert_eq!(snapshot_item.provider, "BuilderId");
+        assert_eq!(snapshot_item.user_id.as_deref(), Some("user-1"));
+        assert_eq!(snapshot_item.machine_id.as_deref(), Some("machine-1"));
+        assert_eq!(snapshot_item.credentials.access_token, "access-1");
+        assert_eq!(snapshot_item.credentials.csrf_token, "csrf-1");
+        assert_eq!(snapshot_item.credentials.refresh_token, "r".repeat(150));
+        assert_eq!(
+            snapshot_item.credentials.client_id.as_deref(),
+            Some("client-1")
+        );
+        assert_eq!(
+            snapshot_item.credentials.client_secret.as_deref(),
+            Some("secret-1")
+        );
+        assert_eq!(
+            snapshot_item.credentials.region.as_deref(),
+            Some("us-east-1")
+        );
+        assert_eq!(snapshot_item.credentials.expires_at, 1_782_691_200_000);
+        assert_eq!(
+            snapshot_item.credentials.auth_method.as_deref(),
+            Some("idc")
+        );
+        assert_eq!(
+            snapshot_item.credentials.provider.as_deref(),
+            Some("BuilderId")
+        );
+        assert_eq!(snapshot_item.subscription.subscription_type, "Pro_Plus");
+        assert_eq!(
+            snapshot_item.subscription.title.as_deref(),
+            Some("KIRO POWER")
+        );
+        assert_eq!(snapshot_item.usage.current, 3.0);
+        assert_eq!(snapshot_item.usage.limit, 10.0);
+        assert_eq!(snapshot_item.usage.percent_used, 30.0);
+        assert_eq!(snapshot_item.usage.last_updated, 1_782_691_200_000);
+        assert_eq!(
+            snapshot_item.tags,
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
+        assert_eq!(snapshot_item.status, "active");
+        assert_eq!(snapshot_item.created_at, 1_782_691_100_000);
+        assert_eq!(snapshot_item.last_used_at, 1_782_691_150_000);
+
+        let by_local_id = service.export_credential_snapshot(&[serde_json::json!(first_id)]);
+        assert_eq!(by_local_id.credentials.len(), 1);
+        assert_eq!(by_local_id.credentials[0].id, "source-1");
+        let by_local_id_value = serde_json::to_value(&by_local_id).unwrap();
+        assert_eq!(by_local_id_value["accounts"][0]["id"], "source-1");
+    }
+
+    #[test]
+    fn import_credentials_auto_detects_cached_credential_items_wrapper() {
+        let dir = temp_test_dir("cached-credential-wrapper-import");
+        let config = crate::model::config::Config::default();
+        let credentials_path = dir.join("credentials.json");
+        let (service, _, _, _) = test_service(config, credentials_path);
+
+        let import_payload = serde_json::json!({
+            "items": [{
+                "provider": "BuilderId",
+                "refreshToken": "b".repeat(150),
+                "clientId": "client-cached-credential",
+                "clientSecret": "secret-cached-credential",
+                "priority": 4,
+                "weight": 2,
+                "region": "us-east-1",
+                "apiRegion": "us-west-2",
+                "machineId": "machine-cached-credential"
+            }]
+        });
+
+        let response = service.import_credentials(ImportCredentialsRequest {
+            dry_run: false,
+            mode: CredentialImportMode::SkipExisting,
+            input: import_payload,
+        });
+
+        assert_eq!(response.summary.added, 1);
+        assert_eq!(response.summary.invalid, 0);
+        assert_eq!(
+            response.items[0].source_format,
+            SOURCE_FORMAT_CACHED_CREDENTIAL
+        );
+        assert_eq!(response.items[0].auth_method.as_deref(), Some("idc"));
+
+        let snapshot = service.token_manager.snapshot();
+        let exported = service
+            .token_manager
+            .export_credentials_by_ids(&[snapshot.entries[0].id]);
+        let imported = exported.into_iter().next().unwrap();
+        assert_eq!(imported.auth_method.as_deref(), Some("idc"));
+        assert_eq!(imported.provider.as_deref(), Some("BuilderId"));
+        assert_eq!(
+            imported.client_id.as_deref(),
+            Some("client-cached-credential")
+        );
+        assert_eq!(
+            imported.client_secret.as_deref(),
+            Some("secret-cached-credential")
+        );
+        assert_eq!(imported.priority, 4);
+        assert_eq!(imported.weight, 2);
+        assert_eq!(imported.region.as_deref(), Some("us-east-1"));
+        assert_eq!(imported.api_region.as_deref(), Some("us-west-2"));
+        assert_eq!(
+            imported.machine_id.as_deref(),
+            Some("machine-cached-credential")
+        );
+    }
+
+    #[test]
+    fn import_credentials_cached_credential_preserves_external_idp_material() {
+        let dir = temp_test_dir("cached-credential-external-idp");
+        let config = crate::model::config::Config::default();
+        let credentials_path = dir.join("credentials.json");
+        let (service, _, _, _) = test_service(config, credentials_path);
+        let response = service.import_credentials(ImportCredentialsRequest {
+            dry_run: false,
+            mode: CredentialImportMode::SkipExisting,
+            input: serde_json::json!({
+                "items": [{
+                    "provider": "Microsoft",
+                    "accessToken": "access-token-import",
+                    "refreshToken": "e".repeat(150),
+                    "profileArn": "arn:aws:codewhisperer:profile/imported",
+                    "expiresAt": "2026-06-29T00:00:00Z",
+                    "clientId": "client-import",
+                    "authMethod": "microsoft",
+                    "userId": "https://login.microsoftonline.com/tenant/v2.0",
+                    "tokenEndpoint": "https://login.microsoftonline.com/tenant/oauth2/v2.0/token",
+                    "issuerUrl": "https://login.microsoftonline.com/tenant/v2.0",
+                    "scopes": "api://client-import/codewhisperer:conversations offline_access",
+                    "clientIdHash": "client-hash-import",
+                    "idToken": "id-token-import",
+                    "ssoSessionId": "sso-session-import",
+                    "priority": 8,
+                    "weight": 4,
+                    "concurrency": 2,
+                    "region": "us-east-1",
+                    "authRegion": "us-east-1",
+                    "apiRegion": "eu-central-1",
+                    "machineId": "machine-import",
+                    "email": "import@example.com",
+                    "proxyURL": "direct",
+                    "overageStatus": "DISABLED",
+                    "endpoint": "ide"
+                }]
+            }),
+        });
+
+        assert_eq!(response.summary.added, 1);
+        assert_eq!(response.summary.invalid, 0);
+
+        let snapshot = service.token_manager.snapshot();
+        let exported = service
+            .token_manager
+            .export_credentials_by_ids(&[snapshot.entries[0].id]);
+        let imported = exported.into_iter().next().unwrap();
+        assert_eq!(imported.auth_method.as_deref(), Some("external_idp"));
+        assert_eq!(imported.provider.as_deref(), Some("AzureAD"));
+        assert_eq!(
+            imported.access_token.as_deref(),
+            Some("access-token-import")
+        );
+        assert_eq!(imported.client_id.as_deref(), Some("client-import"));
+        assert_eq!(
+            imported.token_endpoint.as_deref(),
+            Some("https://login.microsoftonline.com/tenant/oauth2/v2.0/token")
+        );
+        assert_eq!(
+            imported.issuer_url.as_deref(),
+            Some("https://login.microsoftonline.com/tenant/v2.0")
+        );
+        assert_eq!(
+            imported.scopes.as_deref(),
+            Some("api://client-import/codewhisperer:conversations offline_access")
+        );
+        assert_eq!(
+            imported.client_id_hash.as_deref(),
+            Some("client-hash-import")
+        );
+        assert_eq!(imported.id_token.as_deref(), Some("id-token-import"));
+        assert_eq!(
+            imported.sso_session_id.as_deref(),
+            Some("sso-session-import")
+        );
+        assert_eq!(imported.priority, 8);
+        assert_eq!(imported.weight, 4);
+        assert_eq!(imported.concurrency, Some(2));
+        assert_eq!(imported.auth_region.as_deref(), Some("us-east-1"));
+        assert_eq!(imported.api_region.as_deref(), Some("eu-central-1"));
+        assert_eq!(imported.machine_id.as_deref(), Some("machine-import"));
+        assert_eq!(imported.proxy_url.as_deref(), Some("direct"));
+        assert_eq!(imported.overage_status.as_deref(), Some("DISABLED"));
+        assert_eq!(imported.endpoint.as_deref(), Some("ide"));
+    }
+
+    #[test]
+    fn import_credentials_accepts_single_cached_credential_item() {
+        let dir = temp_test_dir("cached-credential-wrapper");
+        let config = crate::model::config::Config::default();
+        let credentials_path = dir.join("credentials.json");
+        let (service, _, _, _) = test_service(config, credentials_path);
+
+        let response = service.import_credentials(ImportCredentialsRequest {
+            dry_run: false,
+            mode: CredentialImportMode::SkipExisting,
+            input: serde_json::json!({
+                "items": {
+                    "provider": "Social",
+                    "refreshToken": "s".repeat(150),
+                    "authMethod": "social",
+                    "priority": 3,
+                    "weight": 6,
+                    "region": "eu-west-1",
+                    "apiRegion": "eu-central-1",
+                    "machineId": "machine-cached-credential"
+                }
+            }),
+        });
+
+        assert_eq!(response.summary.added, 1);
+        assert_eq!(response.summary.invalid, 0);
+
+        let snapshot = service.token_manager.snapshot();
+        let exported = service
+            .token_manager
+            .export_credentials_by_ids(&[snapshot.entries[0].id]);
+        let imported = exported.into_iter().next().unwrap();
+        assert_eq!(imported.auth_method.as_deref(), Some("social"));
+        assert_eq!(imported.weight, 6);
+        assert_eq!(imported.region.as_deref(), Some("eu-west-1"));
+        assert_eq!(imported.api_region.as_deref(), Some("eu-central-1"));
+        assert_eq!(
+            imported.machine_id.as_deref(),
+            Some("machine-cached-credential")
+        );
+    }
+
+    #[test]
+    fn export_complete_credential_backup_serializes_camel_case_and_preserves_full_fields() {
+        let dir = temp_test_dir("native-backup-export-camel-case");
+        let config = crate::model::config::Config::default();
+        let credentials_path = dir.join("credentials.json");
+        let (service, _, _, _) = test_service(config, credentials_path);
+
+        let mut cred = KiroCredentials::default();
+        cred.refresh_token = Some("r".repeat(150));
+        cred.access_token = Some("access-token".to_string());
+        cred.expires_at = Some((Utc::now() + chrono::Duration::hours(1)).to_rfc3339());
+        cred.auth_method = Some("social".to_string());
+        cred.provider = Some("GitHub".to_string());
+        cred.user_id = Some("user-1".to_string());
+        cred.profile_arn = Some("profile-arn".to_string());
+        cred.machine_id = Some("machine-1".to_string());
+        cred.region = Some("us-east-1".to_string());
+        cred.auth_region = Some("us-west-2".to_string());
+        cred.api_region = Some("us-east-2".to_string());
+        cred.proxy_url = Some("direct".to_string());
+        cred.endpoint = Some("ide".to_string());
+        cred.concurrency = Some(3);
+        let id = service.token_manager.add_imported_credential(cred).unwrap();
+
+        let backup = service.export_credential_backup(&[id]);
+        let json = serde_json::to_string(&backup).unwrap();
+        assert!(json.contains("refreshToken"));
+        assert!(json.contains("machineId"));
+        assert!(json.contains("authRegion"));
+        assert!(json.contains("apiRegion"));
+        assert!(json.contains("proxyUrl"));
+        assert!(!json.contains("refresh_token"));
+        assert!(!json.contains("machine_id"));
+        assert!(!json.contains("proxy_url"));
+
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["format"], CREDENTIAL_BACKUP_FORMAT);
+        assert_eq!(value["source"]["credentialCount"], 1);
+        let credential = &value["credentials"][0]["credential"];
+        assert_eq!(credential["machineId"], "machine-1");
+        assert_eq!(credential["endpoint"], "ide");
+        assert_eq!(credential["concurrency"], 3);
+    }
+
+    #[test]
+    fn credential_success_and_import_preview_summaries_preserve_source_metadata() {
+        let dir = temp_test_dir("credential-summary-source-metadata");
+        let config = crate::model::config::Config::default();
+        let credentials_path = dir.join("credentials.json");
+        let (service, _, _, _) = test_service(config, credentials_path);
+
+        let mut cred = KiroCredentials::default();
+        cred.refresh_token = Some("r".repeat(150));
+        cred.access_token = Some("access-token".to_string());
+        cred.auth_method = Some("external_idp".to_string());
+        cred.provider = Some("AzureAD".to_string());
+        cred.user_id = Some("https://login.microsoftonline.com/tenant/v2.0".to_string());
+        cred.client_id = Some("client-id".to_string());
+        cred.token_endpoint =
+            Some("https://login.microsoftonline.com/tenant/oauth2/v2.0/token".to_string());
+        cred.issuer_url = Some("https://login.microsoftonline.com/tenant/v2.0".to_string());
+        cred.scopes =
+            Some("api://client-id/codewhisperer:conversations offline_access".to_string());
+        cred.start_url = Some("https://d-1234567890.awsapps.com/start".to_string());
+        cred.client_id_hash = Some("client-hash".to_string());
+        cred.sso_session_id = Some("sso-session".to_string());
+        cred.region = Some("us-east-1".to_string());
+        cred.auth_region = Some("us-west-2".to_string());
+        cred.api_region = Some("eu-central-1".to_string());
+        cred.machine_id = Some("machine-id".to_string());
+        cred.endpoint = Some("ide".to_string());
+        cred.proxy_username = Some("proxy-user".to_string());
+        cred.group_id = Some("group-1".to_string());
+        cred.tag_links = Some(serde_json::json!([{ "tagId": "tag-1", "tagName": "Tenant" }]));
+        cred.usage_data = Some(serde_json::json!({
+            "userInfo": { "email": "user@example.com" },
+            "usageBreakdownList": [{ "currentUsage": 1, "usageLimit": 10 }]
+        }));
+        cred.available_models_cache = Some(serde_json::json!({
+            "cachedAt": 1893456000,
+            "response": { "availableModels": [] }
+        }));
+        cred.failure_count = Some(2);
+        cred.last_failure_at = Some("2026-06-28T10:01:00Z".to_string());
+        cred.disabled_reason = Some("manual".to_string());
+        cred.success_count = Some(7);
+        let id = service.token_manager.add_imported_credential(cred).unwrap();
+
+        let added = service.add_credential_response_from_stored(id, "ok".to_string(), None);
+        assert_eq!(added.auth_method.as_deref(), Some("external_idp"));
+        assert_eq!(added.provider.as_deref(), Some("AzureAD"));
+        assert_eq!(added.auth_region.as_deref(), Some("us-west-2"));
+        assert_eq!(added.api_region.as_deref(), Some("eu-central-1"));
+        assert_eq!(
+            added.token_endpoint.as_deref(),
+            Some("https://login.microsoftonline.com/tenant/oauth2/v2.0/token")
+        );
+        assert!(added.has_proxy_credentials);
+
+        let details = service.credential_login_details_from_stored(id);
+        assert_eq!(details.machine_id.as_deref(), Some("machine-id"));
+        assert_eq!(details.client_id_hash.as_deref(), Some("client-hash"));
+        assert_eq!(details.sso_session_id.as_deref(), Some("sso-session"));
+        assert_eq!(details.api_region.as_deref(), Some("eu-central-1"));
+        assert_eq!(details.group_id.as_deref(), Some("group-1"));
+        assert!(details.tag_links.is_some());
+        assert!(details.has_usage_data);
+        assert!(details.has_available_models_cache);
+        assert_eq!(details.source_failure_count, Some(2));
+        assert_eq!(
+            details.source_last_failure_at.as_deref(),
+            Some("2026-06-28T10:01:00Z")
+        );
+        assert_eq!(details.source_disabled_reason.as_deref(), Some("manual"));
+        assert_eq!(details.source_success_count, Some(7));
+
+        let preview = service.import_credentials(ImportCredentialsRequest {
+            dry_run: true,
+            mode: CredentialImportMode::SkipExisting,
+            input: serde_json::json!({
+                "accessToken": "access-preview",
+                "refreshToken": "p".repeat(150),
+                "authMethod": "external_idp",
+                "provider": "Microsoft",
+                "clientId": "client-preview",
+                "tokenEndpoint": "https://login.microsoftonline.com/tenant/oauth2/v2.0/token",
+                "issuerUrl": "https://login.microsoftonline.com/tenant/v2.0",
+                "scopes": "api://client-preview/codewhisperer:conversations offline_access",
+                "region": "us-east-1",
+                "authRegion": "us-west-2",
+                "apiRegion": "eu-central-1",
+                "machineId": "machine-preview",
+                "groupId": "group-preview",
+                "tagLinks": [{ "tagId": "tag-preview", "tagName": "Preview" }],
+                "usageData": {
+                    "userInfo": { "email": "preview@example.com" },
+                    "usageBreakdownList": [{ "currentUsage": 2, "usageLimit": 20 }]
+                },
+                "availableModelsCache": {
+                    "cachedAt": 1893456000,
+                    "response": { "availableModels": [] }
+                },
+                "failureCount": 3,
+                "lastFailureAt": "2026-06-28T10:02:00Z",
+                "disabledReason": "imported",
+                "successCount": 9,
+                "startUrl": "https://d-1234567890.awsapps.com/start",
+                "clientIdHash": "hash-preview",
+                "ssoSessionId": "session-preview",
+                "endpoint": "ide"
+            }),
+        });
+
+        assert_eq!(preview.summary.parsed, 1);
+        assert_eq!(preview.summary.invalid, 0);
+        let item = &preview.items[0];
+        assert_eq!(item.auth_method.as_deref(), Some("external_idp"));
+        assert_eq!(item.provider.as_deref(), Some("AzureAD"));
+        assert_eq!(item.region.as_deref(), Some("us-east-1"));
+        assert_eq!(item.auth_region.as_deref(), Some("us-west-2"));
+        assert_eq!(item.api_region.as_deref(), Some("eu-central-1"));
+        assert_eq!(item.machine_id.as_deref(), Some("machine-preview"));
+        assert_eq!(item.group_id.as_deref(), Some("group-preview"));
+        assert!(item.tag_links.is_some());
+        assert!(item.has_usage_data);
+        assert!(item.has_available_models_cache);
+        assert_eq!(item.source_failure_count, Some(3));
+        assert_eq!(
+            item.source_last_failure_at.as_deref(),
+            Some("2026-06-28T10:02:00Z")
+        );
+        assert_eq!(item.source_disabled_reason.as_deref(), Some("imported"));
+        assert_eq!(item.source_success_count, Some(9));
+        assert_eq!(item.client_id_hash.as_deref(), Some("hash-preview"));
+        assert_eq!(item.sso_session_id.as_deref(), Some("session-preview"));
+        assert_eq!(
+            item.token_endpoint.as_deref(),
+            Some("https://login.microsoftonline.com/tenant/oauth2/v2.0/token")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn credential_record_import_preserves_source_metadata_in_stored_model_and_summary() {
+        let dir = temp_test_dir("credential-record-source-metadata");
+        let config = crate::model::config::Config::default();
+        let credentials_path = dir.join("credentials.json");
+        let (service, _, _, _) = test_service(config, credentials_path);
+        let access_token = jwt_with_exp((Utc::now() + chrono::Duration::hours(1)).timestamp());
+
+        let mut raw = serde_json::Map::new();
+        macro_rules! field {
+            ($key:literal, $value:expr) => {
+                raw.insert($key.to_string(), serde_json::json!($value));
+            };
+        }
+        field!("id", "source-single-credential");
+        field!("accessToken", access_token);
+        field!("refreshToken", "g".repeat(150));
+        field!("authMethod", "microsoft");
+        field!("provider", "Microsoft");
+        field!("clientId", "client-single");
+        field!(
+            "tokenEndpoint",
+            "https://login.microsoftonline.com/tenant/oauth2/v2.0/token"
+        );
+        field!("issuerUrl", "https://login.microsoftonline.com/tenant/v2.0");
+        field!(
+            "scopes",
+            "api://client-single/codewhisperer:conversations offline_access"
+        );
+        field!("email", "single@example.com");
+        field!("userId", "https://login.microsoftonline.com/tenant/v2.0");
+        field!("machineId", "machine-single");
+        field!("region", "us-east-1");
+        field!("authRegion", "us-west-2");
+        field!("apiRegion", "eu-central-1");
+        field!("label", "Single import");
+        field!("status", "active");
+        field!("addedAt", "2026/06/29 10:00:00");
+        field!("password", "source-password");
+        field!("nickname", "Single Credential");
+        field!(
+            "usageData",
+            serde_json::json!({ "userInfo": { "email": "single@example.com" } })
+        );
+        field!("groupId", "group-single");
+        field!(
+            "tagLinks",
+            serde_json::json!([{ "tagId": "tag-single", "tagName": "Single" }])
+        );
+        field!(
+            "availableModelsCache",
+            serde_json::json!({ "response": { "models": ["claude-sonnet"] } })
+        );
+        field!("failureCount", 4);
+        field!("lastFailureAt", "2026-06-29T01:02:03Z");
+        field!("disabledReason", "manual");
+        field!("successCount", 11);
+        field!("subscriptionType", "Pro");
+        field!("subscriptionTitle", "KIRO PRO");
+        field!("usageCurrent", 12.5);
+        field!("usageLimit", 100.0);
+        field!("usagePercent", 12.5);
+        field!("nextResetDate", "2026-07-01");
+        field!("requestCount", 19);
+        field!("errorCount", 2);
+        field!("totalTokens", 12345);
+        field!("totalCredits", 6.5);
+        field!("lastUsedAt", 1893456000);
+        field!("createdAt", 1893450000);
+        field!("tags", serde_json::json!(["single", "source"]));
+        field!("proxyURL", "direct");
+        field!("endpoint", "ide");
+        let req: ImportCredentialRecordRequest =
+            serde_json::from_value(serde_json::Value::Object(raw)).unwrap();
+
+        let response = service.import_credential_record(req).await.unwrap();
+
+        assert_eq!(response.auth_method.as_deref(), Some("external_idp"));
+        assert_eq!(response.provider.as_deref(), Some("AzureAD"));
+        assert_eq!(
+            response.source_account_id.as_deref(),
+            Some("source-single-credential")
+        );
+        assert_eq!(response.group_id.as_deref(), Some("group-single"));
+        assert!(response.tag_links.is_some());
+        assert_eq!(response.has_usage_data, true);
+        assert_eq!(response.has_available_models_cache, true);
+        assert_eq!(response.source_failure_count, Some(4));
+        assert_eq!(response.source_success_count, Some(11));
+        assert_eq!(response.auth_region.as_deref(), Some("us-west-2"));
+        assert_eq!(response.api_region.as_deref(), Some("eu-central-1"));
+
+        let imported = service
+            .token_manager
+            .export_credentials_by_ids(&[response.credential_id])
+            .pop()
+            .unwrap();
+        assert_eq!(
+            imported.source_account_id.as_deref(),
+            Some("source-single-credential")
+        );
+        assert_eq!(imported.label.as_deref(), Some("Single import"));
+        assert_eq!(imported.status.as_deref(), Some("active"));
+        assert_eq!(imported.added_at.as_deref(), Some("2026/06/29 10:00:00"));
+        assert_eq!(imported.password.as_deref(), Some("source-password"));
+        assert_eq!(imported.nickname.as_deref(), Some("Single Credential"));
+        assert_eq!(imported.group_id.as_deref(), Some("group-single"));
+        assert!(imported.tag_links.is_some());
+        assert!(imported.usage_data.is_some());
+        assert!(imported.available_models_cache.is_some());
+        assert_eq!(imported.failure_count, Some(4));
+        assert_eq!(
+            imported.last_failure_at.as_deref(),
+            Some("2026-06-29T01:02:03Z")
+        );
+        assert_eq!(imported.disabled_reason.as_deref(), Some("manual"));
+        assert_eq!(imported.success_count, Some(11));
+        assert_eq!(imported.subscription_type.as_deref(), Some("Pro"));
+        assert_eq!(imported.subscription_title.as_deref(), Some("KIRO PRO"));
+        assert_eq!(imported.usage_current, Some(12.5));
+        assert_eq!(imported.usage_limit, Some(100.0));
+        assert_eq!(imported.usage_percent, Some(12.5));
+        assert_eq!(imported.request_count, Some(19));
+        assert_eq!(imported.error_count, Some(2));
+        assert_eq!(imported.total_tokens, Some(12345));
+        assert_eq!(imported.total_credits, Some(6.5));
+        assert_eq!(imported.last_used_at, Some(1893456000));
+        assert_eq!(imported.created_at, Some(1893450000));
+        assert!(imported.tags.is_some());
+
+        let details = service.credential_login_details_from_stored(response.credential_id);
+        assert_eq!(details.group_id.as_deref(), Some("group-single"));
+        assert!(details.has_usage_data);
+        assert!(details.has_available_models_cache);
+        assert_eq!(details.source_failure_count, Some(4));
+        assert_eq!(details.source_success_count, Some(11));
+    }
+
+    #[test]
+    fn import_credentials_round_trips_multiple_auth_methods_without_refresh() {
+        let dir = temp_test_dir("backup-round-trip");
+        let config = crate::model::config::Config::default();
+        let credentials_path = dir.join("credentials.json");
+        let (service, _, _, _) = test_service(config, credentials_path);
+        let future = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let access_jwt = jwt_with_exp((Utc::now() + chrono::Duration::hours(1)).timestamp());
+
+        let backup = serde_json::json!({
+            "format": CREDENTIAL_BACKUP_FORMAT,
+            "version": CREDENTIAL_BACKUP_VERSION,
+            "exportedAt": Utc::now().to_rfc3339(),
+            "source": { "app": "xkiro.rs", "schema": CREDENTIAL_BACKUP_SCHEMA, "credentialCount": 4 },
+            "credentials": [
+                { "credential": {
+                    "accessToken": "access-social",
+                    "refreshToken": "s".repeat(150),
+                    "expiresAt": future,
+                    "authMethod": "social",
+                    "provider": "GitHub",
+                    "email": "dev@github.local",
+                    "profileArn": "profile-social",
+                    "machineId": "machine-social",
+                    "region": "us-east-1",
+                    "apiRegion": "us-east-2",
+                    "proxyUrl": "direct"
+                }},
+                { "credential": {
+                    "accessToken": "access-idc",
+                    "refreshToken": "i".repeat(150),
+                    "expiresAt": future,
+                    "authMethod": "IdC",
+                    "clientId": "client-idc",
+                    "clientSecret": "secret-idc",
+                    "startUrl": "https://d-123.awsapps.com/start",
+                    "clientIdHash": "hash-idc",
+                    "idToken": "id-token-idc",
+                    "ssoSessionId": "session-idc",
+                    "authRegion": "us-west-2",
+                    "machineId": "machine-idc"
+                }},
+                { "credential": {
+                    "accessToken": access_jwt,
+                    "refreshToken": "e".repeat(150),
+                    "authMethod": "external_idp",
+                    "provider": "Microsoft",
+                    "clientId": "client-external",
+                    "tokenEndpoint": "https://login.microsoftonline.com/tenant/oauth2/v2.0/token",
+                    "issuerUrl": "https://login.microsoftonline.com/tenant/v2.0",
+                    "scopes": "openid profile offline_access",
+                    "machineId": "machine-external"
+                }},
+                { "credential": {
+                    "authMethod": "api_key",
+                    "apiKey": "ksk_test_backup_key",
+                    "endpoint": "ide",
+                    "disabled": true,
+                    "concurrency": 2,
+                    "machineId": "machine-api"
+                }}
+            ]
+        });
+
+        let response = service.import_credentials(ImportCredentialsRequest {
+            dry_run: false,
+            mode: CredentialImportMode::SkipExisting,
+            input: backup,
+        });
+
+        assert_eq!(response.summary.added, 4);
+        assert_eq!(response.summary.invalid, 0);
+        let snapshot = service.token_manager.snapshot();
+        assert_eq!(snapshot.total, 4);
+
+        let exported = service.token_manager.export_credentials_by_ids(
+            &snapshot
+                .entries
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+        );
+        assert!(exported.iter().any(|cred| {
+            cred.auth_method.as_deref() == Some("social")
+                && cred.machine_id.as_deref() == Some("machine-social")
+                && cred.api_region.as_deref() == Some("us-east-2")
+                && cred.provider.as_deref() == Some("GitHub")
+        }));
+        assert!(exported.iter().any(|cred| {
+            cred.auth_method.as_deref() == Some("idc")
+                && cred.provider.as_deref() == Some("Enterprise")
+                && cred.client_id_hash.as_deref() == Some("hash-idc")
+                && cred.sso_session_id.as_deref() == Some("session-idc")
+        }));
+        assert!(exported.iter().any(|cred| {
+            cred.auth_method.as_deref() == Some("external_idp")
+                && cred.provider.as_deref() == Some("AzureAD")
+                && cred
+                    .token_endpoint
+                    .as_deref()
+                    .unwrap()
+                    .contains("microsoftonline.com")
+                && cred.expires_at.is_some()
+        }));
+        assert!(exported.iter().any(|cred| {
+            cred.auth_method.as_deref() == Some("api_key")
+                && cred.api_key.as_deref() == Some("ksk_test_backup_key")
+                && cred.disabled
+                && cred.concurrency == Some(2)
+        }));
+
+        let status = service.get_all_credentials();
+        let api_key_item = status
+            .credentials
+            .iter()
+            .find(|item| item.auth_method.as_deref() == Some("api_key"))
+            .unwrap();
+        assert!(api_key_item.has_api_key);
+        assert!(!api_key_item.has_refresh_token);
+    }
+
+    #[test]
+    fn import_credentials_derives_external_idp_from_provider_and_access_token_jwt() {
+        let dir = temp_test_dir("backup-external-provider-jwt");
+        let config = crate::model::config::Config::default();
+        let credentials_path = dir.join("credentials.json");
+        let (service, _, _, _) = test_service(config, credentials_path);
+        let exp = (Utc::now() + chrono::Duration::hours(1)).timestamp();
+        let access_jwt = jwt_with_iss_exp("https://login.microsoftonline.com/tenant-1/v2.0", exp);
+
+        let backup = serde_json::json!({
+            "format": CREDENTIAL_BACKUP_FORMAT,
+            "version": CREDENTIAL_BACKUP_VERSION,
+            "exportedAt": Utc::now().to_rfc3339(),
+            "source": { "app": "xkiro.rs", "schema": CREDENTIAL_BACKUP_SCHEMA, "credentialCount": 1 },
+            "credentials": [{ "credential": {
+                "accessToken": access_jwt,
+                "refreshToken": "m".repeat(150),
+                "provider": "Microsoft",
+                "clientId": "client-microsoft",
+                "machineId": "machine-microsoft"
+            }}]
+        });
+
+        let response = service.import_credentials(ImportCredentialsRequest {
+            dry_run: false,
+            mode: CredentialImportMode::SkipExisting,
+            input: backup,
+        });
+
+        assert_eq!(response.summary.added, 1);
+        assert_eq!(response.summary.invalid, 0);
+        let id = service.token_manager.snapshot().entries[0].id;
+        let imported = service
+            .token_manager
+            .export_credentials_by_ids(&[id])
+            .pop()
+            .unwrap();
+
+        assert_eq!(imported.auth_method.as_deref(), Some("external_idp"));
+        assert_eq!(imported.provider.as_deref(), Some("AzureAD"));
+        assert_eq!(
+            imported.token_endpoint.as_deref(),
+            Some("https://login.microsoftonline.com/tenant-1/oauth2/v2.0/token")
+        );
+        assert_eq!(
+            imported.issuer_url.as_deref(),
+            Some("https://login.microsoftonline.com/tenant-1/v2.0")
+        );
+        assert!(
+            imported
+                .scopes
+                .as_deref()
+                .unwrap_or_default()
+                .contains("codewhisperer:conversations")
+        );
+        assert!(imported.expires_at.is_some());
+    }
+
+    #[test]
+    fn import_credentials_dry_run_does_not_write_and_rejects_bad_external_endpoint() {
+        let dir = temp_test_dir("backup-dry-run-security");
+        let config = crate::model::config::Config::default();
+        let credentials_path = dir.join("credentials.json");
+        let (service, _, _, _) = test_service(config, credentials_path);
+
+        let dry_run_backup = serde_json::json!({
+            "format": CREDENTIAL_BACKUP_FORMAT,
+            "version": CREDENTIAL_BACKUP_VERSION,
+            "exportedAt": Utc::now().to_rfc3339(),
+            "source": { "app": "xkiro.rs", "schema": CREDENTIAL_BACKUP_SCHEMA, "credentialCount": 1 },
+            "credentials": [{ "credential": {
+                "accessToken": "access-dry-run",
+                "refreshToken": "d".repeat(150),
+                "authMethod": "social",
+                "machineId": "machine-dry-run"
+            }}]
+        });
+
+        let response = service.import_credentials(ImportCredentialsRequest {
+            dry_run: true,
+            mode: CredentialImportMode::SkipExisting,
+            input: dry_run_backup,
+        });
+        assert_eq!(response.summary.added, 1);
+        assert_eq!(service.token_manager.snapshot().total, 0);
+
+        let bad_external = serde_json::json!({
+            "format": CREDENTIAL_BACKUP_FORMAT,
+            "version": CREDENTIAL_BACKUP_VERSION,
+            "exportedAt": Utc::now().to_rfc3339(),
+            "source": { "app": "xkiro.rs", "schema": CREDENTIAL_BACKUP_SCHEMA, "credentialCount": 1 },
+            "credentials": [{ "credential": {
+                "refreshToken": "z".repeat(150),
+                "authMethod": "external_idp",
+                "clientId": "client-bad",
+                "tokenEndpoint": "http://127.0.0.1/token"
+            }}]
+        });
+
+        let response = service.import_credentials(ImportCredentialsRequest {
+            dry_run: true,
+            mode: CredentialImportMode::SkipExisting,
+            input: bad_external,
+        });
+        assert_eq!(response.summary.invalid, 1);
+        assert!(
+            response.items[0]
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("external IdP endpoint rejected")
+        );
+    }
+
+    #[test]
+    fn import_credentials_converts_credential_snapshot_and_flat_credential_shapes() {
+        let dir = temp_test_dir("import-snapshot-shapes");
+        let config = crate::model::config::Config::default();
+        let credentials_path = dir.join("credentials.json");
+        let (service, _, _, _) = test_service(config, credentials_path);
+        let expires_ms = 1_893_456_000_000_i64;
+
+        let credential_snapshot = serde_json::json!({
+            "version": "test",
+            "exportedAt": expires_ms,
+            "accounts": [{
+                "id": "source-credential-1",
+                "email": "builder@example.com",
+                "nickname": "Builder backup",
+                "idp": "BuilderId",
+                "userId": "builder-user",
+                "machineId": "machine-builder",
+                "tags": ["primary", "builder"],
+                "status": "active",
+                "createdAt": 1_893_455_000_000_i64,
+                "lastUsedAt": 1_893_455_500_000_i64,
+                "credentials": {
+                    "accessToken": "access-builder",
+                    "csrfToken": "csrf-builder",
+                    "refreshToken": "b".repeat(150),
+                    "clientId": "client-builder",
+                    "clientSecret": "secret-builder",
+                    "region": "us-east-1",
+                    "expiresAt": expires_ms,
+                    "authMethod": "IdC"
+                },
+                "subscription": { "type": "Pro", "title": "KIRO PRO" },
+                "usage": {
+                    "current": 12.5,
+                    "limit": 100.0,
+                    "percentUsed": 0.125,
+                    "lastUpdated": 1_893_455_900_000_i64
+                }
+            }]
+        });
+        let parsed = service
+            .parse_credential_import(credential_snapshot)
+            .unwrap();
+        assert_eq!(parsed.source_format, SOURCE_FORMAT_CREDENTIAL_SNAPSHOT);
+        let converted = service
+            .normalize_imported_credential(parsed.credentials.into_iter().next().unwrap())
+            .unwrap();
+        assert_eq!(converted.auth_method.as_deref(), Some("idc"));
+        assert_eq!(converted.provider.as_deref(), Some("BuilderId"));
+        assert_eq!(converted.machine_id.as_deref(), Some("machine-builder"));
+        assert_eq!(converted.nickname.as_deref(), Some("Builder backup"));
+        assert_eq!(converted.csrf_token.as_deref(), Some("csrf-builder"));
+        assert_eq!(converted.status.as_deref(), Some("active"));
+        assert_eq!(converted.subscription_title.as_deref(), Some("KIRO PRO"));
+        assert_eq!(converted.subscription_type.as_deref(), Some("Pro"));
+        assert_eq!(converted.usage_current, Some(12.5));
+        assert_eq!(converted.usage_limit, Some(100.0));
+        assert_eq!(converted.usage_percent, Some(0.125));
+        assert_eq!(converted.last_refresh, Some(1_893_455_900_000_i64));
+        assert_eq!(converted.created_at, Some(1_893_455_000_000_i64));
+        assert_eq!(converted.last_used_at, Some(1_893_455_500_000_i64));
+        assert_eq!(
+            converted
+                .tags
+                .as_ref()
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            converted.source_account_id.as_deref(),
+            Some("source-credential-1")
+        );
+        assert_eq!(
+            converted.client_id_hash.as_deref(),
+            Some(KIRO_BUILDER_ID_CLIENT_ID_HASH)
+        );
+        assert_eq!(
+            converted.expires_at.as_deref(),
+            Some("2030-01-01T00:00:00+00:00")
+        );
+
+        let flat_credential = serde_json::json!([{
+            "id": "source-credential",
+            "email": "user@gmail.com",
+            "accessToken": "access-source",
+            "refreshToken": "k".repeat(150),
+            "authMethod": "IdC",
+            "clientId": "client-source",
+            "clientSecret": "secret-source",
+            "clientIdHash": "hash-source",
+            "ssoSessionId": "session-source",
+            "idToken": "id-token-source",
+            "region": "eu-west-1",
+            "startUrl": "https://view.awsapps.com/start",
+            "profileArn": "profile-source",
+            "machineId": "machine-source",
+            "enabled": false,
+            "proxyConfig": {
+                "enabled": true,
+                "protocol": "socks5",
+                "host": "127.0.0.1",
+                "port": 1080,
+                "username": "proxy-user",
+                "password": "proxy-pass"
+            }
+        }]);
+        let parsed = service.parse_credential_import(flat_credential).unwrap();
+        let converted = service
+            .normalize_imported_credential(parsed.credentials.into_iter().next().unwrap())
+            .unwrap();
+        assert_eq!(converted.auth_method.as_deref(), Some("idc"));
+        assert_eq!(
+            converted.proxy_url.as_deref(),
+            Some("socks5://127.0.0.1:1080")
+        );
+        assert_eq!(converted.proxy_username.as_deref(), Some("proxy-user"));
+        assert_eq!(converted.proxy_password.as_deref(), Some("proxy-pass"));
+        assert!(converted.disabled);
+        assert_eq!(converted.id, None);
+        assert_eq!(
+            converted.source_account_id.as_deref(),
+            Some("source-credential")
+        );
+        assert_eq!(converted.region.as_deref(), Some("eu-west-1"));
+    }
+
+    #[test]
+    fn import_credentials_accepts_canonical_snapshot_credentials_collection() {
+        let dir = temp_test_dir("import-canonical-snapshot-collection");
+        let config = crate::model::config::Config::default();
+        let credentials_path = dir.join("credentials.json");
+        let (service, _, _, _) = test_service(config, credentials_path);
+
+        let parsed = service
+            .parse_credential_import(serde_json::json!({
+                "version": "test",
+                "exportedAt": 1_893_456_000_000_i64,
+                "credentials": [{
+                    "id": "source-canonical-credential",
+                    "email": "canonical@example.com",
+                    "nickname": "Canonical snapshot",
+                    "idp": "BuilderId",
+                    "machineId": "machine-canonical",
+                    "credentials": {
+                        "refreshToken": "c".repeat(150),
+                        "clientId": "client-canonical",
+                        "clientSecret": "secret-canonical",
+                        "authMethod": "IdC",
+                        "expiresAt": 1_893_456_000_000_i64
+                    }
+                }]
+            }))
+            .unwrap();
+
+        assert_eq!(parsed.source_format, SOURCE_FORMAT_CREDENTIAL_SNAPSHOT);
+        let converted = service
+            .normalize_imported_credential(parsed.credentials.into_iter().next().unwrap())
+            .unwrap();
+        assert_eq!(
+            converted.source_account_id.as_deref(),
+            Some("source-canonical-credential")
+        );
+        assert_eq!(converted.auth_method.as_deref(), Some("idc"));
+        assert_eq!(converted.provider.as_deref(), Some("BuilderId"));
+        assert_eq!(
+            converted.expires_at.as_deref(),
+            Some("2030-01-01T00:00:00+00:00")
+        );
+    }
+
+    #[test]
+    fn import_credentials_accepts_credential_snapshot_items_without_credentials_wrapper() {
+        let dir = temp_test_dir("import-credential-snapshot-items");
+        let config = crate::model::config::Config::default();
+        let credentials_path = dir.join("credentials.json");
+        let (service, _, _, _) = test_service(config, credentials_path);
+
+        let mut snapshot_item = serde_json::Map::new();
+        macro_rules! field {
+            ($key:literal, $value:expr) => {
+                snapshot_item.insert($key.to_string(), serde_json::json!($value));
+            };
+        }
+        field!("id", "source-config-credential");
+        field!("email", "config@example.com");
+        field!("userId", "config-user");
+        field!("nickname", "Config credential");
+        field!("accessToken", "access-config");
+        field!("refreshToken", "c".repeat(150));
+        field!("clientId", "client-config");
+        field!("clientSecret", "secret-config");
+        field!("authMethod", "idc");
+        field!("provider", "BuilderId");
+        field!("region", "us-west-2");
+        field!("expiresAt", 1_893_456_000_i64);
+        field!("machineId", "machine-config");
+        field!("profileArn", "profile-config");
+        field!("proxyURL", "direct");
+        field!("weight", 4);
+        field!("overageStatus", "ENABLED");
+        field!("overageCapability", "OVERAGE_CAPABLE");
+        field!("overageCap", 20.0);
+        field!("overageRate", 0.2);
+        field!("currentOverages", 3.5);
+        field!("overageCheckedAt", 1_893_455_000_i64);
+        field!("enabled", false);
+        field!("banStatus", "SUSPENDED");
+        field!("banReason", "manual-test");
+        field!("banTime", 1_893_455_100_i64);
+        field!("subscriptionType", "PRO_PLUS");
+        field!("subscriptionTitle", "KIRO PRO+");
+        field!("daysRemaining", 14);
+        field!("usageCurrent", 42.0);
+        field!("usageLimit", 100.0);
+        field!("usagePercent", 0.42);
+        field!("nextResetDate", "2030-02-01");
+        field!("lastRefresh", 1_893_455_200_i64);
+        field!("trialUsageCurrent", 1.0);
+        field!("trialUsageLimit", 5.0);
+        field!("trialUsagePercent", 0.2);
+        field!("trialStatus", "ACTIVE");
+        field!("trialExpiresAt", 1_893_555_000_i64);
+        field!("requestCount", 11);
+        field!("errorCount", 2);
+        field!("totalTokens", 12345);
+        field!("totalCredits", 6.75);
+        field!("lastUsed", 1_893_455_300_i64);
+
+        let import_payload = serde_json::json!({
+            "accounts": [serde_json::Value::Object(snapshot_item)]
+        });
+
+        let response = service.import_credentials(ImportCredentialsRequest {
+            dry_run: false,
+            mode: CredentialImportMode::SkipExisting,
+            input: import_payload,
+        });
+
+        assert_eq!(response.summary.added, 1);
+        assert_eq!(response.summary.invalid, 0);
+        let id = service.token_manager.snapshot().entries[0].id;
+        let imported = service
+            .token_manager
+            .export_credentials_by_ids(&[id])
+            .pop()
+            .unwrap();
+
+        assert_eq!(
+            imported.source_account_id.as_deref(),
+            Some("source-config-credential")
+        );
+        assert_eq!(
+            imported.expires_at.as_deref(),
+            Some("2030-01-01T00:00:00+00:00")
+        );
+        assert_eq!(imported.nickname.as_deref(), Some("Config credential"));
+        assert_eq!(imported.region.as_deref(), Some("us-west-2"));
+        assert_eq!(imported.weight, 4);
+        assert!(imported.disabled);
+        assert_eq!(imported.overage_status.as_deref(), Some("ENABLED"));
+        assert_eq!(
+            imported.overage_capability.as_deref(),
+            Some("OVERAGE_CAPABLE")
+        );
+        assert_eq!(imported.overage_cap, Some(20.0));
+        assert_eq!(imported.overage_rate, Some(0.2));
+        assert_eq!(imported.current_overages, Some(3.5));
+        assert_eq!(imported.overage_checked_at, Some(1_893_455_000_i64));
+        assert_eq!(imported.ban_status.as_deref(), Some("SUSPENDED"));
+        assert_eq!(imported.ban_reason.as_deref(), Some("manual-test"));
+        assert_eq!(imported.ban_time, Some(1_893_455_100_i64));
+        assert_eq!(imported.subscription_type.as_deref(), Some("PRO_PLUS"));
+        assert_eq!(imported.subscription_title.as_deref(), Some("KIRO PRO+"));
+        assert_eq!(imported.days_remaining, Some(14));
+        assert_eq!(imported.usage_current, Some(42.0));
+        assert_eq!(imported.usage_limit, Some(100.0));
+        assert_eq!(imported.usage_percent, Some(0.42));
+        assert_eq!(imported.next_reset_date.as_deref(), Some("2030-02-01"));
+        assert_eq!(imported.last_refresh, Some(1_893_455_200_i64));
+        assert_eq!(imported.trial_usage_current, Some(1.0));
+        assert_eq!(imported.trial_usage_limit, Some(5.0));
+        assert_eq!(imported.trial_usage_percent, Some(0.2));
+        assert_eq!(imported.trial_status.as_deref(), Some("ACTIVE"));
+        assert_eq!(imported.trial_expires_at, Some(1_893_555_000_i64));
+        assert_eq!(imported.request_count, Some(11));
+        assert_eq!(imported.error_count, Some(2));
+        assert_eq!(imported.total_tokens, Some(12345));
+        assert_eq!(imported.total_credits, Some(6.75));
+        assert_eq!(imported.last_used_at, Some(1_893_455_300_i64));
+
+        let status = service.get_all_credentials();
+        let item = &status.credentials[0];
+        assert_eq!(
+            item.source_account_id.as_deref(),
+            Some("source-config-credential")
+        );
+        assert_eq!(item.nickname.as_deref(), Some("Config credential"));
+        assert!(item.has_token);
+        assert!(item.has_refresh_token);
+        assert!(item.has_client_id);
+        assert!(item.has_client_secret);
+        assert!(!item.has_id_token);
+        assert_eq!(item.ban_time, Some(1_893_455_100_i64));
+        assert_eq!(item.overage_cap, Some(20.0));
+        assert_eq!(item.overage_rate, Some(0.2));
+        assert_eq!(item.current_overages, Some(3.5));
+        assert_eq!(item.usage_current, Some(42.0));
+        assert_eq!(item.usage_limit, Some(100.0));
+        assert_eq!(item.usage_percent, Some(0.42));
+        assert_eq!(item.trial_status.as_deref(), Some("ACTIVE"));
+        assert_eq!(item.request_count, Some(11));
+        assert_eq!(item.error_count, Some(2));
+        assert_eq!(item.total_tokens, Some(12345));
+        assert_eq!(item.total_credits, Some(6.75));
+        assert_eq!(item.last_used, Some(1_893_455_300_i64));
+
+        let exported = service.export_credential_backup(&[id]);
+        let exported_credential = &exported.credentials[0].credential;
+        assert_eq!(
+            exported_credential.source_account_id.as_deref(),
+            Some("source-config-credential")
+        );
+        assert_eq!(
+            exported_credential.nickname.as_deref(),
+            Some("Config credential")
+        );
+        assert_eq!(exported_credential.overage_cap, Some(20.0));
+        assert_eq!(exported_credential.usage_current, Some(42.0));
+        assert_eq!(exported_credential.trial_status.as_deref(), Some("ACTIVE"));
+        assert_eq!(exported_credential.request_count, Some(11));
+        assert_eq!(exported_credential.last_used_at, Some(1_893_455_300_i64));
+    }
+
+    #[test]
+    fn import_credentials_preserves_source_shape_saved_credential_model() {
+        let dir = temp_test_dir("import-source-shape-saved-credential");
+        let config = crate::model::config::Config::default();
+        let credentials_path = dir.join("credentials.json");
+        let (service, _, _, _) = test_service(config, credentials_path);
+
+        let source_shape_input = serde_json::json!([{
+            "id": "source-enterprise-credential",
+            "email": "enterprise@example.com",
+            "password": "source-password",
+            "label": "Work tenant",
+            "status": "active",
+            "addedAt": "2026/06/28 10:00:00",
+            "accessToken": "access-enterprise",
+            "refreshToken": "r".repeat(150),
+            "expiresAt": "2030-01-01T00:00:00Z",
+            "provider": "Enterprise",
+            "userId": "enterprise-user",
+            "authMethod": "IdC",
+            "clientId": "client-enterprise",
+            "clientSecret": "secret-enterprise",
+            "region": "eu-west-1",
+            "clientIdHash": "enterprise-hash",
+            "ssoSessionId": "session-enterprise",
+            "idToken": "id-token-enterprise",
+            "startUrl": "https://d-90660ceab3.awsapps.com/start/",
+            "profileArn": "profile-enterprise",
+            "usageData": {
+                "userInfo": {
+                    "email": "enterprise@example.com",
+                    "userId": "enterprise-user"
+                },
+                "usageBreakdownList": [{ "current": 10, "limit": 100 }]
+            },
+            "groupId": "group-1",
+            "tagLinks": [{
+                "tagId": "tag-1",
+                "tagName": "Tenant",
+                "linkedAt": "2026-06-28 10:00"
+            }],
+            "machineId": "machine-enterprise",
+            "availableModelsCache": {
+                "response": { "models": ["claude-sonnet"] },
+                "cachedAt": 1893456000
+            },
+            "failureCount": 2,
+            "lastFailureAt": "2026-06-28T10:01:00Z",
+            "disabledReason": "manual",
+            "successCount": 7,
+            "enabled": false,
+            "proxyConfig": {
+                "enabled": true,
+                "protocol": "http",
+                "host": "127.0.0.1",
+                "port": 8080
+            }
+        }]);
+
+        let response = service.import_credentials(ImportCredentialsRequest {
+            dry_run: false,
+            mode: CredentialImportMode::SkipExisting,
+            input: source_shape_input,
+        });
+
+        assert_eq!(response.summary.added, 1);
+        assert_eq!(response.summary.invalid, 0);
+        let id = service.token_manager.snapshot().entries[0].id;
+        let imported = service
+            .token_manager
+            .export_credentials_by_ids(&[id])
+            .pop()
+            .unwrap();
+
+        assert_eq!(
+            imported.source_account_id.as_deref(),
+            Some("source-enterprise-credential")
+        );
+        assert_eq!(imported.label.as_deref(), Some("Work tenant"));
+        assert_eq!(imported.status.as_deref(), Some("active"));
+        assert_eq!(imported.added_at.as_deref(), Some("2026/06/28 10:00:00"));
+        assert_eq!(imported.password.as_deref(), Some("source-password"));
+        assert_eq!(imported.auth_method.as_deref(), Some("idc"));
+        assert_eq!(imported.provider.as_deref(), Some("Enterprise"));
+        assert_eq!(imported.region.as_deref(), Some("eu-west-1"));
+        assert_eq!(
+            imported.start_url.as_deref(),
+            Some("https://d-90660ceab3.awsapps.com/start")
+        );
+        assert_eq!(imported.client_id_hash.as_deref(), Some("enterprise-hash"));
+        assert_eq!(
+            imported.sso_session_id.as_deref(),
+            Some("session-enterprise")
+        );
+        assert_eq!(imported.id_token.as_deref(), Some("id-token-enterprise"));
+        assert_eq!(imported.machine_id.as_deref(), Some("machine-enterprise"));
+        assert_eq!(imported.group_id.as_deref(), Some("group-1"));
+        assert_eq!(imported.failure_count, Some(2));
+        assert_eq!(
+            imported.last_failure_at.as_deref(),
+            Some("2026-06-28T10:01:00Z")
+        );
+        assert_eq!(imported.disabled_reason.as_deref(), Some("manual"));
+        assert_eq!(imported.success_count, Some(7));
+        assert!(imported.disabled);
+        assert_eq!(imported.proxy_url.as_deref(), Some("http://127.0.0.1:8080"));
+        assert_eq!(
+            imported
+                .usage_data
+                .as_ref()
+                .and_then(|value| value["userInfo"]["email"].as_str()),
+            Some("enterprise@example.com")
+        );
+        assert_eq!(
+            imported
+                .tag_links
+                .as_ref()
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+        assert!(imported.available_models_cache.is_some());
+
+        let exported = service.export_credential_backup(&[id]);
+        let exported_credential = &exported.credentials[0].credential;
+        assert_eq!(exported_credential.region.as_deref(), Some("eu-west-1"));
+        assert_eq!(
+            exported_credential.source_account_id.as_deref(),
+            Some("source-enterprise-credential")
+        );
+        assert_eq!(
+            exported_credential.usage_data.as_ref(),
+            imported.usage_data.as_ref()
+        );
+
+        let status = service.get_all_credentials();
+        let item = &status.credentials[0];
+        assert!(item.has_token);
+        assert!(item.has_refresh_token);
+        assert!(item.has_client_id);
+        assert!(item.has_client_secret);
+        assert!(item.has_id_token);
+        assert!(item.has_profile_arn);
+        assert_eq!(item.group_id.as_deref(), Some("group-1"));
+        assert!(item.tag_links.is_some());
+        assert!(item.usage_data.is_some());
+        assert!(item.has_available_models_cache);
+        assert_eq!(item.source_failure_count, Some(2));
+        assert_eq!(
+            item.source_last_failure_at.as_deref(),
+            Some("2026-06-28T10:01:00Z")
+        );
+        assert_eq!(item.source_disabled_reason.as_deref(), Some("manual"));
+        assert_eq!(item.source_success_count, Some(7));
+    }
+
+    #[test]
+    fn import_credentials_derives_idc_metadata_from_nested_credentials_client_secret() {
+        let dir = temp_test_dir("import-nested-idc-derive");
+        let config = crate::model::config::Config::default();
+        let credentials_path = dir.join("credentials.json");
+        let (service, _, _, _) = test_service(config, credentials_path);
+        let start_url = "https://d-derived.awsapps.com/start";
+        let client_secret = client_secret_with_start_url(&format!("{start_url}/"));
+
+        let raw_nested_credential = serde_json::json!({
+            "id": "nested-enterprise-credential",
+            "email": "nested@example.com",
+            "provider": "Enterprise",
+            "authMethod": "IdC",
+            "machineId": "machine-nested",
+            "credentials": {
+                "accessToken": "access-nested",
+                "refreshToken": "n".repeat(150),
+                "clientId": "client-nested",
+                "clientSecret": client_secret,
+                "region": "ap-southeast-1"
+            }
+        });
+
+        let response = service.import_credentials(ImportCredentialsRequest {
+            dry_run: false,
+            mode: CredentialImportMode::SkipExisting,
+            input: raw_nested_credential,
+        });
+
+        assert_eq!(response.summary.added, 1);
+        assert_eq!(response.summary.invalid, 0);
+        let id = service.token_manager.snapshot().entries[0].id;
+        let imported = service
+            .token_manager
+            .export_credentials_by_ids(&[id])
+            .pop()
+            .unwrap();
+
+        assert_eq!(
+            imported.source_account_id.as_deref(),
+            Some("nested-enterprise-credential")
+        );
+        assert_eq!(imported.auth_method.as_deref(), Some("idc"));
+        assert_eq!(imported.provider.as_deref(), Some("Enterprise"));
+        assert_eq!(imported.start_url.as_deref(), Some(start_url));
+        let expected_hash = AdminService::calculate_client_id_hash(start_url);
+        assert_eq!(
+            imported.client_id_hash.as_deref(),
+            Some(expected_hash.as_str())
+        );
+        assert_eq!(imported.region.as_deref(), Some("ap-southeast-1"));
+        assert_eq!(imported.machine_id.as_deref(), Some("machine-nested"));
+    }
+
+    #[test]
+    fn import_credentials_merge_missing_uses_user_id_without_overwriting_refresh_token() {
+        let dir = temp_test_dir("backup-merge-user-id");
+        let config = crate::model::config::Config::default();
+        let credentials_path = dir.join("credentials.json");
+        let (service, _, _, _) = test_service(config, credentials_path);
+
+        let mut existing = KiroCredentials::default();
+        existing.refresh_token = Some("x".repeat(150));
+        existing.access_token = Some("access-old".to_string());
+        existing.auth_method = Some("social".to_string());
+        existing.user_id = Some("same-user".to_string());
+        existing.machine_id = Some("machine-old".to_string());
+        let id = service
+            .token_manager
+            .add_imported_credential(existing)
+            .unwrap();
+
+        let backup = serde_json::json!({
+            "format": CREDENTIAL_BACKUP_FORMAT,
+            "version": CREDENTIAL_BACKUP_VERSION,
+            "exportedAt": Utc::now().to_rfc3339(),
+            "source": { "app": "xkiro.rs", "schema": CREDENTIAL_BACKUP_SCHEMA, "credentialCount": 1 },
+            "credentials": [{ "credential": {
+                "accessToken": "access-new",
+                "refreshToken": "y".repeat(150),
+                "authMethod": "social",
+                "userId": "same-user",
+                "machineId": "machine-new",
+                "profileArn": "profile-new"
+            }}]
+        });
+
+        let response = service.import_credentials(ImportCredentialsRequest {
+            dry_run: false,
+            mode: CredentialImportMode::MergeMissing,
+            input: backup,
+        });
+
+        assert_eq!(response.summary.merged, 1);
+        assert_eq!(service.token_manager.snapshot().total, 1);
+        let merged = service
+            .token_manager
+            .export_credentials_by_ids(&[id])
+            .pop()
+            .unwrap();
+        let expected_refresh = "x".repeat(150);
+        assert_eq!(
+            merged.refresh_token.as_deref(),
+            Some(expected_refresh.as_str())
+        );
+        assert_eq!(merged.machine_id.as_deref(), Some("machine-old"));
+        assert_eq!(merged.profile_arn.as_deref(), Some("profile-new"));
     }
 
     #[tokio::test]
-    async fn update_settings_patch_empty_password_preserves_admin_key_like_kiro_go() {
+    async fn update_access_settings_patch_empty_password_preserves_admin_key() {
         let dir = temp_test_dir("empty-password");
         let config_path = dir.join("config.json");
         let credentials_path = dir.join("credentials.json");
@@ -5152,7 +10700,7 @@ mod settings_tests {
             test_service(config, credentials_path);
 
         service
-            .update_settings(UpdateSettingsRequest {
+            .update_access_settings(UpdateAccessSettingsRequest {
                 api_key: Some(String::new()),
                 require_api_key: Some(false),
                 password: Some("   ".to_string()),
@@ -5170,7 +10718,7 @@ mod settings_tests {
         assert_eq!(admin_runtime.read().as_str(), "admin-password");
 
         service
-            .update_settings(UpdateSettingsRequest {
+            .update_access_settings(UpdateAccessSettingsRequest {
                 api_key: None,
                 require_api_key: None,
                 password: Some(" new-admin-password ".to_string()),
@@ -5191,8 +10739,70 @@ mod settings_tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[tokio::test]
+    async fn thinking_update_accepts_missing_fields_as_zero_values() {
+        let dir = temp_test_dir("thinking-partial");
+        let config_path = dir.join("config.json");
+        let credentials_path = dir.join("credentials.json");
+        let mut config = crate::model::config::Config::load(&config_path).unwrap();
+        config.thinking_suffix = "-custom".to_string();
+        config.openai_thinking_format = "reasoning_content".to_string();
+        config.claude_thinking_format = "think".to_string();
+        config.save().unwrap();
+        let (service, _, _, _) = test_service(config, credentials_path);
+
+        let request: UpdateThinkingConfigRequest = serde_json::from_value(serde_json::json!({
+            "openaiFormat": "thinking"
+        }))
+        .expect("zero-value thinking update should parse");
+
+        service.update_thinking_config(request).await.unwrap();
+
+        let stored = service.token_manager.config();
+        assert_eq!(stored.thinking_suffix, "-thinking");
+        assert_eq!(stored.openai_thinking_format, "thinking");
+        assert_eq!(stored.claude_thinking_format, "thinking");
+
+        let runtime = service.thinking_config.read().clone();
+        assert_eq!(runtime.suffix, "-thinking");
+        assert_eq!(runtime.openai_format, "thinking");
+        assert_eq!(runtime.claude_format, "thinking");
+
+        let invalid: UpdateThinkingConfigRequest = serde_json::from_value(serde_json::json!({
+            "openaiFormat": "bad-format",
+            "claudeFormat": ""
+        }))
+        .unwrap();
+        assert!(matches!(
+            service.update_thinking_config(invalid).await,
+            Err(AdminServiceError::InvalidRequest(_))
+        ));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn endpoint_update_missing_preferred_endpoint_reaches_service_validation() {
+        let dir = temp_test_dir("endpoint-missing");
+        let config_path = dir.join("config.json");
+        let credentials_path = dir.join("credentials.json");
+        let config = crate::model::config::Config::load(&config_path).unwrap();
+        config.save().unwrap();
+        let (service, _, _, _) = test_service(config, credentials_path);
+
+        let request: UpdateEndpointConfigRequest = serde_json::from_value(serde_json::json!({}))
+            .expect("zero-value endpoint update should parse");
+
+        assert!(matches!(
+            service.update_endpoint_config(request).await,
+            Err(AdminServiceError::InvalidRequest(_))
+        ));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
-    fn update_api_key_empty_key_preserves_existing_value_like_kiro_go() {
+    fn update_api_key_empty_key_preserves_existing_value() {
         let dir = temp_test_dir("api-key-empty-patch");
         let config_path = dir.join("config.json");
         let credentials_path = dir.join("credentials.json");
@@ -5274,29 +10884,77 @@ mod settings_tests {
     }
 
     #[test]
-    fn load_api_keys_migrates_legacy_api_key_like_kiro_go() {
-        let dir = temp_test_dir("api-key-legacy-migration");
+    fn create_api_key_whitespace_key_rejects() {
+        let dir = temp_test_dir("api-key-whitespace-create");
+        let config_path = dir.join("config.json");
+        let credentials_path = dir.join("credentials.json");
+        let config = crate::model::config::Config::load(&config_path).unwrap();
+        config.save().unwrap();
+        let (service, _, _, _) = test_service(config, credentials_path);
 
-        let keys = AdminService::load_api_keys_runtime_with_legacy(
+        let generated = service
+            .create_api_key(CreateApiKeyRequest {
+                name: None,
+                key: Some(String::new()),
+                enabled: None,
+                token_limit: 0,
+                credit_limit: 0.0,
+            })
+            .unwrap();
+        assert!(generated.key.starts_with("sk-"));
+
+        let trimmed = service
+            .create_api_key(CreateApiKeyRequest {
+                name: None,
+                key: Some("  sk-trimmed  ".to_string()),
+                enabled: None,
+                token_limit: 0,
+                credit_limit: 0.0,
+            })
+            .unwrap();
+        assert_eq!(trimmed.key, "sk-trimmed");
+
+        let err = service
+            .create_api_key(CreateApiKeyRequest {
+                name: None,
+                key: Some("   ".to_string()),
+                enabled: None,
+                token_limit: 0,
+                credit_limit: 0.0,
+            })
+            .unwrap_err();
+        assert!(matches!(err, AdminServiceError::InvalidRequest(_)));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_api_keys_migrates_config_api_key() {
+        let dir = temp_test_dir("api-key-config-migration");
+
+        let keys = AdminService::load_api_keys_runtime_with_config_key(
             Some(&dir),
-            Some(" legacy-secret "),
+            Some(" config-secret "),
             true,
         );
         let snapshot = keys.read().clone();
         assert_eq!(snapshot.len(), 1);
-        assert_eq!(snapshot[0].key, "legacy-secret");
+        assert_eq!(snapshot[0].key, "config-secret");
         assert!(snapshot[0].enabled);
-        assert_eq!(snapshot[0].name.as_deref(), Some("legacy-api-key"));
+        assert!(snapshot[0].migrated);
+        assert_eq!(snapshot[0].name.as_deref(), Some("config-api-key"));
+        assert!(to_api_key_view(&snapshot[0]).migrated);
 
         let persisted: Vec<ApiKeyEntry> =
             serde_json::from_str(&std::fs::read_to_string(dir.join("kiro_api_keys.json")).unwrap())
                 .unwrap();
         assert_eq!(persisted.len(), 1);
-        assert_eq!(persisted[0].key, "legacy-secret");
+        assert_eq!(persisted[0].key, "config-secret");
+        assert!(persisted[0].migrated);
 
-        let reloaded = AdminService::load_api_keys_runtime_with_legacy(
+        let reloaded = AdminService::load_api_keys_runtime_with_config_key(
             Some(&dir),
-            Some("legacy-secret"),
+            Some("config-secret"),
             true,
         );
         assert_eq!(reloaded.read().len(), 1);
@@ -5306,20 +10964,133 @@ mod settings_tests {
     }
 
     #[test]
-    fn load_api_keys_migrates_public_legacy_api_key_disabled_like_kiro_go() {
+    fn load_api_keys_migrates_public_config_api_key_disabled() {
         let dir = temp_test_dir("api-key-public-migration");
 
-        let keys = AdminService::load_api_keys_runtime_with_legacy(
+        let keys = AdminService::load_api_keys_runtime_with_config_key(
             Some(&dir),
-            Some("legacy-secret"),
+            Some("config-secret"),
             false,
         );
         let snapshot = keys.read().clone();
         assert_eq!(snapshot.len(), 1);
-        assert_eq!(snapshot[0].key, "legacy-secret");
+        assert_eq!(snapshot[0].key, "config-secret");
         assert!(!snapshot[0].enabled);
+        assert!(snapshot[0].migrated);
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn prompt_filter_update_accepts_partial_payload() {
+        let dir = temp_test_dir("prompt-filter-partial");
+        let config_path = dir.join("config.json");
+        let credentials_path = dir.join("credentials.json");
+        let mut config = crate::model::config::Config::load(&config_path).unwrap();
+        config.prompt_filter.filter_claude_code = true;
+        config.prompt_filter.filter_env_noise = true;
+        config.prompt_filter.filter_strip_boundaries = true;
+        config.prompt_filter.rules = vec![crate::model::config::PromptFilterRule {
+            id: "rule-1".to_string(),
+            name: "Rule 1".to_string(),
+            enabled: true,
+            rule_type: "lines-containing".to_string(),
+            match_pattern: "secret".to_string(),
+            replace: String::new(),
+        }];
+        config.save().unwrap();
+        let (service, _, _, _) = test_service(config, credentials_path);
+
+        let request: UpdatePromptFilterConfigRequest = serde_json::from_value(serde_json::json!({
+            "filterEnvNoise": false
+        }))
+        .expect("partial prompt filter update should parse");
+
+        service.update_prompt_filter_config(request).await.unwrap();
+
+        let stored = service.token_manager.config().prompt_filter;
+        assert!(stored.filter_claude_code);
+        assert!(!stored.filter_env_noise);
+        assert!(stored.filter_strip_boundaries);
+        assert_eq!(stored.rules.len(), 1);
+        assert_eq!(stored.rules[0].match_pattern, "secret");
+
+        let runtime = service.prompt_filter_config.read().clone();
+        assert_eq!(runtime.filter_env_noise, stored.filter_env_noise);
+        assert_eq!(runtime.rules.len(), 1);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod balance_response_tests {
+    use super::*;
+
+    #[test]
+    fn balance_response_from_usage_maps_usage_limits_consistently() {
+        let usage: UsageLimitsResponse = serde_json::from_value(serde_json::json!({
+            "nextDateReset": 1234.0,
+            "subscriptionInfo": {
+                "subscriptionTitle": "KIRO PRO+",
+                "overageCapability": "OVERAGE_CAPABLE"
+            },
+            "overageConfiguration": {
+                "overageStatus": "ENABLED"
+            },
+            "usageBreakdownList": [{
+                "currentUsageWithPrecision": 12.5,
+                "usageLimitWithPrecision": 10.0,
+                "overageCapWithPrecision": 50.0
+            }]
+        }))
+        .expect("usage limits should parse");
+
+        let balance = balance_response_from_usage(42, &usage);
+
+        assert_eq!(balance.id, 42);
+        assert_eq!(balance.subscription_title.as_deref(), Some("KIRO PRO+"));
+        assert_eq!(balance.subscription_type.as_deref(), Some("PRO_PLUS"));
+        assert_eq!(balance.current_usage, 12.5);
+        assert_eq!(balance.usage_limit, 10.0);
+        assert_eq!(balance.remaining, 0.0);
+        assert_eq!(balance.usage_percentage, 100.0);
+        assert_eq!(balance.next_reset_at, Some(1234.0));
+        assert_eq!(balance.overage_cap, 50.0);
+        assert_eq!(
+            balance.overage_capability.as_deref(),
+            Some("OVERAGE_CAPABLE")
+        );
+        assert_eq!(balance.overage_status.as_deref(), Some("ENABLED"));
+    }
+}
+
+#[cfg(test)]
+mod export_adapter_tests {
+    use super::*;
+
+    #[test]
+    fn credential_snapshot_subscription_type_uses_canonical_classifier() {
+        assert_eq!(
+            AdminService::credential_export_subscription_type(Some("KIRO PRO+")),
+            "Pro_Plus"
+        );
+        assert_eq!(
+            AdminService::credential_export_subscription_type(Some("KIRO POWER")),
+            "Pro_Plus"
+        );
+        assert_eq!(
+            AdminService::credential_export_subscription_type(Some("enterprise")),
+            "Enterprise"
+        );
+        assert_eq!(
+            AdminService::credential_export_subscription_type(Some("KIRO TEAMS")),
+            "Teams"
+        );
+        assert_eq!(
+            AdminService::credential_export_subscription_type(None),
+            "Free"
+        );
     }
 }
 
@@ -5328,7 +11099,7 @@ mod api_key_tests {
     use super::*;
 
     #[test]
-    fn mask_api_key_matches_kiro_go() {
+    fn mask_api_key_keeps_short_values_and_masks_middle() {
         assert_eq!(mask_api_key(""), "");
         assert_eq!(mask_api_key("short"), "short");
         assert_eq!(mask_api_key("sk-1234567890abcdef"), "sk-123****cdef");
@@ -5341,6 +11112,7 @@ mod api_key_tests {
             name: Some("main".to_string()),
             key: "sk-1234567890abcdef".to_string(),
             enabled: true,
+            migrated: true,
             created_at: 100,
             last_used_at: Some(200),
             token_limit: 10,
@@ -5353,11 +11125,12 @@ mod api_key_tests {
         let value = serde_json::to_value(view).expect("view should serialize");
         assert_eq!(value["keyMasked"], "sk-123****cdef");
         assert!(value.get("key").is_none());
+        assert_eq!(value["migrated"], true);
         assert_eq!(value["lastUsedAt"], 200);
     }
 
     #[test]
-    fn prompt_filter_dto_matches_kiro_go_fields() {
+    fn prompt_filter_dto_uses_canonical_fields() {
         let response = PromptFilterConfigResponse {
             filter_claude_code: false,
             filter_env_noise: false,
@@ -5374,7 +11147,7 @@ mod api_key_tests {
             "filterStripBoundaries": false,
             "rules": []
         }))
-        .expect("Kiro-Go-shaped prompt filter request should parse");
-        assert!(!request.filter_strip_boundaries);
+        .expect("prompt filter request should parse");
+        assert_eq!(request.filter_strip_boundaries, Some(false));
     }
 }

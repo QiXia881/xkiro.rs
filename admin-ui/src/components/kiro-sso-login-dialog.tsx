@@ -17,8 +17,10 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import type { StartKiroSsoLoginResponse } from '@/types/api'
+import { CredentialLoginSummary } from '@/components/credential-login-summary'
+import type { CredentialLoginDetails, StartKiroSsoLoginResponse } from '@/types/api'
 import { extractErrorMessage } from '@/lib/utils'
+import { CREDENTIAL_AUTH_LABELS, formatCredentialAuthLabel } from '@/lib/credential-metadata'
 
 interface KiroSsoLoginDialogProps {
   open: boolean
@@ -32,6 +34,8 @@ export function KiroSsoLoginDialog({ open, onOpenChange, onSuccess }: KiroSsoLog
   const [step, setStep] = useState<Step>('intro')
   const [session, setSession] = useState<StartKiroSsoLoginResponse | null>(null)
   const [credentialId, setCredentialId] = useState<number | null>(null)
+  const [credentialAuthLabel, setCredentialAuthLabel] = useState('')
+  const [credentialDetails, setCredentialDetails] = useState<CredentialLoginDetails | null>(null)
   const [starting, setStarting] = useState(false)
   const [submittingCallback, setSubmittingCallback] = useState(false)
   const [callbackUrl, setCallbackUrl] = useState('')
@@ -51,6 +55,8 @@ export function KiroSsoLoginDialog({ open, onOpenChange, onSuccess }: KiroSsoLog
     setStep('intro')
     setSession(null)
     setCredentialId(null)
+    setCredentialAuthLabel('')
+    setCredentialDetails(null)
     setStarting(false)
     setSubmittingCallback(false)
     setCallbackUrl('')
@@ -69,11 +75,15 @@ export function KiroSsoLoginDialog({ open, onOpenChange, onSuccess }: KiroSsoLog
           schedulePoll(sessionId, intervalSeconds)
           return
         }
-        if (result.success && result.completed && result.account) {
-          setCredentialId(result.account.id)
+        const details = result.details
+        if (result.success && result.completed && details) {
+          const authLabel = formatCredentialAuthLabel(details.provider, details.authMethod)
+          setCredentialId(details.id)
+          setCredentialAuthLabel(authLabel)
+          setCredentialDetails(details)
           setStep('done')
           onSuccess()
-          toast.success(`登录成功，已添加凭据 #${result.account.id}`)
+          toast.success(`登录成功，已添加${authLabel ? ` ${authLabel}` : ''} 凭据 #${details.id}`)
           return
         }
         toast.error(`登录失败：${result.error ?? '未知错误'}`)
@@ -91,7 +101,7 @@ export function KiroSsoLoginDialog({ open, onOpenChange, onSuccess }: KiroSsoLog
     try {
       const next = await startKiroSsoLogin()
       if (!next.sessionId || !next.signInUrl) {
-        toast.error('后端返回的 Enterprise SSO 登录链接为空，请检查服务日志')
+        toast.error(`后端返回的 ${CREDENTIAL_AUTH_LABELS.microsoftEntra} 登录链接为空，请检查服务日志`)
         return
       }
       setSession(next)
@@ -153,22 +163,22 @@ export function KiroSsoLoginDialog({ open, onOpenChange, onSuccess }: KiroSsoLog
   }
 
   const loginLinkLabel = session?.signInUrl.includes('microsoftonline.')
-    ? 'Microsoft / Entra ID 登录地址'
-    : 'Kiro Enterprise SSO 入口地址'
+    ? `${CREDENTIAL_AUTH_LABELS.microsoftEntra} 登录地址`
+    : `${CREDENTIAL_AUTH_LABELS.microsoftEntra} 入口地址`
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle>Enterprise SSO - Microsoft 365</DialogTitle>
+          <DialogTitle>{CREDENTIAL_AUTH_LABELS.microsoftEntra}</DialogTitle>
           <DialogDescription>
-            使用 Kiro 托管登录页添加 Microsoft 365 / Entra ID（Azure AD）租户账号。
+            使用企业 SSO 远程登录添加 {CREDENTIAL_AUTH_LABELS.microsoftEntra} 租户凭据。
           </DialogDescription>
         </DialogHeader>
 
         {step === 'intro' && (
           <div className="space-y-3 py-2 text-sm text-muted-foreground">
-            <p>启动后会生成 Kiro Enterprise SSO 入口地址，不会自动打开浏览器标签页。</p>
+            <p>启动后会生成 {CREDENTIAL_AUTH_LABELS.microsoftEntra} 入口地址，不会自动打开浏览器标签页。</p>
             <p>请复制地址到无痕窗口、隐私窗口或其他浏览器中访问；遇到 localhost 回调无法访问时，将地址栏完整 URL 粘贴回来继续。</p>
           </div>
         )}
@@ -211,7 +221,7 @@ export function KiroSsoLoginDialog({ open, onOpenChange, onSuccess }: KiroSsoLog
             </div>
             <div className="flex items-center gap-2 text-sm text-muted-foreground">
               <Loader2 className="h-4 w-4 animate-spin" />
-              正在等待 Kiro Enterprise SSO 回调...
+              正在等待 {CREDENTIAL_AUTH_LABELS.microsoftEntra} 回调...
             </div>
           </div>
         )}
@@ -220,7 +230,11 @@ export function KiroSsoLoginDialog({ open, onOpenChange, onSuccess }: KiroSsoLog
           <div className="flex flex-col items-center gap-3 py-4">
             <CheckCircle className="h-10 w-10 text-green-500" />
             <p className="text-sm font-medium">登录成功</p>
-            <p className="text-xs text-muted-foreground">凭据 #{credentialId} 已添加并启用</p>
+            <CredentialLoginSummary
+              credentialId={credentialId}
+              authLabel={credentialAuthLabel}
+              details={credentialDetails}
+            />
           </div>
         )}
 

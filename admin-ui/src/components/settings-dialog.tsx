@@ -11,32 +11,38 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import {
+  getCommonConfig,
   getEndpointConfig,
-  getXkiroProxyConfig,
-  getXkiroSettings,
+  getProxyConfig,
+  getAccessSettings,
   getPromptFilterConfig,
   getThinkingConfig,
+  updateCommonConfig,
   updateEndpointConfig,
-  updateXkiroProxyConfig,
-  updateXkiroSettings,
+  updateProxyConfig,
+  updateAccessSettings,
   updatePromptFilterConfig,
   updateThinkingConfig,
-  type EndpointConfig,
-  type XkiroSettings,
-  type PromptFilterConfig,
-  type PromptFilterRule,
-  type ThinkingConfig,
 } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
+import type {
+  AccessSettings,
+  CommonConfig,
+  EndpointConfig,
+  PromptFilterConfig,
+  PromptFilterRule,
+  ThinkingConfig,
+} from '@/types/api'
 
 interface SettingsDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
 }
 
-type SettingsTab = 'access' | 'thinking' | 'endpoint' | 'proxy' | 'prompt-filter'
+type SettingsTab = 'common' | 'access' | 'thinking' | 'endpoint' | 'proxy' | 'prompt-filter'
 
 const TABS: { id: SettingsTab; label: string }[] = [
+  { id: 'common', label: '常用' },
   { id: 'access', label: '访问控制' },
   { id: 'thinking', label: 'Thinking' },
   { id: 'endpoint', label: '端点' },
@@ -51,10 +57,14 @@ const DEFAULT_THINKING: ThinkingConfig = {
 }
 
 export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
-  const [activeTab, setActiveTab] = useState<SettingsTab>('access')
+  const [activeTab, setActiveTab] = useState<SettingsTab>('common')
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
-  const [settings, setSettings] = useState<XkiroSettings | null>(null)
+  const [settings, setSettings] = useState<AccessSettings | null>(null)
+  const [common, setCommon] = useState<CommonConfig>({
+    machineId: '',
+    credentialMachineIdStrategy: 'random',
+  })
   const [thinking, setThinking] = useState<ThinkingConfig>(DEFAULT_THINKING)
   const [endpoint, setEndpoint] = useState<EndpointConfig>({
     preferredEndpoint: 'auto',
@@ -80,19 +90,21 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
   const loadSettings = async () => {
     setLoading(true)
     try {
-      const [nextSettings, nextThinking, nextEndpoint, nextProxy, nextPromptFilter] =
+      const [nextSettings, nextCommon, nextThinking, nextEndpoint, nextProxy, nextPromptFilter] =
         await Promise.all([
-          getXkiroSettings(),
+          getAccessSettings(),
+          getCommonConfig(),
           getThinkingConfig(),
           getEndpointConfig(),
-          getXkiroProxyConfig(),
+          getProxyConfig(),
           getPromptFilterConfig(),
         ])
       setSettings(nextSettings)
+      setCommon(nextCommon)
       setThinking(nextThinking)
       setEndpoint(nextEndpoint)
       setPromptFilter(nextPromptFilter)
-      parseProxyURL(nextProxy.proxyURL || '')
+      parseProxyURL(nextProxy.proxyUrl || '')
     } catch (error) {
       toast.error(`加载设置失败: ${extractErrorMessage(error)}`)
     } finally {
@@ -105,11 +117,14 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
     setSaving(true)
     try {
       await Promise.all([
-        updateXkiroSettings({
+        updateAccessSettings({
           apiKey: settings.apiKey || '',
           requireApiKey: settings.requireApiKey,
           allowOverUsage: settings.allowOverUsage,
           ...(newPassword.trim() ? { password: newPassword.trim() } : {}),
+        }),
+        updateCommonConfig({
+          credentialMachineIdStrategy: common.credentialMachineIdStrategy,
         }),
         updateThinkingConfig({
           suffix: thinking.suffix || '-thinking',
@@ -117,7 +132,11 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
           claudeFormat: thinking.claudeFormat,
         }),
         updateEndpointConfig(endpoint),
-        updateXkiroProxyConfig(buildProxyURL()),
+        updateProxyConfig({
+          proxyUrl: buildProxyURL(),
+          proxyUsername: null,
+          proxyPassword: null,
+        }),
         updatePromptFilterConfig(promptFilter),
       ])
       setNewPassword('')
@@ -234,22 +253,43 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                 </div>
               ) : settings ? (
                 <div className="space-y-5">
+                  {activeTab === 'common' && (
+                    <Section
+                      title="常用"
+                      desc="控制后续登录或导入凭证时缺失 machineId 的补全方式；已有凭证不会被修改。"
+                    >
+                      <ReadonlyPair label="本机 machineId" value={common.machineId || '-'} />
+                      <SelectRow
+                        label="凭证 machineId 策略"
+                        value={common.credentialMachineIdStrategy}
+                        options={[
+                          { value: 'random', label: '随机 machineId' },
+                          { value: 'local', label: '使用本机 machineId' },
+                        ]}
+                        onChange={value => setCommon({
+                          ...common,
+                          credentialMachineIdStrategy: value as CommonConfig['credentialMachineIdStrategy'],
+                        })}
+                      />
+                    </Section>
+                  )}
+
                   {activeTab === 'access' && (
                     <Section title="访问控制">
-                      <Field label="API Key">
+                      <Field label="API 密钥">
                         <Input
                           value={settings.apiKey || ''}
                           onChange={event => setSettings({ ...settings, apiKey: event.target.value })}
-                          placeholder="留空可配合关闭 Require API Key"
+                          placeholder="留空可配合关闭 API 密钥校验"
                         />
                       </Field>
                       <ToggleRow
-                        label="Require API Key"
+                        label="启用 API 密钥校验"
                         checked={settings.requireApiKey}
                         onChange={value => setSettings({ ...settings, requireApiKey: value })}
                       />
                       <ToggleRow
-                        label="Allow Over Usage"
+                        label="允许超额使用"
                         desc="仅保存设置；不改变运行时调度策略。"
                         checked={settings.allowOverUsage}
                         onChange={value => setSettings({ ...settings, allowOverUsage: value })}
@@ -259,7 +299,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                           type="password"
                           value={newPassword}
                           onChange={event => setNewPassword(event.target.value)}
-                          placeholder="新的 Admin API Key"
+                          placeholder="新的 Admin API 密钥"
                         />
                       </Field>
                       <ReadonlyPair label="监听地址" value={`${settings.host}:${settings.port}`} />
@@ -293,18 +333,18 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                   {activeTab === 'endpoint' && (
                     <Section title="端点配置">
                       <SelectRow
-                        label="Preferred Endpoint"
+                        label="首选端点"
                         value={endpoint.preferredEndpoint}
                         options={[
-                          { value: 'auto', label: 'Auto' },
-                          { value: 'kiro', label: 'Kiro' },
+                          { value: 'auto', label: '自动' },
+                          { value: 'kiro', label: '默认端点' },
                           { value: 'codewhisperer', label: 'CodeWhisperer' },
                           { value: 'amazonq', label: 'AmazonQ' },
                         ]}
                         onChange={value => setEndpoint({ ...endpoint, preferredEndpoint: value as EndpointConfig['preferredEndpoint'] })}
                       />
                       <ToggleRow
-                        label="Endpoint Fallback"
+                        label="端点故障转移"
                         checked={endpoint.endpointFallback}
                         onChange={value => setEndpoint({ ...endpoint, endpointFallback: value })}
                       />

@@ -228,12 +228,12 @@ pub fn should_handle_websearch_request(req: &MessagesRequest) -> bool {
         return true;
     }
 
-    // 2) 兼容旧客户端：仅提供 web_search 单工具时，视为“纯 WebSearch 请求”
+    // 2) 客户端简写形式：仅提供 web_search 单工具时，视为“纯 WebSearch 请求”
     if is_only_web_search_tool(req) {
         return true;
     }
 
-    // 3) 兼容 Claude Code 风格前缀
+    // 3) 识别 Claude Code 风格前缀
     request_explicit_web_search_prefix(req)
 }
 
@@ -810,6 +810,9 @@ pub async fn call_mcp_api(
     tracing::debug!("MCP request: {}", request_body);
 
     let api_result = provider.call_mcp(&request_body, None).await?;
+    let _cred_permit = api_result._credential_permit;
+    let _glb_permit = api_result._global_permit;
+    let _proxy_permit = api_result._proxy_permit;
 
     let body = api_result.response.text().await?;
     tracing::debug!("MCP response: {}", body);

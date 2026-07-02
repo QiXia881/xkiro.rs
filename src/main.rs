@@ -23,9 +23,9 @@ use axum::response::Json;
 use axum::routing::{get, post};
 use clap::Parser;
 use kiro::background_refresh::BackgroundRefreshConfig;
-#[allow(unused_imports)]
-use kiro::endpoint::CODEWHISPERER_ENDPOINT_NAME;
-use kiro::endpoint::{CliEndpoint, CodewhispererEndpoint, IdeEndpoint, KiroEndpoint};
+use kiro::endpoint::{
+    AmazonQEndpoint, CliEndpoint, CodewhispererEndpoint, IdeEndpoint, KiroEndpoint,
+};
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
@@ -69,7 +69,7 @@ async fn main() {
             proxy,
         };
         if let Err(e) = kiro::auth::helper::run(helper_args).await {
-            eprintln!("Social helper 失败: {:#}", e);
+            eprintln!("社交登录 helper 失败: {:#}", e);
             std::process::exit(1);
         }
         return;
@@ -99,12 +99,12 @@ async fn main() {
         std::process::exit(1);
     });
 
-    // 加载凭证（支持单对象或数组格式）
+    // 加载凭据（支持单对象或数组格式）
     let credentials_path = args
         .credentials
         .unwrap_or_else(|| KiroCredentials::default_credentials_path().to_string());
     let credentials_config = CredentialsConfig::load(&credentials_path).unwrap_or_else(|e| {
-        tracing::error!("加载凭证失败: {}", e);
+        tracing::error!("加载凭据失败: {}", e);
         std::process::exit(1);
     });
 
@@ -114,14 +114,14 @@ async fn main() {
     // 转换为按优先级排序的凭据列表
     let mut credentials_list = credentials_config.into_sorted_credentials();
 
-    // 检查 KIRO_API_KEY 环境变量，自动创建 API Key 凭据
+    // 检查 KIRO_API_KEY 环境变量，自动创建 API 密钥凭据
     if let Ok(kiro_api_key) = std::env::var("KIRO_API_KEY") {
         if kiro_api_key.is_empty() {
             tracing::warn!("KIRO_API_KEY 环境变量已设置但为空，视为未配置");
         } else {
-            tracing::info!("检测到 KIRO_API_KEY 环境变量，添加 API Key 凭据（最高优先级）");
+            tracing::info!("检测到 KIRO_API_KEY 环境变量，添加 API 密钥凭据（最高优先级）");
             let api_key_cred = KiroCredentials {
-                kiro_api_key: Some(kiro_api_key),
+                api_key: Some(kiro_api_key),
                 auth_method: Some("api_key".to_string()),
                 priority: 0,
                 ..Default::default()
@@ -134,9 +134,9 @@ async fn main() {
 
     // 获取第一个凭据用于日志显示
     let first_credentials = credentials_list.first().cloned().unwrap_or_default();
-    tracing::debug!("主凭证: {:?}", first_credentials);
+    tracing::debug!("主凭据: {:?}", first_credentials);
 
-    // 获取 API Key
+    // 获取 API 密钥
     let api_key = config.api_key.clone().unwrap_or_else(|| {
         if config.require_api_key {
             tracing::error!("配置文件中未设置 apiKey");
@@ -178,6 +178,8 @@ async fn main() {
         endpoints.insert(cli.name().to_string(), Arc::new(cli));
         let cw = CodewhispererEndpoint::new();
         endpoints.insert(cw.name().to_string(), Arc::new(cw));
+        let amazonq = AmazonQEndpoint::new();
+        endpoints.insert(amazonq.name().to_string(), Arc::new(amazonq));
     }
 
     // 校验默认端点存在
@@ -207,19 +209,32 @@ async fn main() {
         config.clone(),
         credentials_list,
         proxy_config.clone(),
-        Some(credentials_path.into()),
+        Some(credentials_path.clone().into()),
         is_multiple_format,
     )
     .unwrap_or_else(|e| {
-        tracing::error!("创建 Token 管理器失败: {}", e);
+        tracing::error!("创建令牌管理器失败: {}", e);
         std::process::exit(1);
     });
     let token_manager = Arc::new(token_manager);
 
-    // 启动后台 Token 刷新任务（默认配置：每 60s 检查一次，提前 15 分钟刷新）
+    let proxies_path = std::path::Path::new(&credentials_path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join(kiro::proxy_manager::ProxyEntry::default_proxies_path());
+    let proxy_manager = Arc::new(
+        kiro::proxy_manager::ProxyManager::load_from(&proxies_path).unwrap_or_else(|e| {
+            tracing::error!("加载代理池失败: {}", e);
+            std::process::exit(1);
+        }),
+    );
+    token_manager.set_proxy_manager(Some(proxy_manager.clone()));
+    tracing::info!("已加载 {} 个代理配置", proxy_manager.list().len());
+
+    // 启动后台令牌刷新任务（默认配置：每 60s 检查一次，提前 15 分钟刷新）
     let _background_refresher =
         token_manager.start_background_refresh(BackgroundRefreshConfig::default());
-    tracing::info!("后台 Token 刷新任务已启动");
+    tracing::info!("后台令牌刷新任务已启动");
 
     // 余额初始化由 AdminService::prefetch_balances_on_startup 统一负责：
     // 一次上游 getUsageLimits → 同时回填磁盘缓存（dashboard）+ 运行时缓存（路由决策）+ 低余额禁用
@@ -248,7 +263,7 @@ async fn main() {
     let api_keys_store_path = api_keys_cache_dir
         .as_ref()
         .map(|d| d.join("kiro_api_keys.json"));
-    let api_keys_runtime = admin::AdminService::load_api_keys_runtime_with_legacy(
+    let api_keys_runtime = admin::AdminService::load_api_keys_runtime_with_config_key(
         api_keys_cache_dir.as_deref(),
         config.api_key.as_deref(),
         config.require_api_key,
@@ -264,12 +279,18 @@ async fn main() {
     let prompt_runtime = crate::model::runtime::shared_from_config(&config);
 
     // Prompt Cache 运行时（共享引用，支持热更新）
-    // Prompt Cache 运行时（共享引用，支持热更新）
-    let prompt_cache_runtime =
-        Arc::new(RwLock::new(anthropic::middleware::PromptCacheRuntime::new(
+    let prompt_cache_path = std::path::Path::new(&config_path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("prompt_cache.json");
+    let prompt_cache_runtime = Arc::new(RwLock::new(
+        anthropic::middleware::PromptCacheRuntime::new_with_persistence(
             config.prompt_cache_ttl_seconds,
             config.prompt_cache_accounting_enabled,
-        )));
+            config.prompt_cache_max_ratio,
+            prompt_cache_path,
+        ),
+    ));
 
     // 构建 Anthropic API 路由（profile_arn 由首个凭据提供）
     let anthropic_app = anthropic::create_router_with_provider(
@@ -307,6 +328,7 @@ async fn main() {
         } else {
             let admin_service = admin::AdminService::new(
                 token_manager.clone(),
+                proxy_manager.clone(),
                 Some(kiro_provider.clone()),
                 compression_config.clone(),
                 client_api_key_runtime.clone(),
@@ -358,10 +380,10 @@ async fn main() {
         anthropic_app
     };
 
-    // 记录启动时间（用于 health endpoint uptime 计算）
+    // 记录启动时间（用于 health 端点 uptime 计算）
     let start_time = std::time::Instant::now();
 
-    // 添加公共端点（无需 API Key 认证）：health、telemetry sink
+    // 添加公共端点（无需 API 密钥认证）：health、telemetry sink
     let app = app
         .route(
             "/health",
@@ -401,9 +423,9 @@ async fn main() {
     let addr = format!("{}:{}", config.host, config.port);
     tracing::info!("启动 Anthropic API 端点: {}", addr);
     if config.require_api_key {
-        tracing::info!("API Key: {}***", &api_key[..(api_key.len() / 2)]);
+        tracing::info!("API 密钥: {}***", &api_key[..(api_key.len() / 2)]);
     } else {
-        tracing::info!("API Key 认证已关闭");
+        tracing::info!("API 密钥认证已关闭");
     }
     tracing::info!("可用 API:");
     tracing::info!("  GET  /health");

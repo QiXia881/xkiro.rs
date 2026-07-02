@@ -8,7 +8,7 @@ pub struct Args {
     #[arg(short, long)]
     pub config: Option<String>,
 
-    /// 凭证文件路径
+    /// 凭据文件路径
     #[arg(long)]
     pub credentials: Option<String>,
 
@@ -29,7 +29,7 @@ pub enum Command {
         force: bool,
     },
 
-    /// 本机 Social 登录助手（远程部署场景）
+    /// 本机社交登录助手（远程部署场景）
     ///
     /// 在用户本机完成 GitHub/Google OAuth（本机回调 + token 交换），
     /// 再把最终凭据回传给远程 xkiro 服务，绕开"回调只能命中本机"的限制。
@@ -43,11 +43,11 @@ pub enum Command {
         #[arg(long)]
         session: String,
 
-        /// 登录提供方：Github 或 Google
+        /// 登录提供方：GitHub 或 Google
         #[arg(long)]
         provider: String,
 
-        /// Admin API Key（留空则从 stdin 读取，避免泄露到终端历史）
+        /// Admin API 密钥（留空则从 stdin 读取，避免泄露到终端历史）
         #[arg(long)]
         api_key: Option<String>,
 
@@ -55,7 +55,7 @@ pub enum Command {
         #[arg(long)]
         auth_endpoint: Option<String>,
 
-        /// 本机换 token 时使用的代理（http/https/socks5）
+        /// 本机换取令牌时使用的代理（http/https/socks5）
         #[arg(long)]
         proxy: Option<String>,
     },

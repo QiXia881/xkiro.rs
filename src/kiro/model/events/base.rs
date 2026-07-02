@@ -7,7 +7,7 @@ use crate::kiro::parser::frame::Frame;
 
 /// 从帧 payload 中提取 token 使用量
 ///
-/// 对齐 Kiro-Go `updateTokensFromEvent()`: 递归查找 usage map。
+/// 递归查找 usage map。
 pub fn extract_token_usage_from_frame(frame: &Frame) -> Option<super::token_usage::TokenUsage> {
     if frame.payload.is_empty() {
         return None;

@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Trash2, RotateCcw, CheckCircle2, Settings, FileText, Download, Plus } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Trash2, RotateCcw, CheckCircle2, Settings, FileText, Download, Plus, Network } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -14,9 +14,10 @@ import { SettingsDialog } from '@/components/settings-dialog'
 import { SystemPromptDialog } from '@/components/system-prompt-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { RequestLogsDialog } from '@/components/request-logs-dialog'
+import { ProxyPoolDialog } from '@/components/proxy-pool-dialog'
 import { useCredentials, useDeleteCredential, useResetFailure } from '@/hooks/use-credentials'
 import { useRuntimeStats } from '@/hooks/use-runtime-stats'
-import { getCredentialBalance, refreshBatch, refreshBalancesBatch, getCachedBalances, exportTokenJson, exportKam } from '@/api/credentials'
+import { getCredentialBalance, refreshBatch, refreshBalancesBatch, getCachedBalances, exportCredentialBackup } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse, CredentialStatusItem } from '@/types/api'
 
@@ -36,6 +37,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [verifyDialogOpen, setVerifyDialogOpen] = useState(false)
   const [settingsDialogOpen, setSettingsDialogOpen] = useState(false)
   const [systemPromptDialogOpen, setSystemPromptDialogOpen] = useState(false)
+  const [proxyPoolDialogOpen, setProxyPoolDialogOpen] = useState(false)
   const [verifying, setVerifying] = useState(false)
   const [verifyProgress, setVerifyProgress] = useState({ current: 0, total: 0 })
   const [verifyResults, setVerifyResults] = useState<Map<number, VerifyResult>>(new Map())
@@ -153,6 +155,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
             next.set(item.id, {
               id: item.id,
               subscriptionTitle: item.subscriptionTitle,
+              subscriptionType: item.subscriptionType,
               currentUsage: item.currentUsage,
               usageLimit: item.usageLimit,
               remaining: item.remaining,
@@ -190,6 +193,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
           && existing.currentUsage === runtime.balance.currentUsage
           && existing.usageLimit === runtime.balance.usageLimit
           && existing.remaining === runtime.balance.remaining
+          && existing.subscriptionType === runtime.balance.subscriptionType
           && existing.overageStatus === runtime.balance.overageStatus
           && existing.overageCap === runtime.balance.overageCap
         ) {
@@ -198,6 +202,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
         next.set(id, {
           id,
           subscriptionTitle: runtime.balance.subscriptionTitle,
+          subscriptionType: runtime.balance.subscriptionType,
           currentUsage: runtime.balance.currentUsage,
           usageLimit: runtime.balance.usageLimit,
           remaining: runtime.balance.remaining,
@@ -361,7 +366,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
     deselectAll()
   }
 
-  // 批量刷新 Token
+  // 批量刷新令牌
   const handleBatchForceRefresh = async () => {
     if (selectedIds.size === 0) {
       toast.error('请先选择要刷新的凭据')
@@ -386,9 +391,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
       setBatchRefreshProgress({ current: enabledIds.length, total: enabledIds.length })
 
       if (resp.failureCount === 0) {
-        toast.success(`成功刷新 ${resp.successCount} 个凭据的 Token`)
+        toast.success(`成功刷新 ${resp.successCount} 个凭据的令牌`)
       } else {
-        toast.warning(`刷新 Token：成功 ${resp.successCount} 个，失败 ${resp.failureCount} 个`)
+        toast.warning(`刷新令牌：成功 ${resp.successCount} 个，失败 ${resp.failureCount} 个`)
       }
     } catch (error) {
       toast.error(`批量刷新失败：${extractErrorMessage(error)}`)
@@ -424,7 +429,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
       const resp = await refreshBalancesBatch(enabledIds)
       setBatchQueryBalanceProgress({ current: enabledIds.length, total: enabledIds.length })
 
-      // 成功项合入 balanceMap（复用单凭证查询的展示链路）
+      // 成功项合入 balanceMap（复用单凭据查询的展示链路）
       setBalanceMap(prev => {
         const next = new Map(prev)
         resp.results.forEach(item => {
@@ -553,71 +558,35 @@ export function Dashboard({ onLogout }: DashboardProps) {
     }
   }
 
-  // 批量导出（token.json 兼容格式）
+  // 导出完整凭据备份
   const handleBatchExport = async () => {
     if (selectedIds.size === 0) {
       toast.error('请先选择要导出的凭据')
       return
     }
+    const confirmed = window.confirm(
+      '导出会包含刷新令牌、访问令牌、API 密钥、代理凭据、设备 ID、区域和 SSO 缓存。请只在可信环境保存。是否继续？'
+    )
+    if (!confirmed) return
     try {
       const ids = Array.from(selectedIds)
-      const items = await exportTokenJson(ids)
-      if (items.length === 0) {
-        toast.warning('未导出任何凭据（API Key 凭据不支持导出）')
+      const backup = await exportCredentialBackup(ids)
+      if (backup.credentials.length === 0) {
+        toast.warning('未导出任何凭据')
         return
       }
-      const json = JSON.stringify(items, null, 2)
+      const json = JSON.stringify(backup, null, 2)
       const blob = new Blob([json], { type: 'application/json' })
       const url = URL.createObjectURL(blob)
       const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
       const a = document.createElement('a')
       a.href = url
-      a.download = `kiro-tokens-${ts}.json`
+      a.download = `xkiro-credentials-backup-${backup.credentials.length}-${ts}.json`
       document.body.appendChild(a)
       a.click()
       document.body.removeChild(a)
       URL.revokeObjectURL(url)
-      const skipped = ids.length - items.length
-      toast.success(
-        skipped > 0
-          ? `已导出 ${items.length} 项，跳过 ${skipped} 项（API Key / 缺 refreshToken）`
-          : `已导出 ${items.length} 项`
-      )
-    } catch (error) {
-      toast.error(`导出失败：${extractErrorMessage(error)}`)
-    }
-  }
-
-  // KAM 兼容导出（kiro-account-manager 可直接 import）
-  const handleBatchExportKam = async () => {
-    if (selectedIds.size === 0) {
-      toast.error('请先选择要导出的凭据')
-      return
-    }
-    try {
-      const ids = Array.from(selectedIds)
-      const items = await exportKam(ids)
-      if (items.length === 0) {
-        toast.warning('未导出任何凭据（API Key / 缺 refreshToken）')
-        return
-      }
-      const json = JSON.stringify(items, null, 2)
-      const blob = new Blob([json], { type: 'application/json' })
-      const url = URL.createObjectURL(blob)
-      const today = new Date().toISOString().slice(0, 10)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = `kiro-accounts-${items.length}-${today}.json`
-      document.body.appendChild(a)
-      a.click()
-      document.body.removeChild(a)
-      URL.revokeObjectURL(url)
-      const skipped = ids.length - items.length
-      toast.success(
-        skipped > 0
-          ? `已导出 ${items.length} 项 (KAM)，跳过 ${skipped} 项`
-          : `已导出 ${items.length} 项 (KAM)`
-      )
+      toast.success(`已导出 ${backup.credentials.length} 项完整凭据备份`)
     } catch (error) {
       toast.error(`导出失败：${extractErrorMessage(error)}`)
     }
@@ -775,6 +744,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
             <Button variant="ghost" size="icon" className="h-8 w-8" onClick={() => setSystemPromptDialogOpen(true)} title="系统提示">
               <FileText className="h-4 w-4" />
             </Button>
+            <Button variant="ghost" size="icon" className="h-8 w-8" onClick={() => setProxyPoolDialogOpen(true)} title="代理池">
+              <Network className="h-4 w-4" />
+            </Button>
             <Button variant="ghost" size="icon" className="h-8 w-8" onClick={() => setSettingsDialogOpen(true)} title="设置">
               <Settings className="h-4 w-4" />
             </Button>
@@ -841,13 +813,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   <RotateCcw className="h-3.5 w-3.5 mr-1.5" />
                   恢复异常
                 </Button>
-                <Button onClick={handleBatchExport} size="sm" variant="outline" className="h-8">
+                <Button onClick={handleBatchExport} size="sm" variant="outline" className="h-8" title="完整 xkiro.rs 凭据备份，包含敏感令牌、设备 ID、区域、SSO 缓存和代理">
                   <Download className="h-3.5 w-3.5 mr-1.5" />
-                  批量导出
-                </Button>
-                <Button onClick={handleBatchExportKam} size="sm" variant="outline" className="h-8" title="导出为 kiro-account-manager 兼容格式">
-                  <Download className="h-3.5 w-3.5 mr-1.5" />
-                  导出KAM
+                  导出备份
                 </Button>
                 <Button
                   onClick={handleBatchDelete}
@@ -1013,7 +981,13 @@ export function Dashboard({ onLogout }: DashboardProps) {
         onOpenChange={setSystemPromptDialogOpen}
       />
 
-      {/* 添加凭据（统一入口，内含 6 种方法 + KAM/JSON 批量导入） */}
+      {/* 代理池对话框 */}
+      <ProxyPoolDialog
+        open={proxyPoolDialogOpen}
+        onOpenChange={setProxyPoolDialogOpen}
+      />
+
+      {/* 添加凭据（统一入口，内含登录、缓存、Cookie、JSON 导入） */}
       <AddCredentialDialog
         open={addCredDialogOpen}
         onOpenChange={setAddCredDialogOpen}

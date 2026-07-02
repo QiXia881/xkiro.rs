@@ -9,16 +9,24 @@ import {
   DialogFooter,
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
-import { importKiroGoCredential } from '@/api/credentials'
+import { importCredentialRecord } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
+import { CREDENTIAL_AUTH_LABELS, formatCredentialAuthLabel } from '@/lib/credential-metadata'
 
-interface KiroCacheImportDialogProps {
+interface LocalCacheImportDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
   onSuccess: () => void
 }
 
-type LocalProvider = 'BuilderId' | 'Enterprise' | 'Google' | 'Github'
+type LocalProvider = 'BuilderId' | 'Enterprise' | 'Google' | 'GitHub'
+
+const LOCAL_PROVIDER_OPTIONS: Array<{ value: LocalProvider; label: string }> = [
+  { value: 'BuilderId', label: CREDENTIAL_AUTH_LABELS.awsBuilderId },
+  { value: 'Enterprise', label: CREDENTIAL_AUTH_LABELS.iamIdentityCenter },
+  { value: 'Google', label: CREDENTIAL_AUTH_LABELS.google },
+  { value: 'GitHub', label: CREDENTIAL_AUTH_LABELS.github },
+]
 
 function readJsonObject(raw: string, label: string): Record<string, unknown> {
   try {
@@ -37,18 +45,18 @@ function stringField(data: Record<string, unknown>, key: string): string {
   return typeof value === 'string' ? value.trim() : ''
 }
 
-export function KiroCacheImportDialog({ open, onOpenChange, onSuccess }: KiroCacheImportDialogProps) {
+export function LocalCacheImportDialog({ open, onOpenChange, onSuccess }: LocalCacheImportDialogProps) {
   const [provider, setProvider] = useState<LocalProvider>('BuilderId')
-  const [tokenJson, setTokenJson] = useState('')
+  const [cacheJson, setCacheJson] = useState('')
   const [clientJson, setClientJson] = useState('')
   const [importing, setImporting] = useState(false)
-  const [result, setResult] = useState<{ credentialId: number; email?: string } | null>(null)
+  const [result, setResult] = useState<{ credentialId: number; email?: string; authLabel?: string } | null>(null)
 
-  const isSocial = provider === 'Google' || provider === 'Github'
+  const isSocial = provider === 'Google' || provider === 'GitHub'
 
   const reset = () => {
     setProvider('BuilderId')
-    setTokenJson('')
+    setCacheJson('')
     setClientJson('')
     setImporting(false)
     setResult(null)
@@ -70,56 +78,57 @@ export function KiroCacheImportDialog({ open, onOpenChange, onSuccess }: KiroCac
   }
 
   const handleImport = async () => {
-    if (!tokenJson.trim()) {
-      toast.error('请粘贴或上传 token cache JSON')
+    if (!cacheJson.trim()) {
+      toast.error('请粘贴或上传本地缓存 JSON')
       return
     }
 
     setImporting(true)
     try {
-      const tokenData = readJsonObject(tokenJson, 'token cache JSON')
-      const refreshToken = stringField(tokenData, 'refreshToken')
+      const cacheData = readJsonObject(cacheJson, '本地缓存 JSON')
+      const refreshToken = stringField(cacheData, 'refreshToken')
       if (!refreshToken) {
-        throw new Error('token cache JSON 缺少 refreshToken')
+        throw new Error('本地缓存 JSON 缺少 refreshToken 字段')
       }
 
       let clientData: Record<string, unknown> | null = null
       if (!isSocial) {
         if (!clientJson.trim()) {
-          throw new Error('Builder ID / Enterprise 需要 client registration JSON')
+          throw new Error(`${CREDENTIAL_AUTH_LABELS.awsBuilderId} / ${CREDENTIAL_AUTH_LABELS.iamIdentityCenter} 需要客户端注册 JSON`)
         }
-        clientData = readJsonObject(clientJson, 'client registration JSON')
+        clientData = readJsonObject(clientJson, '客户端注册 JSON')
         if (!stringField(clientData, 'clientId') || !stringField(clientData, 'clientSecret')) {
-          throw new Error('client registration JSON 缺少 clientId 或 clientSecret')
+          throw new Error('客户端注册 JSON 缺少 clientId 或 clientSecret')
         }
       }
 
-      const added = await importKiroGoCredential({
+      const added = await importCredentialRecord({
         refreshToken,
-        accessToken: stringField(tokenData, 'accessToken') || undefined,
+        accessToken: stringField(cacheData, 'accessToken') || undefined,
         clientId: clientData ? stringField(clientData, 'clientId') : undefined,
         clientSecret: clientData ? stringField(clientData, 'clientSecret') : undefined,
-        region: stringField(tokenData, 'region') || undefined,
-        authRegion: stringField(tokenData, 'authRegion') || undefined,
-        apiRegion: stringField(tokenData, 'apiRegion') || undefined,
+        region: stringField(cacheData, 'region') || undefined,
+        authRegion: stringField(cacheData, 'authRegion') || undefined,
+        apiRegion: stringField(cacheData, 'apiRegion') || undefined,
         startUrl:
-          stringField(tokenData, 'startUrl')
+          stringField(cacheData, 'startUrl')
           || (clientData ? stringField(clientData, 'startUrl') : '')
           || undefined,
         clientIdHash:
-          stringField(tokenData, 'clientIdHash')
+          stringField(cacheData, 'clientIdHash')
           || (clientData ? stringField(clientData, 'clientIdHash') : '')
           || undefined,
-        idToken: stringField(tokenData, 'idToken') || undefined,
-        ssoSessionId: stringField(tokenData, 'ssoSessionId') || undefined,
+        idToken: stringField(cacheData, 'idToken') || undefined,
+        ssoSessionId: stringField(cacheData, 'ssoSessionId') || undefined,
         authMethod: clientData ? 'idc' : 'social',
         provider,
-        profileArn: stringField(tokenData, 'profileArn') || undefined,
-        machineId: stringField(tokenData, 'machineId') || undefined,
+        profileArn: stringField(cacheData, 'profileArn') || undefined,
+        machineId: stringField(cacheData, 'machineId') || undefined,
       })
 
-      setResult({ credentialId: added.credentialId, email: added.email })
-      toast.success(`导入成功，已添加凭据 #${added.credentialId}`)
+      const authLabel = formatCredentialAuthLabel(added.provider, added.authMethod)
+      setResult({ credentialId: added.credentialId, email: added.email, authLabel })
+      toast.success(`导入成功，已添加${authLabel ? ` ${authLabel}` : ''} 凭据 #${added.credentialId}`)
       onSuccess()
     } catch (error) {
       toast.error(`导入失败: ${extractErrorMessage(error)}`)
@@ -134,7 +143,7 @@ export function KiroCacheImportDialog({ open, onOpenChange, onSuccess }: KiroCac
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <FolderOpen className="h-5 w-5" />
-            Kiro 本地缓存导入
+            本地缓存导入
           </DialogTitle>
         </DialogHeader>
 
@@ -153,39 +162,38 @@ export function KiroCacheImportDialog({ open, onOpenChange, onSuccess }: KiroCac
               onChange={(event) => setProvider(event.target.value as LocalProvider)}
               disabled={importing}
             >
-              <option value="BuilderId">AWS Builder ID</option>
-              <option value="Enterprise">IAM Identity Center</option>
-              <option value="Google">Google</option>
-              <option value="Github">GitHub</option>
+              {LOCAL_PROVIDER_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>{option.label}</option>
+              ))}
             </select>
           </div>
 
           <div className="space-y-2">
-            <label className="text-sm font-medium">Token cache JSON</label>
+            <label className="text-sm font-medium">本地缓存 JSON</label>
             <textarea
               className="h-28 w-full resize-none rounded-md border bg-background p-3 font-mono text-sm"
               placeholder='{"refreshToken":"...","accessToken":"...","region":"us-east-1"}'
-              value={tokenJson}
-              onChange={(event) => setTokenJson(event.target.value)}
+              value={cacheJson}
+              onChange={(event) => setCacheJson(event.target.value)}
               disabled={importing}
             />
             <label className="inline-flex">
               <span className="inline-flex cursor-pointer items-center rounded-md border px-3 py-1.5 text-sm hover:bg-muted">
                 <Upload className="mr-2 h-3.5 w-3.5" />
-                上传 token JSON
+                上传令牌 JSON
               </span>
               <input
                 type="file"
                 accept=".json"
                 className="hidden"
-                onChange={(event) => void loadFile(event, setTokenJson)}
+                onChange={(event) => void loadFile(event, setCacheJson)}
               />
             </label>
           </div>
 
           {!isSocial && (
             <div className="space-y-2">
-              <label className="text-sm font-medium">Client registration JSON</label>
+              <label className="text-sm font-medium">客户端注册 JSON</label>
               <textarea
                 className="h-28 w-full resize-none rounded-md border bg-background p-3 font-mono text-sm"
                 placeholder='{"clientId":"...","clientSecret":"..."}'
@@ -196,7 +204,7 @@ export function KiroCacheImportDialog({ open, onOpenChange, onSuccess }: KiroCac
               <label className="inline-flex">
                 <span className="inline-flex cursor-pointer items-center rounded-md border px-3 py-1.5 text-sm hover:bg-muted">
                   <Upload className="mr-2 h-3.5 w-3.5" />
-                  上传 client JSON
+                  上传客户端注册 JSON
                 </span>
                 <input
                   type="file"
@@ -215,6 +223,7 @@ export function KiroCacheImportDialog({ open, onOpenChange, onSuccess }: KiroCac
                 <span>导入成功，凭据 #{result.credentialId}</span>
               </div>
               {result.email && <p className="mt-1 text-xs">{result.email}</p>}
+              {result.authLabel && <p className="mt-1 text-xs">{result.authLabel}</p>}
             </div>
           )}
         </div>
@@ -223,7 +232,7 @@ export function KiroCacheImportDialog({ open, onOpenChange, onSuccess }: KiroCac
           <Button variant="outline" onClick={() => handleOpenChange(false)}>
             取消
           </Button>
-          <Button onClick={handleImport} disabled={importing || !tokenJson.trim()}>
+          <Button onClick={handleImport} disabled={importing || !cacheJson.trim()}>
             {importing && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
             导入
           </Button>

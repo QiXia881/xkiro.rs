@@ -29,6 +29,7 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.10", features = ["v1", "v4", "v5", "fast-rng"] }
 fastrand = "2"
 sha2 = "0.10"
+sha1_smol = "1"
 hex = "0.4"
 crc = "3"           # CRC32C 计算
 base64 = "0.22"
@@ -44,3 +45,6 @@ unicode-segmentation = "1.13"  # UAX #29 grapheme cluster 安全截断
 serde_cbor = "0.11"   # CBOR 编解码（Web Portal API）
 regex = "1"           # 系统提示清洗的正则规则
 tiktoken-rs = "0.11"  # cl100k_base 精确 token 计数（precise_token_counting 开启时启用）
+
+[dev-dependencies]
+tower = "0.5"

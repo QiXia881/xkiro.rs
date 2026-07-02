@@ -102,7 +102,7 @@ pub(crate) struct FinalUsage<'a> {
 
 /// Anthropic prompt cache 读写统计
 ///
-/// 与 BK 对齐保留 5m / 1h ephemeral 拆分；cache_tracker 接入前恒为 `None`。
+/// 保留 5m / 1h ephemeral 拆分；cache_tracker 接入前恒为 `None`。
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CacheUsageBreakdown {
     pub cache_creation_input_tokens: i32,
@@ -430,11 +430,12 @@ pub struct StreamContext {
     last_reasoning_content: String,
     thinking_source: ThinkingStreamSource,
     drop_tag_thinking: bool,
-    /// 对齐 Kiro-Go `toolUseState.GeneratedID`: 工具名 → 生成的 fallback ID
+    /// 工具名 → 生成的 fallback ID
     /// 当上游未提供 tool_use_id 时，同一工具名复用同一个生成的 ID
     generated_tool_ids: HashMap<String, String>,
     pending_tool_use: Option<StreamPendingToolUse>,
     thinking_format: String,
+    aborted: bool,
 }
 
 impl StreamContext {
@@ -494,6 +495,7 @@ impl StreamContext {
             generated_tool_ids: HashMap::new(),
             pending_tool_use: None,
             thinking_format: thinking_format.into(),
+            aborted: false,
         }
     }
 
@@ -1238,8 +1240,26 @@ impl StreamContext {
         events
     }
 
+    pub fn generate_error_events(&mut self, message: impl AsRef<str>) -> Vec<SseEvent> {
+        self.aborted = true;
+        vec![SseEvent::new(
+            "error",
+            json!({
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": message.as_ref()
+                }
+            }),
+        )]
+    }
+
     /// 生成最终事件序列
     pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
+        if self.aborted {
+            return Vec::new();
+        }
+
         let mut events = Vec::new();
 
         // Flush thinking_buffer 中的剩余内容
@@ -1445,7 +1465,7 @@ impl StreamContext {
 
 /// 将总输入 token 转为 Anthropic usage 的 input_tokens 口径（剔除 cache 读写）
 ///
-/// 与 BK 严格对齐：饱和减法 + `max(0)`，避免估算偏差产生负值。
+/// 使用饱和减法 + `max(0)`，避免估算偏差产生负值。
 pub(crate) fn billed_input_tokens(
     input_tokens: i32,
     cache_creation_input_tokens: i32,
@@ -1595,7 +1615,7 @@ impl BufferedStreamContext {
 /// （每次包含从头到当前位置的完整内容），而非增量。此函数通过比较当前 chunk
 /// 与上一次的完整内容，计算出真正的增量文本。
 ///
-/// 对齐 Kiro-Go `normalizeChunk()` 逻辑：
+/// 累积文本差量规则：
 /// - chunk == prev → 空增量（无新内容）
 /// - chunk 以 prev 开头 → 返回后缀差量
 /// - prev 以 chunk 开头 → 返回空（回退场景）
@@ -1696,6 +1716,22 @@ mod tests {
         assert!(sse_str.starts_with("event: message_start\n"));
         assert!(sse_str.contains("data: "));
         assert!(sse_str.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn stream_error_events_do_not_emit_normal_stop() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 12, None, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+
+        let events = ctx.generate_error_events("upstream closed");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "error");
+        assert_eq!(events[0].data["type"], "error");
+        assert_eq!(events[0].data["error"]["type"], "api_error");
+        assert_eq!(events[0].data["error"]["message"], "upstream closed");
+        assert!(ctx.generate_final_events().is_empty());
     }
 
     #[test]
@@ -1880,7 +1916,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_tool_use_waits_until_stop_like_kiro_go() {
+    fn stream_tool_use_waits_until_stop() {
         let mut ctx =
             StreamContext::new_with_thinking("test-model", 1, None, false, HashMap::new());
         let _ = ctx.generate_initial_events();
@@ -1924,7 +1960,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_tool_use_replaces_generated_id_when_real_id_arrives_like_kiro_go() {
+    fn stream_tool_use_replaces_generated_id_when_real_id_arrives() {
         let mut ctx =
             StreamContext::new_with_thinking("test-model", 1, None, false, HashMap::new());
         let _ = ctx.generate_initial_events();
@@ -1967,7 +2003,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_tool_use_object_input_replaces_buffer_like_kiro_go() {
+    fn stream_tool_use_object_input_replaces_buffer() {
         let mut ctx =
             StreamContext::new_with_thinking("test-model", 1, None, false, HashMap::new());
         let _ = ctx.generate_initial_events();
@@ -2008,7 +2044,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_final_events_flush_pending_tool_use_on_eof_like_kiro_go() {
+    fn stream_final_events_flush_pending_tool_use_on_eof() {
         let mut ctx =
             StreamContext::new_with_thinking("test-model", 1, None, false, HashMap::new());
         let _ = ctx.generate_initial_events();
@@ -2115,7 +2151,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_output_tokens_count_final_content_like_kiro_go() {
+    fn stream_output_tokens_count_final_content() {
         let mut ctx = StreamContext::new_with_thinking("test-model", 1, None, true, HashMap::new());
 
         ctx.process_assistant_response("<thinking>reasoning</thinking>\n\nhello");
@@ -2156,7 +2192,7 @@ mod tests {
     }
 
     #[test]
-    fn thinking_stream_reasoning_event_blocks_tag_source_like_kiro_go() {
+    fn thinking_stream_reasoning_event_blocks_tag_source() {
         let mut ctx = StreamContext::new_with_thinking("test-model", 1, None, true, HashMap::new());
 
         let mut events = Vec::new();
@@ -2175,7 +2211,7 @@ mod tests {
     }
 
     #[test]
-    fn thinking_stream_tag_source_blocks_reasoning_event_like_kiro_go() {
+    fn thinking_stream_tag_source_blocks_reasoning_event() {
         let mut ctx = StreamContext::new_with_thinking("test-model", 1, None, true, HashMap::new());
 
         let mut events = Vec::new();

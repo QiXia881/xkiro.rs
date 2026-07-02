@@ -1,7 +1,7 @@
 //! Kiro 端点抽象
 //!
 //! 不同 Kiro 端点（如 `ide` / `cli`）在 URL、请求头、请求体上存在差异，
-//! 但共享凭据池、Token 刷新、重试逻辑和 AWS event-stream 响应解码。
+//! 但共享凭据池、令牌刷新、重试逻辑和 AWS event-stream 响应解码。
 //!
 //! [`KiroEndpoint`] 抽象了请求侧的差异点；`KiroProvider` 持有一个 endpoint 注册表，
 //! 按凭据的 `endpoint` 字段选择对应实现。
@@ -11,10 +11,12 @@ use reqwest::RequestBuilder;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::model::config::Config;
 
+pub mod amazonq;
 pub mod cli;
 pub mod codewhisperer;
 pub mod ide;
 
+pub use amazonq::{AMAZONQ_ENDPOINT_NAME, AmazonQEndpoint};
 pub use cli::{CLI_ENDPOINT_NAME, CliEndpoint};
 pub use codewhisperer::{CODEWHISPERER_ENDPOINT_NAME, CodewhispererEndpoint};
 pub use ide::{IDE_ENDPOINT_NAME, IdeEndpoint};
@@ -31,7 +33,7 @@ pub struct UsageRequestParts {
 /// `setUserPreference` 请求所需的 URL + headers + 请求体
 ///
 /// 用于切换上游 overage 开关。不同端点的 host / user-agent 沿用各自的 usage
-/// 风格。请求体由 endpoint 拼装，profileArn 处理与 usage 一致。
+/// 风格。请求体由 endpoint 拼装，已解析的 profileArn 会随 overage 写请求发送。
 pub struct PreferenceRequestParts {
     pub url: String,
     pub headers: Vec<(&'static str, String)>,
@@ -108,12 +110,31 @@ pub trait KiroEndpoint: Send + Sync {
 pub struct RequestContext<'a> {
     /// 当前凭据
     pub credentials: &'a KiroCredentials,
-    /// 有效的 access token（API Key 凭据下即 kiroApiKey）
+    /// 有效的 access token（API 密钥凭据下即 apiKey）
     pub token: &'a str,
     /// 当前凭据对应的 machineId
     pub machine_id: &'a str,
     /// 全局配置
     pub config: &'a Config,
+}
+
+pub(crate) fn codewhisperer_rest_host_for_region(region: &str) -> String {
+    let region = region.trim();
+    if region.is_empty() || region.eq_ignore_ascii_case("us-east-1") {
+        "codewhisperer.us-east-1.amazonaws.com".to_string()
+    } else {
+        format!("q.{}.amazonaws.com", region)
+    }
+}
+
+pub(crate) fn q_rest_host_for_region(region: &str) -> String {
+    let region = region.trim();
+    let region = if region.is_empty() {
+        "us-east-1"
+    } else {
+        region
+    };
+    format!("q.{}.amazonaws.com", region)
 }
 
 /// 默认的 MONTHLY_REQUEST_COUNT 判断逻辑
@@ -175,5 +196,30 @@ mod tests {
             "The bearer token included in the request is invalid"
         ));
         assert!(!default_is_bearer_token_invalid("unrelated error"));
+    }
+
+    #[test]
+    fn codewhisperer_rest_host_matches_regional_routing_rules() {
+        assert_eq!(
+            codewhisperer_rest_host_for_region(""),
+            "codewhisperer.us-east-1.amazonaws.com"
+        );
+        assert_eq!(
+            codewhisperer_rest_host_for_region("us-east-1"),
+            "codewhisperer.us-east-1.amazonaws.com"
+        );
+        assert_eq!(
+            codewhisperer_rest_host_for_region("eu-central-1"),
+            "q.eu-central-1.amazonaws.com"
+        );
+    }
+
+    #[test]
+    fn q_rest_host_defaults_empty_region_to_us_east_1() {
+        assert_eq!(q_rest_host_for_region(""), "q.us-east-1.amazonaws.com");
+        assert_eq!(
+            q_rest_host_for_region("eu-central-1"),
+            "q.eu-central-1.amazonaws.com"
+        );
     }
 }

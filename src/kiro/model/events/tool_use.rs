@@ -1,10 +1,10 @@
 //! 工具使用事件
 //!
 //! 处理 toolUseEvent 类型的事件
-//! 对齐 Kiro-Go `handleToolUseEvent()` 的字段兼容性：
-//! - toolUseId / toolUseID / tool_use_id / id 多字段兼容
-//! - name / toolName / tool_name 多字段兼容
-//! - stop / isStop / done 多字段兼容
+//! 接受 toolUseEvent 的多种上游字段命名：
+//! - toolUseId / toolUseID / tool_use_id / id 字段别名
+//! - name / toolName / tool_name 字段别名
+//! - stop / isStop / done 字段别名
 //! - input 支持 string 和 JSON object 两种类型
 
 use serde::Deserialize;
@@ -18,7 +18,7 @@ use super::base::EventPayload;
 /// 工具使用事件
 ///
 /// 包含工具调用的流式数据。
-/// 使用自定义反序列化以兼容 Kiro 上游的不同字段命名约定。
+/// 使用自定义反序列化识别 Kiro 上游的不同字段命名约定。
 #[derive(Debug, Clone)]
 pub struct ToolUseEvent {
     /// 工具名称
@@ -32,7 +32,7 @@ pub struct ToolUseEvent {
     pub stop: bool,
 }
 
-/// 对齐 Kiro-Go `firstStringField`: 按优先级尝试多个字段名，跳过空字符串
+/// 按优先级尝试多个字段名，跳过空字符串。
 fn first_string_field(obj: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<String> {
     for key in keys {
         if let Some(Value::String(s)) = obj.get(*key) {
@@ -44,7 +44,7 @@ fn first_string_field(obj: &serde_json::Map<String, Value>, keys: &[&str]) -> Op
     None
 }
 
-/// 对齐 Kiro-Go `firstBoolField`: 按优先级尝试多个字段名
+/// 按优先级尝试多个布尔字段名。
 fn first_bool_field(obj: &serde_json::Map<String, Value>, keys: &[&str]) -> bool {
     for key in keys {
         if let Some(Value::Bool(b)) = obj.get(*key) {
@@ -61,9 +61,7 @@ impl<'de> Deserialize<'de> for ToolUseEvent {
     where
         D: serde::Deserializer<'de>,
     {
-        // 先反序列化为原始 JSON Value，手动实现 firstStringField 语义
-        // 对齐 Kiro-Go: serde 的 alias 在主字段存在（即使为空）时不会尝试别名
-        // Kiro-Go 的 firstStringField 会跳过空字符串，尝试下一个候选字段
+        // 先反序列化为原始 JSON Value，手动实现“跳过空主字段继续尝试别名”的语义。
         let raw_value: serde_json::Value = serde_json::Value::deserialize(deserializer)?;
         let obj = match raw_value.as_object() {
             Some(o) => o,
@@ -78,7 +76,7 @@ impl<'de> Deserialize<'de> for ToolUseEvent {
             }
         };
 
-        // 对齐 Kiro-Go firstStringField: 按优先级尝试多个字段名，跳过空字符串
+        // 按优先级尝试多个字段名，跳过空字符串。
         let tool_use_id = first_string_field(obj, &["toolUseId", "toolUseID", "tool_use_id", "id"])
             .unwrap_or_default();
         let name = first_string_field(obj, &["name", "toolName", "tool_name"])
@@ -94,7 +92,7 @@ impl<'de> Deserialize<'de> for ToolUseEvent {
             None => (String::new(), false),
         };
 
-        // stop: 对齐 Kiro-Go firstBoolField
+        // stop: 按优先级尝试多个布尔字段名。
         let stop = first_bool_field(obj, &["stop", "isStop", "done"]);
 
         Ok(ToolUseEvent {

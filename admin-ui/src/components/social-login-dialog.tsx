@@ -12,8 +12,10 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
-import type { StartSocialLoginResponse } from '@/types/api'
+import { CredentialLoginSummary } from '@/components/credential-login-summary'
+import type { CredentialLoginDetails, StartSocialLoginResponse } from '@/types/api'
 import { extractErrorMessage } from '@/lib/utils'
+import { CREDENTIAL_AUTH_LABELS, formatCredentialAuthLabel } from '@/lib/credential-metadata'
 import { storage } from '@/lib/storage'
 
 interface SocialLoginDialogProps {
@@ -23,13 +25,14 @@ interface SocialLoginDialogProps {
 }
 
 type Step = 'form' | 'waiting' | 'done'
-type SocialProvider = 'Github' | 'Google'
+type SocialProvider = 'GitHub' | 'Google'
 
 const POLL_INTERVAL_MS = 2000
+const SOCIAL_PROVIDER_LABEL = `${CREDENTIAL_AUTH_LABELS.google} / ${CREDENTIAL_AUTH_LABELS.github}`
 
 export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLoginDialogProps) {
   const [step, setStep] = useState<Step>('form')
-  const [provider, setProvider] = useState<SocialProvider>('Github')
+  const [provider, setProvider] = useState<SocialProvider>('GitHub')
   const [priority, setPriority] = useState('0')
   const [email, setEmail] = useState('')
   const [isStarting, setIsStarting] = useState(false)
@@ -37,19 +40,34 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
   const [callbackUrl, setCallbackUrl] = useState('')
   const [session, setSession] = useState<StartSocialLoginResponse | null>(null)
   const [credentialId, setCredentialId] = useState<number | null>(null)
+  const [credentialAuthLabel, setCredentialAuthLabel] = useState('')
+  const [credentialDetails, setCredentialDetails] = useState<CredentialLoginDetails | null>(null)
   const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const activePollSessionRef = useRef<string | null>(null)
 
   useEffect(() => {
     return () => {
-      if (pollTimerRef.current) clearTimeout(pollTimerRef.current)
+      if (pollTimerRef.current) {
+        clearTimeout(pollTimerRef.current)
+        pollTimerRef.current = null
+      }
+      activePollSessionRef.current = null
     }
   }, [])
 
+  const stopPolling = () => {
+    if (pollTimerRef.current) {
+      clearTimeout(pollTimerRef.current)
+      pollTimerRef.current = null
+    }
+    activePollSessionRef.current = null
+  }
+
   const handleOpenChange = (nextOpen: boolean) => {
     if (!nextOpen) {
-      if (pollTimerRef.current) clearTimeout(pollTimerRef.current)
+      stopPolling()
       setStep('form')
-      setProvider('Github')
+      setProvider('GitHub')
       setPriority('0')
       setEmail('')
       setIsStarting(false)
@@ -57,35 +75,50 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
       setCallbackUrl('')
       setSession(null)
       setCredentialId(null)
+      setCredentialAuthLabel('')
+      setCredentialDetails(null)
     }
     onOpenChange(nextOpen)
   }
 
   const schedulePoll = (sessionId: string) => {
+    if (activePollSessionRef.current !== sessionId) return
     pollTimerRef.current = setTimeout(async () => {
       try {
         const result = await pollSocialLogin(sessionId)
+        if (activePollSessionRef.current !== sessionId) return
         if (result.status === 'waiting') {
           schedulePoll(sessionId)
           return
         }
         if (result.status === 'success') {
+          const details = result.details ?? null
+          const authLabel = formatCredentialAuthLabel(
+            details?.provider ?? result.provider,
+            details?.authMethod ?? result.authMethod,
+          )
+          stopPolling()
           setCredentialId(result.credentialId)
+          setCredentialAuthLabel(authLabel)
+          setCredentialDetails(details)
           setStep('done')
           onSuccess()
-          toast.success(`登录成功，已添加凭据 #${result.credentialId}`)
+          toast.success(`登录成功，已添加${authLabel ? ` ${authLabel}` : ''} 凭据 #${result.credentialId}`)
           return
         }
         if (result.status === 'error') {
+          stopPolling()
           toast.error(`登录失败：${result.message}`)
           setStep('form')
           setSession(null)
           return
         }
+        stopPolling()
         toast.error('登录会话已过期，请重新发起')
         setStep('form')
         setSession(null)
       } catch (error) {
+        if (activePollSessionRef.current !== sessionId) return
         toast.error(`轮询失败：${extractErrorMessage(error)}`)
         schedulePoll(sessionId)
       }
@@ -103,6 +136,7 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
       })
       setSession(nextSession)
       setStep('waiting')
+      activePollSessionRef.current = nextSession.sessionId
       schedulePoll(nextSession.sessionId)
     } catch (error) {
       toast.error(`发起登录失败：${extractErrorMessage(error)}`)
@@ -146,15 +180,22 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
     }
 
     setIsSubmittingCallback(true)
+    stopPolling()
     try {
       const result = await completeSocialLoginCallback(session.sessionId, trimmedCallbackUrl)
       if (result.status === 'success') {
-        if (pollTimerRef.current) clearTimeout(pollTimerRef.current)
+        const details = result.details ?? null
+        const authLabel = formatCredentialAuthLabel(
+          details?.provider ?? result.provider,
+          details?.authMethod ?? result.authMethod,
+        )
         setCredentialId(result.credentialId)
+        setCredentialAuthLabel(authLabel)
+        setCredentialDetails(details)
         setStep('done')
         setCallbackUrl('')
         onSuccess()
-        toast.success(`登录成功，已添加凭据 #${result.credentialId}`)
+        toast.success(`登录成功，已添加${authLabel ? ` ${authLabel}` : ''} 凭据 #${result.credentialId}`)
         return
       }
       if (result.status === 'error') {
@@ -162,12 +203,13 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
         return
       }
       if (result.status === 'expired') {
-        if (pollTimerRef.current) clearTimeout(pollTimerRef.current)
         toast.error('登录会话已过期，请重新发起')
         setStep('form')
         setSession(null)
         return
       }
+      activePollSessionRef.current = session.sessionId
+      schedulePoll(session.sessionId)
       toast.info('回调已提交，继续等待登录完成')
     } catch (error) {
       toast.error(`提交回调失败：${extractErrorMessage(error)}`)
@@ -180,7 +222,7 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle>Kiro 账号登录</DialogTitle>
+          <DialogTitle>{SOCIAL_PROVIDER_LABEL} 授权登录</DialogTitle>
           <DialogDescription>
             复制登录地址到无痕窗口、隐私窗口或其他浏览器中访问；回调页面打不开时，将地址栏完整 URL 粘贴回来完成登录。
           </DialogDescription>
@@ -193,17 +235,17 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
               <div className="grid grid-cols-2 gap-2">
                 <Button
                   type="button"
-                  variant={provider === 'Github' ? 'default' : 'outline'}
-                  onClick={() => setProvider('Github')}
+                  variant={provider === 'GitHub' ? 'default' : 'outline'}
+                  onClick={() => setProvider('GitHub')}
                 >
-                  GitHub
+                  {CREDENTIAL_AUTH_LABELS.github}
                 </Button>
                 <Button
                   type="button"
                   variant={provider === 'Google' ? 'default' : 'outline'}
                   onClick={() => setProvider('Google')}
                 >
-                  Google
+                  {CREDENTIAL_AUTH_LABELS.google}
                 </Button>
               </div>
             </div>
@@ -254,7 +296,7 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
                 </Button>
               </div>
               <p className="text-xs text-muted-foreground">
-                命令中包含 Admin API Key，请勿分享给他人。需本机已安装与服务端同版本的 xkiro.rs。
+                命令中包含 Admin API 密钥，请勿分享给他人。需本机已安装与服务端同版本的 xkiro.rs。
               </p>
             </div>
 
@@ -274,7 +316,7 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
               </p>
               <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
                 请务必复制到无痕窗口、隐私窗口或其他浏览器中访问。普通窗口会自动沿用
-                上一个已登录的 {provider} 账号，导致无法添加新账号。
+                上一次已登录的 {provider} 身份，导致无法添加新的凭据。
               </div>
               {session.portalUrl && (
                 <div className="space-y-2">
@@ -325,7 +367,11 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
           <div className="flex flex-col items-center gap-3 py-4">
             <CheckCircle className="h-10 w-10 text-green-500" />
             <p className="text-sm font-medium">登录成功</p>
-            <p className="text-xs text-muted-foreground">凭据 #{credentialId} 已添加并启用</p>
+            <CredentialLoginSummary
+              credentialId={credentialId}
+              authLabel={credentialAuthLabel}
+              details={credentialDetails}
+            />
           </div>
         )}
 

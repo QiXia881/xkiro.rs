@@ -1,13 +1,13 @@
 use serde::{Deserialize, Serialize};
 
-/// 刷新 Token 的请求体 (Social 认证)
+/// 刷新令牌的请求体（社交登录认证）
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RefreshRequest {
     pub refresh_token: String,
 }
 
-/// 刷新 Token 的响应体 (Social 认证)
+/// 刷新令牌的响应体（社交登录认证）
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RefreshResponse {
@@ -20,7 +20,7 @@ pub struct RefreshResponse {
     pub expires_in: Option<i64>,
 }
 
-/// IdC Token 刷新请求体 (AWS SSO OIDC)
+/// IAM Identity Center 令牌刷新请求体 (AWS SSO OIDC)
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IdcRefreshRequest {
@@ -30,7 +30,7 @@ pub struct IdcRefreshRequest {
     pub grant_type: String,
 }
 
-/// IdC Token 刷新响应体 (AWS SSO OIDC)
+/// IAM Identity Center 令牌刷新响应体 (AWS SSO OIDC)
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IdcRefreshResponse {
@@ -127,7 +127,7 @@ pub struct OidcErrorResponse {
     pub error: String,
 }
 
-/// Social 登录 code 换 token 请求体
+/// 社交登录 code 换取令牌请求体
 #[derive(Debug, Serialize)]
 pub struct SocialCreateTokenRequest {
     pub code: String,
@@ -137,7 +137,7 @@ pub struct SocialCreateTokenRequest {
     pub invitation_code: Option<String>,
 }
 
-/// Social 登录 code 换 token 响应体
+/// 社交登录 code 换取令牌响应体
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SocialCreateTokenResponse {

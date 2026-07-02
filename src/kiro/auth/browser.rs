@@ -4,10 +4,10 @@
 //! `auth.desktop.kiro.dev/login` → AWS Cognito `oauth2/authorize` → `github/authorize`
 //! → 真正的 github.com/google。中间层在【第一跳】就剥离了我们传入的所有额外 query 参数，
 //! 所以 `prompt=select_account` 永远到不了 GitHub/Google，无法靠 URL 参数强制选号。
-//! 账号复用真正发生在 github.com / google.com 的【浏览器 cookie】层。
+//! 登录身份复用真正发生在 github.com / google.com 的【浏览器 cookie】层。
 //!
 //! `--incognito` 单独不够：第二次 `--incognito` 会复用一个已存在的无痕窗口，里面仍带着
-//! 上个账号的 cookie。唯一可靠解是每次登录给浏览器一个【全新的空 profile】——
+//! 上一次登录身份的 cookie。唯一可靠解是每次登录给浏览器一个【全新的空 profile】——
 //! Chromium 系用 `--user-data-dir=<临时目录>`，Firefox 用 `-profile <临时目录> -no-remote`，
 //! 用后即弃。
 
@@ -30,7 +30,7 @@ impl Drop for IsolatedBrowser {
 ///
 /// 成功返回 `Some(guard)`（其 drop 负责清理 profile，调用方需持有到登录结束）；
 /// 找不到任何可用浏览器时返回 `None`，调用方应提示用户【手动用隐私窗口打开】——
-/// 注意不要回退到普通打开，否则会复用旧账号 cookie，正是要解决的问题。
+/// 注意不要回退到普通打开，否则会复用旧登录身份 cookie，正是要解决的问题。
 pub fn open_isolated(url: &str) -> Option<IsolatedBrowser> {
     let profile_dir = std::env::temp_dir().join(format!("xkiro-oauth-{}", uuid::Uuid::new_v4()));
     if std::fs::create_dir_all(&profile_dir).is_err() {

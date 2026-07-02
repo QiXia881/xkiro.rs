@@ -1,7 +1,7 @@
 //! CodeWhisperer 端点
 //!
 //! 对应 CodeWhisperer API 端点：
-//! - API: `https://codewhisperer.{api_region}.amazonaws.com/generateAssistantResponse`
+//! - API: `https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse` 或区域化后的 `https://q.{api_region}.amazonaws.com/generateAssistantResponse`
 //! - X-Amz-Target: `AmazonCodeWhispererStreamingService.GenerateAssistantResponse`
 //!
 //! 此端点与 IDE 端点共享大部分逻辑，主要区别在于：
@@ -12,7 +12,10 @@
 use reqwest::RequestBuilder;
 use uuid::Uuid;
 
-use super::{KiroEndpoint, PreferenceRequestParts, RequestContext, UsageRequestParts};
+use super::{
+    KiroEndpoint, PreferenceRequestParts, RequestContext, UsageRequestParts,
+    codewhisperer_rest_host_for_region, q_rest_host_for_region,
+};
 use crate::kiro::model::credentials::KiroCredentials;
 
 /// CodeWhisperer 端点名称
@@ -27,11 +30,19 @@ impl CodewhispererEndpoint {
     }
 
     fn api_region<'a>(&self, ctx: &'a RequestContext<'_>) -> &'a str {
-        ctx.credentials.effective_api_region(ctx.config)
+        ctx.credentials.effective_kiro_api_region(ctx.config)
+    }
+
+    fn host_for_region(api_region: &str) -> String {
+        codewhisperer_rest_host_for_region(api_region)
     }
 
     fn host(&self, ctx: &RequestContext<'_>) -> String {
-        format!("codewhisperer.{}.amazonaws.com", self.api_region(ctx))
+        Self::host_for_region(self.api_region(ctx))
+    }
+
+    fn preference_host(&self, ctx: &RequestContext<'_>) -> String {
+        q_rest_host_for_region(self.api_region(ctx))
     }
 
     fn x_amz_user_agent(&self, ctx: &RequestContext<'_>) -> String {
@@ -51,14 +62,8 @@ impl CodewhispererEndpoint {
         )
     }
 
-    fn is_aws_sso_oidc_credentials(credentials: &KiroCredentials) -> bool {
-        let auth_method = credentials.auth_method.as_deref();
-        matches!(auth_method, Some("builder-id") | Some("idc"))
-            || (credentials.client_id.is_some() && credentials.client_secret.is_some())
-    }
-
     fn mcp_profile_arn_header_value(credentials: &KiroCredentials) -> Option<&str> {
-        if Self::is_aws_sso_oidc_credentials(credentials) {
+        if credentials.is_aws_sso_oidc_credential() {
             return None;
         }
         credentials.profile_arn_trimmed()
@@ -68,7 +73,7 @@ impl CodewhispererEndpoint {
         request_body: &str,
         credentials: &KiroCredentials,
     ) -> anyhow::Result<String> {
-        if Self::is_aws_sso_oidc_credentials(credentials) {
+        if credentials.is_aws_sso_oidc_credential() {
             let mut request: serde_json::Value = serde_json::from_str(request_body)?;
             if let Some(obj) = request.as_object_mut() {
                 obj.remove("profileArn");
@@ -112,11 +117,20 @@ impl CodewhispererEndpoint {
 #[cfg(test)]
 mod tests {
     use super::CodewhispererEndpoint;
+    use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
     use crate::kiro::model::credentials::KiroCredentials;
+    use crate::model::config::Config;
     use serde_json::Value;
 
+    fn header_value<'a>(headers: &'a [(&'static str, String)], name: &str) -> Option<&'a str> {
+        headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
     #[test]
-    fn test_inject_profile_arn_preserves_and_trims_explicit_payload_arn_like_kiro_go() {
+    fn test_inject_profile_arn_preserves_and_trims_explicit_payload_arn() {
         let body =
             r#"{"conversationState":{},"profileArn":" arn:aws:codewhisperer:profile/explicit "}"#;
         let credentials = KiroCredentials::default();
@@ -124,6 +138,241 @@ mod tests {
         let json: Value = serde_json::from_str(&result).unwrap();
 
         assert_eq!(json["profileArn"], "arn:aws:codewhisperer:profile/explicit");
+    }
+
+    #[test]
+    fn codewhisperer_endpoint_uses_codewhisperer_host_for_us_east_1() {
+        let endpoint = CodewhispererEndpoint::new();
+        let config = Config::default();
+        let credentials = KiroCredentials {
+            api_region: Some("us-east-1".to_string()),
+            ..Default::default()
+        };
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: "token",
+            machine_id: "machine",
+            config: &config,
+        };
+
+        assert_eq!(
+            endpoint.api_url(&ctx),
+            "https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse"
+        );
+        assert_eq!(
+            endpoint.mcp_url(&ctx),
+            "https://codewhisperer.us-east-1.amazonaws.com/mcp"
+        );
+    }
+
+    #[test]
+    fn codewhisperer_api_headers_include_streaming_accept_header() {
+        let endpoint = CodewhispererEndpoint::new();
+        let config = Config::default();
+        let credentials = KiroCredentials::default();
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: "token",
+            machine_id: "machine",
+            config: &config,
+        };
+
+        let request = endpoint
+            .decorate_api(reqwest::Client::new().post(endpoint.api_url(&ctx)), &ctx)
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            request
+                .headers()
+                .get("accept")
+                .and_then(|v| v.to_str().ok()),
+            Some("*/*")
+        );
+    }
+
+    #[test]
+    fn codewhisperer_usage_uses_codewhisperer_rest_host_for_us_east_1() {
+        let endpoint = CodewhispererEndpoint::new();
+        let config = Config::default();
+        let credentials = KiroCredentials {
+            api_region: Some("us-east-1".to_string()),
+            profile_arn: Some("arn:aws:codewhisperer:us-east-1:123:profile/test".to_string()),
+            ..Default::default()
+        };
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: "token",
+            machine_id: "machine",
+            config: &config,
+        };
+
+        let usage = endpoint.usage_request_parts(&ctx, false).unwrap();
+
+        assert!(
+            usage
+                .url
+                .starts_with("https://codewhisperer.us-east-1.amazonaws.com/getUsageLimits?")
+        );
+        assert!(
+            usage.url.contains(
+                "profileArn=arn%3Aaws%3Acodewhisperer%3Aus-east-1%3A123%3Aprofile%2Ftest"
+            )
+        );
+        assert_eq!(
+            header_value(&usage.headers, "Accept"),
+            Some("application/json")
+        );
+        assert_eq!(
+            header_value(&usage.headers, "host"),
+            Some("codewhisperer.us-east-1.amazonaws.com")
+        );
+        assert!(
+            header_value(&usage.headers, "user-agent")
+                .is_some_and(|value| value.contains("api/codewhispererruntime#1.0.0"))
+        );
+    }
+
+    #[test]
+    fn codewhisperer_set_preference_uses_q_host_and_profile_arn() {
+        let endpoint = CodewhispererEndpoint::new();
+        let config = Config::default();
+        let credentials = KiroCredentials {
+            api_region: Some("us-east-1".to_string()),
+            profile_arn: Some("arn:aws:codewhisperer:us-east-1:123:profile/test".to_string()),
+            ..Default::default()
+        };
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: "token",
+            machine_id: "machine",
+            config: &config,
+        };
+
+        let parts = endpoint
+            .set_preference_request_parts(&ctx, "DISABLED")
+            .unwrap();
+        let body: Value = serde_json::from_str(&parts.body).unwrap();
+
+        assert_eq!(
+            parts.url,
+            "https://q.us-east-1.amazonaws.com/setUserPreference"
+        );
+        assert_eq!(
+            header_value(&parts.headers, "Accept"),
+            Some("application/json")
+        );
+        assert_eq!(
+            header_value(&parts.headers, "content-type"),
+            Some("application/json")
+        );
+        assert_eq!(
+            header_value(&parts.headers, "host"),
+            Some("q.us-east-1.amazonaws.com")
+        );
+        assert_eq!(body["overageConfiguration"]["overageStatus"], "DISABLED");
+        assert_eq!(
+            body["profileArn"],
+            "arn:aws:codewhisperer:us-east-1:123:profile/test"
+        );
+    }
+
+    #[test]
+    fn codewhisperer_endpoint_regionalizes_non_us_east_1_to_q_host() {
+        let endpoint = CodewhispererEndpoint::new();
+        let config = Config::default();
+        let credentials = KiroCredentials {
+            api_region: Some("eu-central-1".to_string()),
+            ..Default::default()
+        };
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: "token",
+            machine_id: "machine",
+            config: &config,
+        };
+
+        assert_eq!(
+            endpoint.api_url(&ctx),
+            "https://q.eu-central-1.amazonaws.com/generateAssistantResponse"
+        );
+        assert_eq!(
+            endpoint.mcp_url(&ctx),
+            "https://q.eu-central-1.amazonaws.com/mcp"
+        );
+
+        let usage = endpoint.usage_request_parts(&ctx, false).unwrap();
+        assert!(
+            usage
+                .url
+                .starts_with("https://q.eu-central-1.amazonaws.com/")
+        );
+        assert!(!usage.url.contains("codewhisperer.eu-central-1"));
+        assert!(
+            usage
+                .headers
+                .iter()
+                .any(|(key, value)| { *key == "host" && value == "q.eu-central-1.amazonaws.com" })
+        );
+    }
+
+    #[test]
+    fn codewhisperer_endpoint_prefers_profile_arn_region() {
+        let endpoint = CodewhispererEndpoint::new();
+        let mut config = Config::default();
+        config.api_region = Some("us-east-1".to_string());
+        let credentials = KiroCredentials {
+            api_region: Some("us-east-1".to_string()),
+            profile_arn: Some("arn:aws:codewhisperer:eu-central-1:123:profile/test".to_string()),
+            ..Default::default()
+        };
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: "token",
+            machine_id: "machine",
+            config: &config,
+        };
+
+        assert_eq!(
+            endpoint.api_url(&ctx),
+            "https://q.eu-central-1.amazonaws.com/generateAssistantResponse"
+        );
+        assert_eq!(
+            endpoint.mcp_url(&ctx),
+            "https://q.eu-central-1.amazonaws.com/mcp"
+        );
+
+        let request = endpoint
+            .decorate_api(reqwest::Client::new().post(endpoint.api_url(&ctx)), &ctx)
+            .build()
+            .unwrap();
+        assert_eq!(
+            request.headers().get("host").and_then(|v| v.to_str().ok()),
+            Some("q.eu-central-1.amazonaws.com")
+        );
+
+        let usage = endpoint.usage_request_parts(&ctx, false).unwrap();
+        assert!(
+            usage
+                .url
+                .starts_with("https://q.eu-central-1.amazonaws.com/getUsageLimits?")
+        );
+        assert_eq!(
+            header_value(&usage.headers, "host"),
+            Some("q.eu-central-1.amazonaws.com")
+        );
+
+        let preference = endpoint
+            .set_preference_request_parts(&ctx, "DISABLED")
+            .unwrap();
+        assert_eq!(
+            preference.url,
+            "https://q.eu-central-1.amazonaws.com/setUserPreference"
+        );
+        assert_eq!(
+            header_value(&preference.headers, "host"),
+            Some("q.eu-central-1.amazonaws.com")
+        );
     }
 }
 
@@ -139,21 +388,16 @@ impl KiroEndpoint for CodewhispererEndpoint {
     }
 
     fn api_url(&self, ctx: &RequestContext<'_>) -> String {
-        format!(
-            "https://codewhisperer.{}.amazonaws.com/generateAssistantResponse",
-            self.api_region(ctx)
-        )
+        format!("https://{}/generateAssistantResponse", self.host(ctx))
     }
 
     fn mcp_url(&self, ctx: &RequestContext<'_>) -> String {
-        format!(
-            "https://codewhisperer.{}.amazonaws.com/mcp",
-            self.api_region(ctx)
-        )
+        format!("https://{}/mcp", self.host(ctx))
     }
 
     fn decorate_api(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
         let mut req = req
+            .header("Accept", "*/*")
             .header("x-amzn-codewhisperer-optout", "true")
             .header("x-amzn-kiro-agent-mode", "vibe")
             .header("x-amz-user-agent", self.x_amz_user_agent(ctx))
@@ -218,11 +462,12 @@ impl KiroEndpoint for CodewhispererEndpoint {
                 host
             )
         };
-        if let Some(profile_arn) = Self::mcp_profile_arn_header_value(ctx.credentials) {
+        if let Some(profile_arn) = ctx.credentials.profile_arn_trimmed() {
             url.push_str(&format!("&profileArn={}", urlencoding::encode(profile_arn)));
         }
 
         let mut headers = vec![
+            ("Accept", "application/json".to_string()),
             (
                 "x-amz-user-agent",
                 format!(
@@ -262,17 +507,18 @@ impl KiroEndpoint for CodewhispererEndpoint {
         ctx: &RequestContext<'_>,
         overage_status: &str,
     ) -> anyhow::Result<PreferenceRequestParts> {
-        let host = self.host(ctx);
+        let host = self.preference_host(ctx);
         let url = format!("https://{}/setUserPreference", host);
 
         let mut body = serde_json::json!({
             "overageConfiguration": { "overageStatus": overage_status },
         });
-        if let Some(profile_arn) = Self::mcp_profile_arn_header_value(ctx.credentials) {
+        if let Some(profile_arn) = ctx.credentials.profile_arn_trimmed() {
             body["profileArn"] = serde_json::Value::String(profile_arn.to_string());
         }
 
         let mut headers = vec![
+            ("Accept", "application/json".to_string()),
             ("content-type", "application/json".to_string()),
             (
                 "x-amz-user-agent",

@@ -1,7 +1,6 @@
 //! 系统提示清洗 Layer-1
 //!
-//! 对齐 Kiro-Go `applyPromptFilters`：在请求送入转换链之前对 system prompt 应用一组
-//! 内置过滤 + 用户自定义规则。
+//! 在请求送入转换链之前对 system prompt 应用一组内置过滤 + 用户自定义规则。
 //!
 //! # 三个内置开关
 //! 1. `filter_claude_code` — 命中 ≥2 个 Claude Code CLI 标记 → 整体替换为精简后端提示

@@ -6,6 +6,13 @@ import {
 } from '@/components/ui/dialog'
 import { Progress } from '@/components/ui/progress'
 import { useCredentialBalance } from '@/hooks/use-credentials'
+import {
+  formatCredentialBalanceDate,
+  formatCredentialBalanceNumber,
+  formatCredentialOverageStatusLabel,
+  getCredentialBalanceBaseUsage,
+  getCredentialBalanceOverageUsage,
+} from '@/lib/credential-balance'
 import { parseError } from '@/lib/utils'
 
 interface BalanceDialogProps {
@@ -16,15 +23,8 @@ interface BalanceDialogProps {
 
 export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialogProps) {
   const { data: balance, isLoading, error } = useCredentialBalance(credentialId, true)
-
-  const formatDate = (timestamp: number | null) => {
-    if (!timestamp) return '未知'
-    return new Date(timestamp * 1000).toLocaleString('zh-CN')
-  }
-
-  const formatNumber = (num: number) => {
-    return num.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
-  }
+  const baseUsage = balance ? getCredentialBalanceBaseUsage(balance) : null
+  const overageUsage = balance ? getCredentialBalanceOverageUsage(balance) : null
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -60,7 +60,7 @@ export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialo
           )
         })()}
 
-        {balance && (
+        {balance && baseUsage && overageUsage && (
           <div className="space-y-4">
             {/* 订阅类型 */}
             <div className="text-center">
@@ -74,44 +74,34 @@ export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialo
               <div className="flex justify-between text-sm">
                 <span>正式额度</span>
                 <span className="text-muted-foreground">
-                  {formatNumber(Math.min(balance.currentUsage, balance.usageLimit))} / {formatNumber(balance.usageLimit)}
+                  {formatCredentialBalanceNumber(baseUsage.used)} / {formatCredentialBalanceNumber(baseUsage.limit)}
                 </span>
               </div>
-              <Progress value={Math.min(100, balance.usagePercentage)} />
+              <Progress value={baseUsage.percent} />
               <div className="text-center text-sm text-muted-foreground">
-                剩余 ${formatNumber(balance.remaining)} · 下次重置 {formatDate(balance.nextResetAt)}
+                剩余 ${formatCredentialBalanceNumber(baseUsage.remaining)} · 下次重置 {formatCredentialBalanceDate(balance.nextResetAt)}
               </div>
             </div>
 
             {/* 超额额度进度 */}
-            {(balance.overageCapability === 'OVERAGE_CAPABLE' || balance.overageCap > 0 || balance.currentUsage > balance.usageLimit) && (() => {
-              const overUsed = Math.max(0, balance.currentUsage - balance.usageLimit)
-              const overRemaining = Math.max(0, balance.overageCap - overUsed)
-              return (
+            {overageUsage.visible && (
               <div className="space-y-2 pt-2 border-t">
                 <div className="flex justify-between text-sm">
                   <span>超额额度</span>
                   <span className="text-muted-foreground">
-                    {formatNumber(overRemaining)} / {balance.overageCap > 0 ? formatNumber(balance.overageCap) : '—'}
+                    {formatCredentialBalanceNumber(overageUsage.remaining)} / {overageUsage.cap > 0 ? formatCredentialBalanceNumber(overageUsage.cap) : '—'}
                   </span>
                 </div>
-                {balance.overageCap > 0 ? (
-                  <Progress value={Math.min(100, (overUsed / balance.overageCap) * 100)} />
+                {overageUsage.cap > 0 ? (
+                  <Progress value={overageUsage.percent} />
                 ) : (
                   <div className="text-xs text-muted-foreground">订阅未提供超额上限</div>
                 )}
                 <div className="text-center text-xs text-muted-foreground">
-                  {balance.overageStatus === 'ENABLED'
-                    ? '远端开关：已启用'
-                    : balance.overageStatus === 'DISABLED'
-                      ? '远端开关：已禁用'
-                      : balance.overageCapability === 'OVERAGE_INCAPABLE'
-                        ? '订阅不支持超额'
-                        : ''}
+                  {formatCredentialOverageStatusLabel(balance, { remote: true })}
                 </div>
               </div>
-              )
-            })()}
+            )}
           </div>
         )}
       </DialogContent>

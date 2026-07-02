@@ -45,7 +45,9 @@ impl OpenAIErrorResponse {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatCompletionsRequest {
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub model: String,
+    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
     pub messages: Vec<ChatMessage>,
     #[serde(default)]
     pub stream: bool,
@@ -58,7 +60,7 @@ pub struct ChatCompletionsRequest {
     pub stop: Option<serde_json::Value>,
     pub tools: Option<Vec<ChatTool>>,
     pub tool_choice: Option<serde_json::Value>,
-    /// 仅做兼容字段（reasoning_effort 等），暂不影响行为
+    /// 客户端可选字段（reasoning_effort 等），暂不影响行为
     #[serde(default)]
     #[allow(dead_code)]
     pub reasoning_effort: Option<String>,
@@ -66,6 +68,7 @@ pub struct ChatCompletionsRequest {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatMessage {
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub role: String,
     /// 可为字符串、数组（多模态）或 null（仅 tool_calls 的 assistant）
     #[serde(default)]
@@ -81,16 +84,24 @@ pub struct ChatMessage {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatToolCall {
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub id: String,
-    #[serde(rename = "type")]
+    #[serde(
+        rename = "type",
+        default,
+        deserialize_with = "deserialize_nullable_string"
+    )]
     pub call_type: String,
+    #[serde(default, deserialize_with = "deserialize_nullable_default")]
     pub function: ChatToolCallFunction,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ChatToolCallFunction {
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub name: String,
     /// OpenAI 规范是字符串（已序列化的 JSON）
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub arguments: String,
 }
 
@@ -297,7 +308,7 @@ pub struct ResponsesRequest {
     pub previous_response_id: Option<String>,
     #[serde(default)]
     pub store: Option<bool>,
-    /// reasoning: { effort: "low|medium|high" }（仅做兼容透传）
+    /// reasoning: { effort: "low|medium|high" }（协议透传）
     #[serde(default)]
     #[allow(dead_code)]
     pub reasoning: Option<serde_json::Value>,
@@ -307,6 +318,29 @@ pub struct ResponsesRequest {
 
 fn default_stream_true() -> bool {
     false
+}
+
+fn deserialize_nullable_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn deserialize_nullable_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn deserialize_nullable_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 fn default_responses_model() -> String {
@@ -322,4 +356,65 @@ where
         Some(model) if !model.trim().is_empty() => model,
         _ => default_responses_model(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::ChatCompletionsRequest;
+
+    #[test]
+    fn chat_request_missing_model_and_messages_use_go_zero_values() {
+        let req: ChatCompletionsRequest =
+            serde_json::from_value(json!({})).expect("chat request should parse");
+
+        assert_eq!(req.model, "");
+        assert!(req.messages.is_empty());
+    }
+
+    #[test]
+    fn chat_request_null_model_messages_and_role_use_go_zero_values() {
+        let req: ChatCompletionsRequest = serde_json::from_value(json!({
+            "model": null,
+            "messages": null
+        }))
+        .expect("chat request should parse null model/messages");
+
+        assert_eq!(req.model, "");
+        assert!(req.messages.is_empty());
+
+        let req: ChatCompletionsRequest = serde_json::from_value(json!({
+            "messages": [
+                { "role": null, "content": "hello" }
+            ]
+        }))
+        .expect("chat request should parse null message role");
+
+        assert_eq!(req.messages[0].role, "");
+    }
+
+    #[test]
+    fn chat_request_incomplete_tool_call_uses_go_zero_values() {
+        let req: ChatCompletionsRequest = serde_json::from_value(json!({
+            "messages": [
+                { "role": "user", "content": "run" },
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [
+                        { "id": null, "type": null, "function": null }
+                    ]
+                },
+                { "role": "tool", "content": "done" }
+            ]
+        }))
+        .expect("chat request should parse incomplete tool calls");
+
+        let tool_call = &req.messages[1].tool_calls.as_ref().unwrap()[0];
+        assert_eq!(tool_call.id, "");
+        assert_eq!(tool_call.call_type, "");
+        assert_eq!(tool_call.function.name, "");
+        assert_eq!(tool_call.function.arguments, "");
+    }
 }

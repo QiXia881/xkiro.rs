@@ -1,7 +1,10 @@
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::fs;
+use std::path::Path;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::types::{Message, MessagesRequest};
@@ -39,20 +42,135 @@ struct CacheEntry {
 }
 
 struct CachedCheckpointStore {
-    by_credential: HashMap<u64, HashMap<[u8; 32], CacheEntry>>,
+    entries_by_credential: HashMap<u64, HashMap<[u8; 32], CacheEntry>>,
+    max_cache_read_ratio: f64,
+    dirty: bool,
 }
 
 pub struct CacheTracker {
     entries: Mutex<CachedCheckpointStore>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct PromptCacheDiskFile {
+    version: i32,
+    entries: Vec<PromptCacheDiskEntry>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PromptCacheDiskEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credential_id: Option<u64>,
+    fingerprint: [u8; 32],
+    expires_at: i64,
+    ttl_seconds: i64,
+}
+
 impl CacheTracker {
     pub fn new(_max_supported_ttl: Duration) -> Self {
+        Self::new_with_max_ratio(_max_supported_ttl, 0.85)
+    }
+
+    pub fn new_with_max_ratio(_max_supported_ttl: Duration, max_cache_read_ratio: f64) -> Self {
         Self {
             entries: Mutex::new(CachedCheckpointStore {
-                by_credential: HashMap::new(),
+                entries_by_credential: HashMap::new(),
+                max_cache_read_ratio: normalize_prompt_cache_max_ratio(max_cache_read_ratio),
+                dirty: false,
             }),
         }
+    }
+
+    pub fn set_max_cache_read_ratio(&self, max_cache_read_ratio: f64) {
+        self.entries.lock().max_cache_read_ratio =
+            normalize_prompt_cache_max_ratio(max_cache_read_ratio);
+    }
+
+    pub fn load_from_path(&self, path: &Path) -> usize {
+        let Ok(data) = fs::read(path) else {
+            return 0;
+        };
+        let Ok(disk) = serde_json::from_slice::<PromptCacheDiskFile>(&data) else {
+            return 0;
+        };
+
+        let now_system = SystemTime::now();
+        let now_instant = Instant::now();
+        let mut loaded = 0usize;
+        let mut entries = self.entries.lock();
+        for item in disk.entries {
+            let Some(credential_id) = item.credential_id.filter(|id| *id != 0) else {
+                continue;
+            };
+            if item.ttl_seconds <= 0 {
+                continue;
+            }
+            let expiry_system = UNIX_EPOCH + Duration::from_secs(item.expires_at.max(0) as u64);
+            let Ok(remaining) = expiry_system.duration_since(now_system) else {
+                continue;
+            };
+            entries
+                .entries_by_credential
+                .entry(credential_id)
+                .or_default()
+                .insert(
+                    item.fingerprint,
+                    CacheEntry {
+                        token_count: 0,
+                        ttl: Duration::from_secs(item.ttl_seconds as u64),
+                        expires_at: now_instant + remaining,
+                    },
+                );
+            loaded += 1;
+        }
+        entries.dirty = false;
+        loaded
+    }
+
+    pub fn flush_to_path(&self, path: &Path) -> anyhow::Result<usize> {
+        let now_instant = Instant::now();
+        let now_system = SystemTime::now();
+        let mut entries = self.entries.lock();
+        if !entries.dirty {
+            return Ok(0);
+        }
+
+        prune_expired(&mut entries.entries_by_credential, now_instant);
+        let entry_count: usize = entries
+            .entries_by_credential
+            .values()
+            .map(HashMap::len)
+            .sum();
+        let mut disk_entries = Vec::with_capacity(entry_count);
+        for (credential_id, credential_entries) in &entries.entries_by_credential {
+            for (fingerprint, entry) in credential_entries {
+                let remaining = entry.expires_at.saturating_duration_since(now_instant);
+                let expires_at = now_system
+                    .checked_add(remaining)
+                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_secs() as i64)
+                    .unwrap_or(0);
+                disk_entries.push(PromptCacheDiskEntry {
+                    credential_id: Some(*credential_id),
+                    fingerprint: *fingerprint,
+                    expires_at,
+                    ttl_seconds: entry.ttl.as_secs() as i64,
+                });
+            }
+        }
+        entries.dirty = false;
+        drop(entries);
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let data = serde_json::to_vec_pretty(&PromptCacheDiskFile {
+            version: 1,
+            entries: disk_entries,
+        })?;
+        fs::write(path, data)?;
+        Ok(entry_count)
     }
 
     pub fn build_profile(
@@ -99,6 +217,9 @@ impl CacheTracker {
     }
 
     pub fn compute(&self, credential_id: u64, profile: &CacheProfile) -> CacheResult {
+        if credential_id == 0 {
+            return CacheResult::default();
+        }
         let Some(last_breakpoint) = profile.last_breakpoint() else {
             return CacheResult::default();
         };
@@ -108,9 +229,10 @@ impl CacheTracker {
 
         let now = Instant::now();
         let mut entries = self.entries.lock();
-        prune_expired(&mut entries.by_credential, now);
+        prune_expired(&mut entries.entries_by_credential, now);
+        let max_cache_read_ratio = entries.max_cache_read_ratio;
 
-        let Some(credential_entries) = entries.by_credential.get_mut(&credential_id) else {
+        let Some(credential_entries) = entries.entries_by_credential.get_mut(&credential_id) else {
             tracing::debug!(credential_id, "首次请求，无缓存条目");
             let effective_creation = if last_breakpoint_tokens < profile.min_cacheable_tokens {
                 0
@@ -125,8 +247,9 @@ impl CacheTracker {
                 cache_creation_1h_input_tokens: cache_1h,
             };
         };
+
         if credential_entries.is_empty() {
-            tracing::debug!(credential_id, "首次请求，缓存条目为空");
+            tracing::debug!(credential_id, "首次请求，无缓存条目");
             let effective_creation = if last_breakpoint_tokens < profile.min_cacheable_tokens {
                 0
             } else {
@@ -139,7 +262,7 @@ impl CacheTracker {
                 cache_creation_5m_input_tokens: cache_5m,
                 cache_creation_1h_input_tokens: cache_1h,
             };
-        }
+        };
 
         tracing::debug!(
             credential_id,
@@ -147,7 +270,7 @@ impl CacheTracker {
             "查找缓存匹配"
         );
 
-        let max_cacheable = ((profile.total_input_tokens as f64) * 0.85) as i32;
+        let max_cacheable = ((profile.total_input_tokens as f64) * max_cache_read_ratio) as i32;
         if last_breakpoint_tokens > max_cacheable {
             last_breakpoint_tokens = max_cacheable;
         }
@@ -192,12 +315,18 @@ impl CacheTracker {
     }
 
     pub fn update(&self, credential_id: u64, profile: &CacheProfile) {
+        if credential_id == 0 || profile.breakpoints.is_empty() {
+            return;
+        }
         let now = Instant::now();
         let mut entries = self.entries.lock();
-        prune_expired(&mut entries.by_credential, now);
+        prune_expired(&mut entries.entries_by_credential, now);
+        let credential_entries = entries
+            .entries_by_credential
+            .entry(credential_id)
+            .or_default();
 
-        let credential_entries = entries.by_credential.entry(credential_id).or_default();
-
+        let mut inserted = false;
         for breakpoint in &profile.breakpoints {
             if breakpoint.cumulative_tokens < profile.min_cacheable_tokens {
                 continue;
@@ -210,7 +339,19 @@ impl CacheTracker {
                     expires_at: now + breakpoint.ttl,
                 },
             );
+            inserted = true;
         }
+        if inserted {
+            entries.dirty = true;
+        }
+    }
+}
+
+fn normalize_prompt_cache_max_ratio(ratio: f64) -> f64 {
+    if ratio > 0.0 && ratio <= 1.0 {
+        ratio
+    } else {
+        0.85
     }
 }
 
@@ -647,10 +788,13 @@ fn is_anthropic_billing_header_block(value: &serde_json::Value) -> bool {
         .starts_with("x-anthropic-billing-header:")
 }
 
-fn prune_expired(entries: &mut HashMap<u64, HashMap<[u8; 32], CacheEntry>>, now: Instant) {
-    entries.retain(|_, credential_entries| {
-        credential_entries.retain(|_, entry| entry.expires_at > now);
-        !credential_entries.is_empty()
+fn prune_expired(
+    entries_by_credential: &mut HashMap<u64, HashMap<[u8; 32], CacheEntry>>,
+    now: Instant,
+) {
+    entries_by_credential.retain(|_, entries| {
+        entries.retain(|_, entry| entry.expires_at > now);
+        !entries.is_empty()
     });
 }
 
@@ -728,6 +872,13 @@ mod tests {
         )
     }
 
+    fn temp_cache_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "xkiro-cache-tracker-{name}-{}.json",
+            uuid::Uuid::new_v4()
+        ))
+    }
+
     fn estimate_input_tokens(request: &MessagesRequest) -> i32 {
         token::count_all_tokens(
             request.model.clone(),
@@ -737,12 +888,12 @@ mod tests {
         ) as i32
     }
 
-    fn kiro_go_cache_cap(profile: &CacheProfile) -> i32 {
+    fn cache_read_cap_tokens(profile: &CacheProfile) -> i32 {
         ((profile.total_input_tokens() as f64) * 0.85) as i32
     }
 
     #[test]
-    fn numeric_ttl_value_is_parsed_like_kiro_go() {
+    fn numeric_ttl_value_sets_breakpoint_ttl() {
         let req = build_request(vec![
             msg(
                 "user",
@@ -767,7 +918,7 @@ mod tests {
     }
 
     #[test]
-    fn system_numeric_ttl_deserializes_like_kiro_go() {
+    fn system_numeric_ttl_deserializes() {
         let payload = serde_json::json!({
             "model": "claude-sonnet-4-6",
             "max_tokens": 1024,
@@ -789,7 +940,7 @@ mod tests {
     }
 
     #[test]
-    fn ttl_constructor_argument_does_not_cap_breakpoints_like_kiro_go() {
+    fn constructor_ttl_does_not_override_explicit_breakpoint_ttl() {
         let req = build_request(vec![msg(
             "user",
             serde_json::json!([{
@@ -861,7 +1012,7 @@ mod tests {
             .map(|bp| {
                 bp.cumulative_tokens
                     .min(profile2.total_input_tokens())
-                    .min(kiro_go_cache_cap(&profile2))
+                    .min(cache_read_cap_tokens(&profile2))
             })
             .unwrap_or(0);
 
@@ -872,7 +1023,7 @@ mod tests {
     }
 
     #[test]
-    fn attribution_header_block_is_skipped_like_kiro_go() {
+    fn attribution_header_block_is_skipped_for_cache_prefix() {
         let tracker = CacheTracker::new(Duration::from_secs(3600));
         let system_with_header = vec![
             SystemMessage {
@@ -921,7 +1072,7 @@ mod tests {
     }
 
     #[test]
-    fn opus_uses_4096_min_cacheable_tokens_like_kiro_go() {
+    fn opus_models_use_4096_min_cacheable_tokens() {
         assert_eq!(minimum_cacheable_tokens_for_model("claude-opus-4.8"), 4096);
         assert_eq!(
             minimum_cacheable_tokens_for_model("claude-sonnet-4.6"),
@@ -984,7 +1135,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_credential_cache_after_uncacheable_update_is_treated_as_first_request_like_kiro_go() {
+    fn empty_credential_cache_after_uncacheable_update_is_treated_as_first_request() {
         let tracker = CacheTracker::new(Duration::from_secs(3600));
         let short_req = build_request(vec![msg("user", cache_text("short"))]);
         let short_profile = tracker.build_profile(&short_req, estimate_input_tokens(&short_req));
@@ -1048,10 +1199,103 @@ mod tests {
             result.cache_read_input_tokens,
             profile1
                 .last_cacheable_breakpoint()
-                .map(|bp| bp.cumulative_tokens.min(kiro_go_cache_cap(&profile2)))
+                .map(|bp| bp.cumulative_tokens.min(cache_read_cap_tokens(&profile2)))
                 .unwrap_or(0)
         );
         assert_eq!(result.cache_creation_input_tokens, 0);
+    }
+
+    #[test]
+    fn same_prompt_hits_only_same_credential() {
+        let tracker = CacheTracker::new(Duration::from_secs(3600));
+        let req = build_request(vec![msg("user", cache_text(&long_cacheable_text()))]);
+        let total = estimate_input_tokens(&req);
+        let profile = tracker.build_profile(&req, total);
+
+        let first = tracker.compute(1, &profile);
+        assert!(first.cache_creation_input_tokens > 0);
+        tracker.update(1, &profile);
+
+        let other_credential = tracker.compute(2, &profile);
+        assert_eq!(other_credential.cache_read_input_tokens, 0);
+        assert!(other_credential.cache_creation_input_tokens > 0);
+
+        let same_credential = tracker.compute(1, &profile);
+        assert!(same_credential.cache_read_input_tokens > 0);
+        assert_eq!(same_credential.cache_creation_input_tokens, 0);
+    }
+
+    #[test]
+    fn cache_read_cap_ratio_is_configurable() {
+        let mut hasher = Sha256::new();
+        write_hash_chunk(&mut hasher, "cache-ratio-test");
+        let prefix_fingerprint: [u8; 32] = hasher.finalize().into();
+        let profile = CacheProfile {
+            total_input_tokens: 1100,
+            min_cacheable_tokens: 1024,
+            breakpoints: vec![CacheBreakpoint {
+                prefix_fingerprint,
+                cumulative_tokens: 1024,
+                ttl: Duration::from_secs(300),
+            }],
+        };
+        let tracker = CacheTracker::new(Duration::from_secs(300));
+        tracker.update(1, &profile);
+
+        let default_result = tracker.compute(1, &profile);
+        assert_eq!(default_result.cache_read_input_tokens, 935);
+
+        tracker.set_max_cache_read_ratio(0.95);
+        let raised_result = tracker.compute(1, &profile);
+        assert_eq!(raised_result.cache_read_input_tokens, 1024);
+    }
+
+    #[test]
+    fn prompt_cache_persists_and_reloads_unexpired_entries() {
+        let path = temp_cache_path("reload");
+        let req = build_request(vec![
+            msg("user", cache_text(&long_cacheable_text())),
+            msg("assistant", serde_json::json!("R1")),
+        ]);
+        let tracker = CacheTracker::new(Duration::from_secs(300));
+        let profile = tracker.build_profile(&req, estimate_input_tokens(&req));
+
+        tracker.update(1, &profile);
+        let persisted = tracker
+            .flush_to_path(&path)
+            .expect("cache flush should work");
+        assert!(persisted > 0);
+
+        let reloaded = CacheTracker::new(Duration::from_secs(300));
+        let loaded = reloaded.load_from_path(&path);
+        assert_eq!(loaded, persisted);
+        let other_credential = reloaded.compute(2, &profile);
+        assert_eq!(other_credential.cache_read_input_tokens, 0);
+
+        let usage = reloaded.compute(1, &profile);
+        assert!(usage.cache_read_input_tokens > 0);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn prompt_cache_load_drops_expired_entries() {
+        let path = temp_cache_path("expired");
+        let disk = PromptCacheDiskFile {
+            version: 1,
+            entries: vec![PromptCacheDiskEntry {
+                credential_id: Some(1),
+                fingerprint: [7u8; 32],
+                expires_at: 1,
+                ttl_seconds: 300,
+            }],
+        };
+        std::fs::write(&path, serde_json::to_vec(&disk).unwrap()).unwrap();
+
+        let tracker = CacheTracker::new(Duration::from_secs(300));
+        assert_eq!(tracker.load_from_path(&path), 0);
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -1085,13 +1329,13 @@ mod tests {
             .unwrap_or(0);
         let capped_last_tokens = profile2
             .last_cacheable_breakpoint()
-            .map(|bp| bp.cumulative_tokens.min(kiro_go_cache_cap(&profile2)))
+            .map(|bp| bp.cumulative_tokens.min(cache_read_cap_tokens(&profile2)))
             .unwrap_or(0);
 
         assert!(matched_tokens > 0);
         assert_eq!(
             result.cache_read_input_tokens,
-            matched_tokens.min(kiro_go_cache_cap(&profile2))
+            matched_tokens.min(cache_read_cap_tokens(&profile2))
         );
         assert_eq!(
             result.cache_creation_input_tokens,
@@ -1223,7 +1467,7 @@ mod tests {
             result.cache_creation_input_tokens,
             profile2
                 .last_cacheable_breakpoint()
-                .map(|bp| bp.cumulative_tokens.min(kiro_go_cache_cap(&profile2)))
+                .map(|bp| bp.cumulative_tokens.min(cache_read_cap_tokens(&profile2)))
                 .unwrap_or(0)
         );
     }

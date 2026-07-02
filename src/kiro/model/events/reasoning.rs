@@ -27,7 +27,7 @@ pub struct ReasoningContentEvent {
     #[serde(default)]
     pub text: String,
 
-    /// 捕获其他未使用的字段，确保反序列化兼容性
+    /// 捕获其他未使用的字段，确保反序列化容错
     #[serde(flatten)]
     #[serde(skip_serializing)]
     #[allow(dead_code)]

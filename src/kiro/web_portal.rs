@@ -1,6 +1,6 @@
 //! Kiro Web Portal API（app.kiro.dev）
 //!
-//! 参考 Kiro-account-manager：
+//! 协议要点：
 //! - POST https://app.kiro.dev/service/KiroWebPortalService/operation/{Operation}
 //! - 协议：rpc-v2-cbor
 //! - Content-Type/Accept: application/cbor
@@ -16,13 +16,14 @@ use chrono::{DateTime, Utc};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, COOKIE, HeaderMap, HeaderValue};
 
 use crate::http_client::{ProxyConfig, build_client};
+use crate::kiro::model::usage_limits::normalize_subscription_type;
 
 #[allow(dead_code)]
 const KIRO_API_BASE: &str = "https://app.kiro.dev/service/KiroWebPortalService/operation";
 #[allow(dead_code)]
 const SMITHY_PROTOCOL: &str = "rpc-v2-cbor";
 const AMZ_SDK_REQUEST: &str = "attempt=1; max=1";
-const X_AMZ_USER_AGENT: &str = "aws-sdk-js/1.0.0 kiro-rs/1.0.0";
+const X_AMZ_USER_AGENT: &str = "aws-sdk-js/1.0.0 xkiro-rs/1.0.0";
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -160,7 +161,7 @@ fn build_headers(access_token: &str, idp: &str) -> anyhow::Result<HeaderMap> {
         header_value(&format!("Bearer {}", access_token), "authorization")?,
     );
 
-    // Kiro-account-manager 里同时带了 Idp / AccessToken cookie。
+    // Web Portal API 同时要求 Idp / AccessToken cookie。
     headers.insert(
         COOKIE,
         header_value(
@@ -312,7 +313,7 @@ pub struct ResourceUsageSummary {
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct AccountAggregateInfo {
+pub struct PortalUsageAggregateInfo {
     pub email: Option<String>,
     pub user_id: Option<String>,
     pub idp: Option<String>,
@@ -321,9 +322,9 @@ pub struct AccountAggregateInfo {
 
     pub subscription_title: Option<String>,
     pub subscription_type: String,
-    pub subscription: AccountSubscriptionDetails,
+    pub subscription: PortalSubscriptionDetails,
 
-    /// 兼容旧 UI：Credits 汇总（如有）
+    /// Credits 汇总（如有）
     pub usage: CreditsUsageSummary,
 
     /// 全部资源用量明细（用于展示/调试）
@@ -335,28 +336,11 @@ pub struct AccountAggregateInfo {
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct AccountSubscriptionDetails {
+pub struct PortalSubscriptionDetails {
     pub raw_type: Option<String>,
     pub management_target: Option<String>,
     pub upgrade_capability: Option<String>,
     pub overage_capability: Option<String>,
-}
-
-fn norm_subscription_type(title: Option<&str>) -> String {
-    let Some(t) = title else {
-        return "Free".to_string();
-    };
-    let up = t.to_uppercase();
-    if up.contains("PRO") {
-        return "Pro".to_string();
-    }
-    if up.contains("ENTERPRISE") {
-        return "Enterprise".to_string();
-    }
-    if up.contains("TEAMS") {
-        return "Teams".to_string();
-    }
-    "Free".to_string()
 }
 
 fn pick_f64(primary: Option<f64>, fallback: Option<f64>) -> f64 {
@@ -397,10 +381,10 @@ fn bonus_is_effective(b: &Bonus) -> bool {
     }
 }
 
-pub fn aggregate_account_info(
+pub fn aggregate_portal_usage_info(
     user_info: Option<UserInfoResponse>,
     usage: UsageAndLimitsResponse,
-) -> AccountAggregateInfo {
+) -> PortalUsageAggregateInfo {
     let credit = usage.usage_breakdown_list.as_ref().and_then(|l| {
         l.iter().find(|b| {
             b.resource_type
@@ -458,7 +442,16 @@ pub fn aggregate_account_info(
         .as_ref()
         .and_then(|s| s.subscription_title.clone());
 
-    let subscription_type = norm_subscription_type(subscription_title.as_deref());
+    let subscription_type = usage
+        .subscription_info
+        .as_ref()
+        .and_then(|info| {
+            subscription_title
+                .as_deref()
+                .or(info.r#type.as_deref())
+                .map(normalize_subscription_type)
+        })
+        .unwrap_or_else(|| normalize_subscription_type(""));
 
     let email = usage
         .user_info
@@ -487,7 +480,7 @@ pub fn aggregate_account_info(
         overage_cap: c.overage_cap,
     });
 
-    AccountAggregateInfo {
+    PortalUsageAggregateInfo {
         email,
         user_id,
         idp: user_info.as_ref().and_then(|u| u.idp.clone()),
@@ -496,7 +489,7 @@ pub fn aggregate_account_info(
 
         subscription_title,
         subscription_type,
-        subscription: AccountSubscriptionDetails {
+        subscription: PortalSubscriptionDetails {
             raw_type: usage
                 .subscription_info
                 .as_ref()
@@ -550,5 +543,49 @@ pub fn aggregate_account_info(
             })
             .unwrap_or_default(),
         raw_usage: usage,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn portal_usage_aggregate_uses_canonical_subscription_type() {
+        let teams = aggregate_portal_usage_info(
+            None,
+            UsageAndLimitsResponse {
+                user_info: None,
+                subscription_info: Some(SubscriptionInfo {
+                    r#type: None,
+                    subscription_title: Some("KIRO TEAMS".to_string()),
+                    upgrade_capability: None,
+                    overage_capability: None,
+                    subscription_management_target: None,
+                }),
+                usage_breakdown_list: None,
+                next_date_reset: None,
+                overage_configuration: None,
+            },
+        );
+        assert_eq!(teams.subscription_type, "TEAMS");
+
+        let enterprise = aggregate_portal_usage_info(
+            None,
+            UsageAndLimitsResponse {
+                user_info: None,
+                subscription_info: Some(SubscriptionInfo {
+                    r#type: Some("enterprise".to_string()),
+                    subscription_title: None,
+                    upgrade_capability: None,
+                    overage_capability: None,
+                    subscription_management_target: None,
+                }),
+                usage_breakdown_list: None,
+                next_date_reset: None,
+                overage_configuration: None,
+            },
+        );
+        assert_eq!(enterprise.subscription_type, "ENTERPRISE");
     }
 }

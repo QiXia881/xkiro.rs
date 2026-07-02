@@ -8,7 +8,7 @@
 use reqwest::{Client, StatusCode};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::sleep;
 
@@ -16,13 +16,14 @@ use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::TlsBackend;
 use parking_lot::{Mutex, RwLock};
 
 /// API 调用结果
 ///
-/// `_credential_permit` / `_global_permit` 持有到上游响应消费完成（一次"上游来回"）：
+/// `_credential_permit` / `_global_permit` / `_proxy_permit` 持有到上游响应消费完成（一次"上游来回"）：
 /// - 流式：handler 在 SSE unfold 中读到上游 `body_stream` 返回 `None`/`Err` 即立即 drop。
 /// - 非流式：`response.bytes().await` 完成即随 ApiCallResult 一起 drop。
 ///
@@ -32,6 +33,7 @@ pub struct ApiCallResult {
     pub credential_id: u64,
     pub _credential_permit: Option<OwnedSemaphorePermit>,
     pub _global_permit: Option<OwnedSemaphorePermit>,
+    pub _proxy_permit: Option<OwnedSemaphorePermit>,
 }
 
 /// MCP 调用结果
@@ -42,6 +44,7 @@ pub struct McpCallResult {
     pub credential_id: u64,
     pub _credential_permit: Option<OwnedSemaphorePermit>,
     pub _global_permit: Option<OwnedSemaphorePermit>,
+    pub _proxy_permit: Option<OwnedSemaphorePermit>,
 }
 
 /// 每个凭据的最大重试次数
@@ -53,7 +56,9 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 enum EndpointError {
     /// 瞬态错误：可重试，也可 fallback 到备选 endpoint
     Transient(anyhow::Error),
-    /// 致命错误（400/402/凭据问题）：不重试，需切换凭据
+    /// 已调整当前凭据运行时状态，调用方应重新获取上下文后重试。
+    RetryCredential(anyhow::Error),
+    /// 致命错误（402/凭据问题）：不重试 endpoint，需切换凭据
     Fatal(anyhow::Error),
 }
 
@@ -61,12 +66,13 @@ enum EndpointError {
 enum CredentialFailureAction {
     Generic,
     AuthenticationFailed,
-    AccountSuspended,
+    CredentialSuspended,
     SoftCooldown,
 }
 
 /// 总重试次数硬上限（避免无限重试）
 const MAX_TOTAL_RETRIES: usize = 9;
+const UNSUPPORTED_MODEL_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 
 const STREAM_API_TIMEOUT_SECS: u64 = 5 * 60;
 const REST_API_TIMEOUT_SECS: u64 = 30;
@@ -75,6 +81,13 @@ const REST_API_TIMEOUT_SECS: u64 = 30;
 enum ClientKind {
     Stream,
     Rest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct UnsupportedModelKey {
+    credential_id: u64,
+    model_id: String,
+    proxy_id: Option<u64>,
 }
 
 fn api_timeout_secs(kind: ClientKind) -> u64 {
@@ -93,7 +106,7 @@ pub struct KiroProvider {
     token_manager: Arc<MultiTokenManager>,
     /// 全局代理配置（用于凭据无自定义代理时的回退）
     ///
-    /// 使用 RwLock 包裹以支持运行时热更新（贴合 BK provider.rs:108）
+    /// 使用 RwLock 包裹以支持运行时热更新。
     global_proxy: RwLock<Option<ProxyConfig>>,
     /// Client 缓存：key = (effective proxy config, request kind)
     /// 不同代理和 REST/stream timeout 需要独立 Client。
@@ -104,10 +117,12 @@ pub struct KiroProvider {
     endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
     /// 默认端点名称（凭据未指定 endpoint 时使用）
     ///
-    /// 使用 RwLock 包裹以支持运行时热更新（贴合 BK provider.rs:111）
+    /// 使用 RwLock 包裹以支持运行时热更新。
     default_endpoint: RwLock<String>,
     /// 是否在首选 endpoint 瞬态失败时尝试其它 endpoint
     endpoint_fallback: RwLock<bool>,
+    /// 短 TTL 缓存：credential + model + proxy 组合被上游判定 INVALID_MODEL_ID。
+    unsupported_model_cache: Mutex<HashMap<UnsupportedModelKey, Instant>>,
 }
 
 impl KiroProvider {
@@ -148,6 +163,7 @@ impl KiroProvider {
             endpoints,
             default_endpoint: RwLock::new(default_endpoint),
             endpoint_fallback: RwLock::new(endpoint_fallback),
+            unsupported_model_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -189,11 +205,9 @@ impl KiroProvider {
 
     /// 获取备选 endpoint 列表（排除当前 endpoint，按固定顺序）
     ///
-    /// 对齐 Kiro-Go `getSortedEndpoints()` 的 fallback 逻辑：
-    /// 固定顺序: ide → codewhisperer → cli，排除当前 endpoint。
+    /// 固定顺序: ide → codewhisperer → amazonq → cli，排除当前 endpoint。
     fn alternative_endpoints(&self, current_name: &str) -> Vec<Arc<dyn KiroEndpoint>> {
-        // 对齐 Kiro-Go: 固定 endpoint 优先级顺序
-        const ENDPOINT_ORDER: &[&str] = &["ide", "codewhisperer", "cli"];
+        const ENDPOINT_ORDER: &[&str] = &["ide", "codewhisperer", "amazonq", "cli"];
         let mut result = Vec::new();
         for name in ENDPOINT_ORDER {
             if *name != current_name {
@@ -213,8 +227,8 @@ impl KiroProvider {
 
     /// 热更新全局代理配置
     ///
-    /// 贴合 BK provider.rs:118-128：替换 global_proxy 后清空 client_cache，
-    /// 让下次 [`Self::client_for`] 调用按需重建凭据级 Client。
+    /// 替换 global_proxy 后清空 client_cache，让下次 [`Self::client_for`]
+    /// 调用按需重建凭据级 Client。
     pub fn update_global_proxy(&self, proxy: Option<ProxyConfig>) -> anyhow::Result<()> {
         // 提前验证新代理配置是否能成功构建 Client，避免清空缓存后下次请求失败
         let rest_client = build_client(
@@ -241,7 +255,7 @@ impl KiroProvider {
 
     /// 热更新默认 endpoint 名称
     ///
-    /// 贴合 BK provider.rs:131-138：仅当目标端点已在注册表中时才生效。
+    /// 仅当目标端点已在注册表中时才生效。
     pub fn update_default_endpoint(&self, default_endpoint: String) -> anyhow::Result<()> {
         if !self.endpoints.contains_key(&default_endpoint) {
             return Err(anyhow::anyhow!("未知端点: {}", default_endpoint));
@@ -264,7 +278,51 @@ impl KiroProvider {
         request_body: &str,
         user_id: Option<&str>,
     ) -> anyhow::Result<ApiCallResult> {
-        self.call_api_with_retry(request_body, false, user_id).await
+        self.call_api_with_retry(request_body, false, user_id, None)
+            .await
+    }
+
+    pub async fn call_api_with_client_affinity(
+        &self,
+        request_body: &str,
+        user_id: Option<&str>,
+        client_key: Option<&str>,
+    ) -> anyhow::Result<ApiCallResult> {
+        self.call_api_with_retry(request_body, false, user_id, client_key)
+            .await
+    }
+
+    pub async fn call_api_with_credential(
+        &self,
+        credential_id: u64,
+        request_body: &str,
+    ) -> anyhow::Result<ApiCallResult> {
+        let model = Self::extract_model_from_request(request_body);
+        let mut ctx = self
+            .token_manager
+            .acquire_context_for_credential(credential_id, model.as_deref())
+            .await?;
+        let config = self.token_manager.config();
+        let machine_id = machine_id::generate_from_credentials(&ctx.credentials, &config);
+        let endpoint = self.endpoint_for(&ctx.credentials)?;
+
+        match self
+            .try_single_endpoint(
+                &endpoint,
+                &mut ctx,
+                request_body,
+                &config,
+                &machine_id,
+                "凭据测试",
+                ClientKind::Rest,
+            )
+            .await
+        {
+            Ok(result) => Ok(result),
+            Err(EndpointError::Fatal(e))
+            | Err(EndpointError::Transient(e))
+            | Err(EndpointError::RetryCredential(e)) => Err(e),
+        }
     }
 
     /// 发送流式 API 请求
@@ -273,13 +331,64 @@ impl KiroProvider {
         request_body: &str,
         user_id: Option<&str>,
     ) -> anyhow::Result<ApiCallResult> {
-        self.call_api_with_retry(request_body, true, user_id).await
+        self.call_api_with_retry(request_body, true, user_id, None)
+            .await
+    }
+
+    pub async fn call_api_stream_with_client_affinity(
+        &self,
+        request_body: &str,
+        user_id: Option<&str>,
+        client_key: Option<&str>,
+    ) -> anyhow::Result<ApiCallResult> {
+        self.call_api_with_retry(request_body, true, user_id, client_key)
+            .await
     }
 
     /// 获取内部 `MultiTokenManager` 引用（用于在请求生命周期外同步运行时缓存，
     /// 例如 metering 透传后 `apply_credit_usage`）
     pub fn token_manager(&self) -> &Arc<MultiTokenManager> {
         &self.token_manager
+    }
+
+    fn prune_unsupported_model_cache_locked(cache: &mut HashMap<UnsupportedModelKey, Instant>) {
+        let now = Instant::now();
+        cache.retain(|_, expires_at| *expires_at > now);
+    }
+
+    fn mark_unsupported_model_combo(
+        &self,
+        credential_id: u64,
+        model_id: &str,
+        proxy_id: Option<u64>,
+    ) {
+        let mut cache = self.unsupported_model_cache.lock();
+        Self::prune_unsupported_model_cache_locked(&mut cache);
+        cache.insert(
+            UnsupportedModelKey {
+                credential_id,
+                model_id: model_id.to_string(),
+                proxy_id,
+            },
+            Instant::now() + UNSUPPORTED_MODEL_CACHE_TTL,
+        );
+        tracing::warn!(
+            credential_id,
+            model_id,
+            proxy_id = ?proxy_id,
+            ttl_secs = UNSUPPORTED_MODEL_CACHE_TTL.as_secs(),
+            "已缓存不支持的 credential/model/proxy 组合"
+        );
+    }
+
+    fn unsupported_proxy_ids_for_model(&self, credential_id: u64, model_id: &str) -> HashSet<u64> {
+        let mut cache = self.unsupported_model_cache.lock();
+        Self::prune_unsupported_model_cache_locked(&mut cache);
+        cache
+            .keys()
+            .filter(|key| key.credential_id == credential_id && key.model_id == model_id)
+            .filter_map(|key| key.proxy_id)
+            .collect()
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
@@ -374,6 +483,7 @@ impl KiroProvider {
                     credential_id: ctx.id,
                     _credential_permit: ctx._credential_permit.take(),
                     _global_permit: ctx._global_permit.take(),
+                    _proxy_permit: ctx._proxy_permit.take(),
                 });
             }
 
@@ -485,12 +595,13 @@ impl KiroProvider {
     /// - 每个凭据最多重试 MAX_RETRIES_PER_CREDENTIAL 次
     /// - 总重试次数 = min(凭据数量 × 每凭据重试次数, MAX_TOTAL_RETRIES)
     /// - 硬上限 9 次，避免无限重试
-    /// - 瞬态错误时按配置尝试备选 endpoint（对齐 Kiro-Go 多端点 fallback）
+    /// - 瞬态错误时按配置尝试备选 endpoint
     async fn call_api_with_retry(
         &self,
         request_body: &str,
         is_stream: bool,
         user_id: Option<&str>,
+        client_key: Option<&str>,
     ) -> anyhow::Result<ApiCallResult> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
@@ -506,8 +617,9 @@ impl KiroProvider {
             // 获取调用上下文（绑定 index、credentials、token）
             let mut ctx = match self
                 .token_manager
-                .acquire_context_for_session_excluding(
+                .acquire_context_for_route_excluding(
                     user_id,
+                    client_key,
                     model.as_deref(),
                     &excluded_credentials,
                 )
@@ -533,7 +645,7 @@ impl KiroProvider {
                 }
             };
 
-            // 构建备选 endpoint 列表（对齐 Kiro-Go 多端点 fallback）
+            // 构建备选 endpoint 列表
             let current_ep_name = self.endpoint_name_for(&ctx.credentials);
             let alt_endpoints = self.alternative_endpoints(&current_ep_name);
 
@@ -561,13 +673,14 @@ impl KiroProvider {
                     return Ok(api_result);
                 }
                 Err(EndpointError::Fatal(e)) => {
-                    // 致命错误（400/402/凭据问题）：不尝试备选 endpoint
+                    // 致命错误（402/凭据问题）：不尝试备选 endpoint
                     let action = Self::credential_failure_action(&e);
                     last_error = Some(e);
                     match action {
-                        CredentialFailureAction::AccountSuspended => {
+                        CredentialFailureAction::CredentialSuspended => {
                             excluded_credentials.insert(ctx.id);
-                            self.token_manager.mark_account_suspended(ctx.id);
+                            self.token_manager
+                                .mark_credential_suspended_by_upstream(ctx.id);
                             continue;
                         }
                         CredentialFailureAction::SoftCooldown => {
@@ -601,7 +714,7 @@ impl KiroProvider {
                     continue;
                 }
                 Err(EndpointError::Transient(e)) => {
-                    // 瞬态错误：尝试备选 endpoint（对齐 Kiro-Go fallback 逻辑）
+                    // 瞬态错误：尝试备选 endpoint
                     last_error = Some(e);
                     let mut tried_alt = false;
                     let fallback_enabled = *self.endpoint_fallback.read();
@@ -638,6 +751,11 @@ impl KiroProvider {
                                 tried_alt = true;
                                 continue;
                             }
+                            Err(EndpointError::RetryCredential(e)) => {
+                                last_error = Some(e);
+                                tried_alt = true;
+                                break;
+                            }
                             Err(EndpointError::Fatal(_)) => {
                                 // 致命错误，停止尝试备选
                                 break;
@@ -651,6 +769,12 @@ impl KiroProvider {
                             max_retries
                         );
                     }
+                    if matches!(last_error.as_ref(), Some(error) if Self::is_retry_credential_error(error))
+                    {
+                        if attempt + 1 < max_retries {
+                            continue;
+                        }
+                    }
                     if let Some(error) = &last_error
                         && Self::is_rate_limited_error(error)
                     {
@@ -659,6 +783,13 @@ impl KiroProvider {
                     excluded_credentials.insert(ctx.id);
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
+                    }
+                    continue;
+                }
+                Err(EndpointError::RetryCredential(e)) => {
+                    last_error = Some(e);
+                    if attempt + 1 < max_retries {
+                        continue;
                     }
                     continue;
                 }
@@ -679,7 +810,7 @@ impl KiroProvider {
     ///
     /// 返回 Ok(ApiCallResult) 表示成功，
     /// Err(EndpointError::Transient) 表示可重试的上游瞬态错误，
-    /// Err(EndpointError::Fatal) 表示不可重试的致命错误（400/402/凭据问题）。
+    /// Err(EndpointError::Fatal) 表示不可重试 endpoint 的致命错误（402/凭据问题）。
     async fn try_single_endpoint(
         &self,
         endpoint: &Arc<dyn KiroEndpoint>,
@@ -725,6 +856,7 @@ impl KiroProvider {
                 credential_id: ctx.id,
                 _credential_permit: ctx._credential_permit.take(),
                 _global_permit: ctx._global_permit.take(),
+                _proxy_permit: ctx._proxy_permit.take(),
             });
         }
 
@@ -750,9 +882,38 @@ impl KiroProvider {
             )));
         }
 
-        // 400 Bad Request：致命错误
+        // 只有 401/403/402 阻止 endpoint fallback；400 可能是端点特定错误。
         if status.as_u16() == 400 {
-            return Err(EndpointError::Fatal(anyhow::anyhow!(
+            if Self::is_invalid_model_id(&body) {
+                let model_id = Self::extract_model_from_request(request_body)
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                let current_proxy_id = ctx.credentials.proxy_id;
+                self.mark_unsupported_model_combo(ctx.id, &model_id, current_proxy_id);
+                let excluded_proxy_ids = self.unsupported_proxy_ids_for_model(ctx.id, &model_id);
+                if let Some(next_proxy_id) = self
+                    .token_manager
+                    .choose_replacement_proxy(ctx.id, &excluded_proxy_ids)
+                {
+                    self.token_manager
+                        .set_proxy_id(ctx.id, Some(next_proxy_id))
+                        .map_err(EndpointError::Transient)?;
+                    tracing::warn!(
+                        credential_id = ctx.id,
+                        model_id,
+                        old_proxy_id = ?current_proxy_id,
+                        new_proxy_id = next_proxy_id,
+                        excluded_proxy_count = excluded_proxy_ids.len(),
+                        "凭据当前出口不支持该模型，已自动换绑代理并重试"
+                    );
+                    return Err(EndpointError::RetryCredential(anyhow::anyhow!(
+                        "{} API 请求失败: {} {}",
+                        api_type,
+                        status,
+                        body
+                    )));
+                }
+            }
+            return Err(EndpointError::Transient(anyhow::anyhow!(
                 "{} API 请求失败: {} {}",
                 api_type,
                 status,
@@ -761,10 +922,10 @@ impl KiroProvider {
         }
 
         // 401/403 凭据问题：致命错误
-        // 对齐 Kiro-Go: 细粒度分类以便日志和监控
+        // 保留细粒度分类以便日志和监控。
         if matches!(status.as_u16(), 401 | 403) {
             let error_kind = if Self::is_suspension_error(&body) {
-                "账户暂停"
+                "凭据暂停"
             } else if Self::is_profile_unavailable_error(&body) {
                 "Profile 不可用"
             } else {
@@ -791,6 +952,7 @@ impl KiroProvider {
                 "API 请求失败（402 overage）: {}",
                 &body[..body.len().min(200)]
             );
+            self.refresh_balance_after_overage_failure(ctx.id).await;
             return Err(EndpointError::Fatal(anyhow::anyhow!(
                 "{} API 请求失败: {} {}",
                 api_type,
@@ -838,10 +1000,14 @@ impl KiroProvider {
         msg.contains(" 429 ") || msg.contains("429 too many requests")
     }
 
+    fn is_retry_credential_error(error: &anyhow::Error) -> bool {
+        error.to_string().contains("INVALID_MODEL_ID")
+    }
+
     fn credential_failure_action(error: &anyhow::Error) -> CredentialFailureAction {
         let msg = error.to_string();
         if Self::is_suspension_error(&msg) {
-            CredentialFailureAction::AccountSuspended
+            CredentialFailureAction::CredentialSuspended
         } else if Self::is_profile_unavailable_error(&msg) {
             CredentialFailureAction::SoftCooldown
         } else if Self::is_auth_error(&msg) {
@@ -869,8 +1035,8 @@ impl KiroProvider {
 
     /// 检测响应体是否表示「模型暂时不可用」
     ///
-    /// 对齐 BK：识别 `MODEL_TEMPORARILY_UNAVAILABLE` 字符串、顶层 `reason` 字段，
-    /// 以及 `error.reason` 嵌套字段。命中后由调用方决定是否触发全局熔断。
+    /// 识别 `MODEL_TEMPORARILY_UNAVAILABLE` 字符串、顶层 `reason` 字段，
+    /// 以及 `error.reason` 嵌套字段。
     fn is_model_temporarily_unavailable(body: &str) -> bool {
         if body.contains("MODEL_TEMPORARILY_UNAVAILABLE") {
             return true;
@@ -894,18 +1060,40 @@ impl KiroProvider {
             .is_some_and(|v| v == "MODEL_TEMPORARILY_UNAVAILABLE")
     }
 
+    /// 检测响应体是否表示「当前凭据/出口不支持请求模型」。
+    fn is_invalid_model_id(body: &str) -> bool {
+        if body.contains("INVALID_MODEL_ID") {
+            return true;
+        }
+
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+            return false;
+        };
+
+        if value
+            .get("reason")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| value == "INVALID_MODEL_ID")
+        {
+            return true;
+        }
+
+        value
+            .pointer("/error/reason")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| value == "INVALID_MODEL_ID")
+    }
+
     /// 检测响应体是否表示「输入过长」
     ///
-    /// 对齐 BK：典型返回
-    /// `{"message":"Input is too long.","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}`
+    /// 典型返回 `{"message":"Input is too long.","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}`。
     fn is_input_too_long(body: &str) -> bool {
         body.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") || body.contains("Input is too long")
     }
 
-    /// 检测响应体是否表示「账户暂停」
+    /// 检测响应体是否表示「上游暂停」
     ///
-    /// 对齐 Kiro-Go `isSuspensionErrorMessage()`: 大小写不敏感
-    /// 匹配 "temporarily_suspended" / "temporarily is suspended" / "account suspended"
+    /// 大小写不敏感，匹配 "temporarily_suspended" / "temporarily is suspended" / "account suspended"。
     fn is_suspension_error(body: &str) -> bool {
         let lower = body.to_lowercase();
         lower.contains("temporarily_suspended")
@@ -915,8 +1103,7 @@ impl KiroProvider {
 
     /// 检测响应体是否表示「Profile 不可用」
     ///
-    /// 对齐 Kiro-Go `isProfileUnavailableErrorMessage()`: 大小写不敏感
-    /// 匹配 "no available kiro profile"
+    /// 大小写不敏感，匹配 "no available kiro profile"。
     fn is_profile_unavailable_error(body: &str) -> bool {
         let lower = body.to_lowercase();
         lower.contains("no available kiro profile")
@@ -924,7 +1111,7 @@ impl KiroProvider {
 
     /// 检测响应体是否表示「认证错误」
     ///
-    /// 对齐 Kiro-Go `isAuthErrorMessage()`: 大小写不敏感，10 种模式
+    /// 大小写不敏感，覆盖常见 token 失效、401/403、invalid_grant 等模式。
     fn is_auth_error(body: &str) -> bool {
         let lower = body.to_lowercase();
         lower.contains("http 401")
@@ -952,8 +1139,8 @@ impl KiroProvider {
 
     /// 后台异步刷新余额缓存（如果需要）
     ///
-    /// 贴合 BK provider.rs:190-212：成功调用 API 后触发，仅在 TTL 到期时才发起
-    /// `getUsageLimits` 请求，避免每次 API 调用都阻塞在余额查询上。
+    /// 成功调用 API 后触发，仅在 TTL 到期时才发起 `getUsageLimits` 请求，
+    /// 避免每次 API 调用都阻塞在余额查询上。
     ///
     /// 余额低于 1.0 时主动调用 `mark_insufficient_balance` 禁用凭据，确保
     /// admin UI 余额显示与故障转移逻辑同步。
@@ -966,43 +1153,53 @@ impl KiroProvider {
         tokio::spawn(async move {
             match tm.get_usage_limits_for(id).await {
                 Ok(resp) => {
-                    let usage_limit = resp.usage_limit();
-                    let current_usage = resp.current_usage();
-                    let remaining = (usage_limit - current_usage).max(0.0);
-                    // 真正不可用 = 正式额度耗尽 AND（超额未开启 OR 超额额度耗尽）
-                    let overage_enabled = resp.overage_status() == Some("ENABLED");
-                    let overage_used = (current_usage - usage_limit).max(0.0);
-                    let overage_remaining = if overage_enabled {
-                        (resp.overage_cap() - overage_used).max(0.0)
-                    } else {
-                        0.0
-                    };
-                    tm.update_balance_cache_full(id, remaining, overage_remaining);
-                    let exhausted = remaining < 1.0 && overage_remaining < 1.0;
-                    tracing::debug!(
-                        "凭据 #{} 余额缓存已刷新: 正式 {:.2}, 超额 enabled={} remaining={:.2}",
-                        id,
-                        remaining,
-                        overage_enabled,
-                        overage_remaining
-                    );
-                    if exhausted {
-                        if tm.mark_insufficient_balance(id) {
-                            tracing::warn!(
-                                "凭据 #{} 额度耗尽（正式 {:.2}, 超额 enabled={} remaining={:.2}），已主动禁用",
-                                id,
-                                remaining,
-                                overage_enabled,
-                                overage_remaining
-                            );
-                        }
-                    }
+                    Self::apply_usage_limits_to_balance(&tm, id, &resp);
                 }
                 Err(e) => {
                     tracing::warn!("凭据 #{} 余额刷新失败: {}", id, e);
                 }
             }
         });
+    }
+
+    async fn refresh_balance_after_overage_failure(&self, id: u64) {
+        match self.token_manager.get_usage_limits_for(id).await {
+            Ok(resp) => {
+                Self::apply_usage_limits_to_balance(&self.token_manager, id, &resp);
+                tracing::warn!("凭据 #{} 已在 402 overage 后刷新 usage/overage 快照", id);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "凭据 #{} 402 overage 后刷新 usage/overage 快照失败: {}",
+                    id,
+                    e
+                );
+            }
+        }
+    }
+
+    fn apply_usage_limits_to_balance(tm: &MultiTokenManager, id: u64, resp: &UsageLimitsResponse) {
+        let remaining = resp.primary_remaining();
+        let overage_enabled = resp.overage_status() == Some("ENABLED");
+        let overage_remaining = resp.primary_overage_remaining();
+        tm.update_balance_cache_full(id, remaining, overage_remaining);
+        let exhausted = remaining < 1.0 && overage_remaining < 1.0;
+        tracing::debug!(
+            "凭据 #{} 余额缓存已刷新: 正式 {:.2}, 超额 enabled={} remaining={:.2}",
+            id,
+            remaining,
+            overage_enabled,
+            overage_remaining
+        );
+        if exhausted && tm.mark_insufficient_balance(id) {
+            tracing::warn!(
+                "凭据 #{} 额度耗尽（正式 {:.2}, 超额 enabled={} remaining={:.2}），已主动禁用",
+                id,
+                remaining,
+                overage_enabled,
+                overage_remaining
+            );
+        }
     }
 }
 
@@ -1094,13 +1291,13 @@ mod tests {
     }
 
     #[test]
-    fn api_timeouts_match_kiro_go_stream_and_rest_clients() {
+    fn api_timeouts_match_stream_and_rest_clients() {
         assert_eq!(api_timeout_secs(ClientKind::Stream), 5 * 60);
         assert_eq!(api_timeout_secs(ClientKind::Rest), 30);
     }
 
     #[test]
-    fn account_failure_classifiers_match_kiro_go_non_rate_limit_cases() {
+    fn credential_failure_classifiers_cover_non_rate_limit_cases() {
         assert!(KiroProvider::is_suspension_error(
             "Your User ID temporarily is suspended"
         ));
@@ -1114,7 +1311,7 @@ mod tests {
             KiroProvider::credential_failure_action(&anyhow::anyhow!(
                 "HTTP 403: temporarily_suspended"
             )),
-            super::CredentialFailureAction::AccountSuspended
+            super::CredentialFailureAction::CredentialSuspended
         );
         assert_eq!(
             KiroProvider::credential_failure_action(&anyhow::anyhow!(
@@ -1129,7 +1326,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_stream_retries_next_credential_after_pre_response_failure_like_kiro_go() {
+    async fn non_stream_retries_next_credential_after_pre_response_failure() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let (tx, rx) = mpsc::channel();
@@ -1204,7 +1401,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn account_suspension_disables_credential_and_retries_next_like_kiro_go() {
+    async fn upstream_credential_suspension_disables_credential_and_retries_next() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let (tx, rx) = mpsc::channel();
@@ -1286,7 +1483,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn profile_unavailable_soft_cools_down_without_disabling_like_kiro_go() {
+    async fn profile_unavailable_soft_cools_down_without_disabling() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let (tx, rx) = mpsc::channel();
@@ -1445,7 +1642,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn endpoint_fallback_enabled_retries_alt_after_429_like_kiro_go() {
+    async fn endpoint_fallback_enabled_retries_alt_after_429() {
         let primary_listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let primary_url = format!("http://{}", primary_listener.local_addr().unwrap());
         let alt_listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1514,7 +1711,76 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn endpoint_fallback_does_not_retry_alt_on_auth_failure_like_kiro_go() {
+    async fn endpoint_fallback_enabled_retries_alt_after_400() {
+        let primary_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let primary_url = format!("http://{}", primary_listener.local_addr().unwrap());
+        let alt_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let alt_url = format!("http://{}", alt_listener.local_addr().unwrap());
+        let (tx, rx) = mpsc::channel();
+
+        let primary = thread::spawn(move || {
+            let (mut stream, _) = primary_listener.accept().unwrap();
+            let mut buffer = [0_u8; 2048];
+            let n = stream.read(&mut buffer).unwrap();
+            let request = String::from_utf8_lossy(&buffer[..n]).to_string();
+            tx.send(format!("primary:{request}")).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\nConnection: close\r\n\r\nbad request",
+                )
+                .unwrap();
+        });
+        let (alt_tx, alt_rx) = mpsc::channel();
+        let alt = thread::spawn(move || {
+            let (mut stream, _) = alt_listener.accept().unwrap();
+            let mut buffer = [0_u8; 2048];
+            let n = stream.read(&mut buffer).unwrap();
+            let request = String::from_utf8_lossy(&buffer[..n]).to_string();
+            alt_tx.send(format!("alt:{request}")).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        });
+
+        let mut config = Config::default();
+        config.default_endpoint = "primary".to_string();
+        config.endpoint_fallback = true;
+        let token_manager = Arc::new(
+            MultiTokenManager::new(
+                config,
+                vec![valid_credential("token-primary", 0)],
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        token_manager.update_balance_cache_full(1, 10.0, 0.0);
+
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert(
+            "primary".to_string(),
+            Arc::new(TestEndpoint { url: primary_url }),
+        );
+        endpoints.insert("alt".to_string(), Arc::new(TestEndpoint { url: alt_url }));
+        let provider = KiroProvider::with_proxy(
+            Arc::clone(&token_manager),
+            None,
+            endpoints,
+            "primary".into(),
+        );
+
+        let result = provider.call_api("{}", None).await.unwrap();
+
+        primary.join().unwrap();
+        alt.join().unwrap();
+        assert_eq!(result.response.text().await.unwrap(), "ok");
+        assert!(rx.recv().unwrap().contains("Bearer token-primary"));
+        assert!(alt_rx.recv().unwrap().contains("Bearer token-primary"));
+    }
+
+    #[tokio::test]
+    async fn endpoint_fallback_does_not_retry_alt_on_auth_failure() {
         let primary_listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let primary_url = format!("http://{}", primary_listener.local_addr().unwrap());
         let alt_listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1632,5 +1898,21 @@ mod tests {
     fn input_too_long_does_not_match_unrelated() {
         let body = r#"{"message":"unauthorized"}"#;
         assert!(!KiroProvider::is_input_too_long(body));
+    }
+
+    #[test]
+    fn detects_invalid_model_id_variants() {
+        assert!(KiroProvider::is_invalid_model_id(
+            r#"{"reason":"INVALID_MODEL_ID"}"#
+        ));
+        assert!(KiroProvider::is_invalid_model_id(
+            r#"{"error":{"reason":"INVALID_MODEL_ID"}}"#
+        ));
+        assert!(KiroProvider::is_invalid_model_id(
+            "upstream error INVALID_MODEL_ID"
+        ));
+        assert!(!KiroProvider::is_invalid_model_id(
+            r#"{"reason":"MODEL_TEMPORARILY_UNAVAILABLE"}"#
+        ));
     }
 }

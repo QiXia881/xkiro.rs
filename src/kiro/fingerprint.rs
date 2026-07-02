@@ -92,7 +92,7 @@ pub struct Fingerprint {
     /// 时区偏移（分钟）
     pub timezone_offset: i16,
 
-    /// Machine ID（64 字符十六进制）
+    /// 机器 ID（64 字符十六进制）
     pub machine_id: String,
 }
 

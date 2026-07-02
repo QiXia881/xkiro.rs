@@ -3,7 +3,7 @@
 //! 将 OpenAI Chat Completions / Responses 请求归一化为 [`MessagesRequest`]，
 //! 之后由上层走 `anthropic::converter::convert_request` → Kiro。
 //!
-//! 字段对齐参考 KAM `gateway/converter.rs`，并贴合 OpenAI 官方协议字段名。
+//! 字段贴合 OpenAI 官方协议字段名，并在边界归一化常见客户端形状。
 
 use base64::{Engine, engine::general_purpose};
 use serde_json::{Value, json};
@@ -545,7 +545,7 @@ fn normalize_image_media_type(raw: Option<&str>) -> Option<String> {
     }
 }
 
-fn openai_image_part_to_block(item: &Value) -> Option<Value> {
+pub(super) fn openai_image_part_to_block(item: &Value) -> Option<Value> {
     if let Some(file) = item.get("file").filter(|v| v.is_object())
         && let Some(block) = openai_image_part_to_block(file)
     {
@@ -637,10 +637,23 @@ fn content_to_anthropic_blocks(content: Option<&Value>) -> Vec<Value> {
                 vec![json!({ "type": "text", "text": s })]
             }
         }
-        Some(Value::Array(items)) => items
-            .iter()
-            .filter_map(chat_content_part_to_block)
-            .collect(),
+        Some(Value::Array(items)) => {
+            let mut text = String::new();
+            let mut blocks = Vec::new();
+            for item in items {
+                if let Some(part_text) = openai_text_part(item) {
+                    text.push_str(part_text);
+                    continue;
+                }
+                if let Some(block) = chat_content_part_to_block(item) {
+                    blocks.push(block);
+                }
+            }
+            if !text.is_empty() {
+                blocks.insert(0, json!({ "type": "text", "text": text }));
+            }
+            blocks
+        }
         Some(Value::Null) | None => Vec::new(),
         Some(other @ Value::Object(_)) => {
             if let Some(block) = chat_content_part_to_block(other) {
@@ -659,10 +672,6 @@ fn content_to_anthropic_blocks(content: Option<&Value>) -> Vec<Value> {
 }
 
 fn assistant_content_to_anthropic_blocks(content: Option<&Value>) -> Vec<Value> {
-    let blocks = content_to_anthropic_blocks(content);
-    if !blocks.is_empty() {
-        return blocks;
-    }
     let text = extract_message_text(content);
     if text.is_empty() {
         Vec::new()
@@ -683,7 +692,7 @@ fn chat_content_part_to_block(item: &Value) -> Option<Value> {
     let part_type = item.get("type").and_then(Value::as_str).unwrap_or("");
     match part_type {
         "text" | "input_text" | "output_text" => {
-            let text = item.get("text").and_then(Value::as_str).unwrap_or("");
+            let text = openai_text_part(item).unwrap_or("");
             if text.is_empty() {
                 None
             } else {
@@ -705,6 +714,12 @@ fn chat_content_part_to_block(item: &Value) -> Option<Value> {
             .filter(|text| !text.is_empty())
             .map(|text| json!({ "type": "text", "text": text })),
     }
+}
+
+fn openai_text_part(item: &Value) -> Option<&str> {
+    item.get("text")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
 }
 
 fn blocks_to_value(blocks: Vec<Value>) -> Value {
@@ -762,7 +777,7 @@ fn chat_tool_to_anthropic_tool(t: &ChatTool) -> Option<Tool> {
         return Some(web_search_hosted_tool());
     }
 
-    if t.tool_type != "function" && !t.tool_type.is_empty() {
+    if t.tool_type != "function" {
         tracing::warn!(
             tool_type = %t.tool_type,
             "OpenAI Chat Completions 请求包含未支持的 hosted tool，已忽略"
@@ -906,7 +921,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_tool_uses_nested_fields_first_like_kiro_go() {
+    fn responses_tool_uses_nested_fields_first() {
         let tools = responses_tool_to_anthropic(&json!({
             "type": "function",
             "name": "flat_name",
@@ -927,7 +942,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_tool_falls_back_to_flat_when_nested_incomplete_like_kiro_go() {
+    fn responses_tool_falls_back_to_flat_when_nested_incomplete() {
         let tools = responses_tool_to_anthropic(&json!({
             "type": "function",
             "name": "flat_name",
@@ -947,7 +962,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_tool_skips_empty_names_like_kiro_go() {
+    fn responses_tool_skips_empty_names() {
         let tools = responses_tool_to_anthropic(&json!({
             "type": "function",
             "name": "  ",
@@ -970,7 +985,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_tool_accepts_responses_flat_format_like_kiro_go() {
+    fn chat_tool_accepts_responses_flat_format() {
         let tool: ChatTool = serde_json::from_value(json!({
             "type": "function",
             "name": "exec_command",
@@ -991,7 +1006,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_tool_accepts_nested_format_like_kiro_go() {
+    fn chat_tool_accepts_nested_format() {
         let tool: ChatTool = serde_json::from_value(json!({
             "type": "function",
             "function": {
@@ -1008,7 +1023,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_tool_skips_empty_names_like_kiro_go() {
+    fn chat_tool_skips_empty_names() {
         let tool: ChatTool = serde_json::from_value(json!({
             "type": "function",
             "name": "",
@@ -1020,7 +1035,19 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_arguments_non_object_falls_back_to_empty_object_like_kiro_go() {
+    fn chat_tool_skips_missing_type() {
+        let tool: ChatTool = serde_json::from_value(json!({
+            "name": "exec_command",
+            "description": "Run a shell command",
+            "parameters": { "type": "object" }
+        }))
+        .expect("missing-type tool should parse with Go zero value");
+
+        assert!(chat_tool_to_anthropic_tool(&tool).is_none());
+    }
+
+    #[test]
+    fn tool_call_arguments_non_object_falls_back_to_empty_object() {
         assert_eq!(parse_json_loose("[]"), json!({}));
         assert_eq!(parse_json_loose("\"text\""), json!({}));
         assert_eq!(parse_json_loose("true"), json!({}));
@@ -1028,7 +1055,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_tools_preserve_openai_names_in_final_kiro_payload_like_kiro_go() {
+    fn chat_tools_preserve_openai_names_in_final_kiro_payload() {
         let req: ChatCompletionsRequest = serde_json::from_value(json!({
             "model": "claude-sonnet-4.5",
             "messages": [
@@ -1092,7 +1119,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_assistant_map_content_in_history_like_kiro_go() {
+    fn chat_assistant_map_content_in_history() {
         let req: ChatCompletionsRequest = serde_json::from_value(json!({
             "model": "claude-sonnet-4.5",
             "messages": [
@@ -1129,7 +1156,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_assistant_unknown_array_content_falls_back_to_json_like_kiro_go() {
+    fn chat_assistant_unknown_array_content_falls_back_to_json() {
         let req: ChatCompletionsRequest = serde_json::from_value(json!({
             "model": "claude-sonnet-4.5",
             "messages": [
@@ -1173,7 +1200,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_assistant_tool_calls_do_not_inject_placeholder_like_kiro_go() {
+    fn chat_assistant_tool_calls_do_not_inject_placeholder() {
         let req: ChatCompletionsRequest = serde_json::from_value(json!({
             "model": "claude-sonnet-4.5",
             "messages": [
@@ -1221,7 +1248,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_structured_assistant_and_orphan_tool_result_like_kiro_go() {
+    fn chat_structured_assistant_and_orphan_tool_result() {
         let req: ChatCompletionsRequest = serde_json::from_value(json!({
             "model": "claude-sonnet-4.5",
             "messages": [
@@ -1282,7 +1309,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_history_tool_cycles_do_not_pollute_assistant_like_kiro_go() {
+    fn chat_history_tool_cycles_do_not_pollute_assistant() {
         let mut messages = vec![json!({
             "role": "user",
             "content": "start a multi-step task"
@@ -1333,6 +1360,11 @@ mod tests {
         for item in &payload.conversation_state.history {
             if let KiroMessage::Assistant(assistant) = item {
                 let content = &assistant.assistant_response_message.content;
+                assert_ne!(
+                    content.trim(),
+                    "OK",
+                    "converter must not synthesize trailing OK assistant turns"
+                );
                 assert!(!content.contains("[Called tool"));
                 assert!(!content.contains("with input {"));
                 assert!(
@@ -1376,7 +1408,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_untyped_source_image_maps_like_kiro_go() {
+    fn chat_untyped_source_image_maps() {
         let block = chat_content_part_to_block(&json!({
             "source": {
                 "type": "base64",
@@ -1441,7 +1473,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_base64_image_is_skipped_like_kiro_go() {
+    fn invalid_base64_image_is_skipped() {
         let block = chat_content_part_to_block(&json!({
             "type": "input_image",
             "b64_json": "not-base64!!",
@@ -1452,7 +1484,7 @@ mod tests {
     }
 
     #[test]
-    fn image_placeholder_is_skipped_like_kiro_go() {
+    fn image_placeholder_is_skipped() {
         let block = chat_content_part_to_block(&json!({
             "type": "image_url",
             "image_url": { "url": "[Image #1]" }
@@ -1462,7 +1494,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_unknown_text_part_is_preserved_like_kiro_go() {
+    fn chat_unknown_text_part_is_preserved() {
         let block = chat_content_part_to_block(&json!({
             "type": "custom_text",
             "text": "keep this text"
@@ -1473,7 +1505,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_unknown_text_part_is_preserved_like_kiro_go() {
+    fn responses_unknown_text_part_is_preserved() {
         let req: ResponsesRequest = serde_json::from_value(json!({
             "model": "claude-sonnet-4.5",
             "input": [{
@@ -1493,7 +1525,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_system_nested_content_text_is_preserved_like_kiro_go() {
+    fn chat_system_nested_content_text_is_preserved() {
         let req: ChatCompletionsRequest = serde_json::from_value(json!({
             "model": "claude-sonnet-4.5",
             "messages": [
@@ -1521,7 +1553,85 @@ mod tests {
     }
 
     #[test]
-    fn chat_tool_result_unknown_json_falls_back_to_text_like_kiro_go() {
+    fn chat_user_text_parts_concatenate_without_newline() {
+        let req: ChatCompletionsRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4.5",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        { "type": "text", "text": "alpha" },
+                        { "type": "input_text", "text": "beta" }
+                    ]
+                }
+            ]
+        }))
+        .expect("chat request should parse");
+
+        let payload = convert_request(
+            &chat_completions_to_messages_request(&req),
+            &CompressionConfig::default(),
+            &PromptFilterConfig::default(),
+            false,
+        )
+        .expect("conversion should succeed");
+
+        assert_eq!(
+            payload
+                .conversation_state
+                .current_message
+                .user_input_message
+                .content,
+            "alphabeta"
+        );
+    }
+
+    #[test]
+    fn chat_assistant_image_content_falls_back_to_json_text() {
+        let req: ChatCompletionsRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4.5",
+            "messages": [
+                { "role": "user", "content": "u1" },
+                {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "image_url",
+                        "image_url": { "url": format!("data:image/png;base64,{VALID_IMAGE_B64}") }
+                    }]
+                },
+                { "role": "user", "content": "u2" }
+            ]
+        }))
+        .expect("chat request should parse");
+
+        let payload = convert_request(
+            &chat_completions_to_messages_request(&req),
+            &CompressionConfig::default(),
+            &PromptFilterConfig::default(),
+            false,
+        )
+        .expect("conversion should succeed");
+
+        let assistant = payload
+            .conversation_state
+            .history
+            .iter()
+            .find_map(|item| match item {
+                KiroMessage::Assistant(assistant) => Some(assistant),
+                KiroMessage::User(_) => None,
+            })
+            .expect("assistant history should exist");
+
+        assert!(
+            assistant
+                .assistant_response_message
+                .content
+                .contains("\"image_url\"")
+        );
+    }
+
+    #[test]
+    fn chat_tool_result_unknown_json_falls_back_to_text() {
         let req: ChatCompletionsRequest = serde_json::from_value(json!({
             "model": "claude-sonnet-4.5",
             "messages": [
@@ -1558,7 +1668,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_tool_result_followed_by_user_is_flushed_like_kiro_go() {
+    fn chat_tool_result_followed_by_user_is_flushed() {
         let req: ChatCompletionsRequest = serde_json::from_value(json!({
             "model": "claude-sonnet-4.5",
             "messages": [
@@ -1631,7 +1741,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_consecutive_identical_tool_results_collapse_like_kiro_go() {
+    fn chat_consecutive_identical_tool_results_collapse() {
         let req: ChatCompletionsRequest = serde_json::from_value(json!({
             "model": "claude-sonnet-4.5",
             "messages": [
@@ -1725,7 +1835,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_tool_result_image_followed_by_user_is_carried_like_kiro_go() {
+    fn chat_tool_result_image_followed_by_user_is_carried() {
         const DATA_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
         let req: ChatCompletionsRequest = serde_json::from_value(json!({
             "model": "claude-sonnet-4.5",
@@ -1794,7 +1904,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_tool_result_image_attaches_to_current_message_like_kiro_go() {
+    fn chat_tool_result_image_attaches_to_current_message() {
         const DATA_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
         let req: ChatCompletionsRequest = serde_json::from_value(json!({
             "model": "claude-sonnet-4.5",
@@ -1832,7 +1942,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_tool_results_continuation_includes_prefix_like_kiro_go() {
+    fn chat_tool_results_continuation_includes_prefix() {
         let req: ChatCompletionsRequest = serde_json::from_value(json!({
             "model": "claude-sonnet-4.5",
             "messages": [
@@ -1870,7 +1980,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_conversation_id_stable_from_anchor_like_kiro_go() {
+    fn chat_conversation_id_stable_from_anchor() {
         let req_a: ChatCompletionsRequest = serde_json::from_value(json!({
             "model": "claude-sonnet-4.5",
             "messages": [
@@ -1918,7 +2028,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_parallel_function_calls_merge_like_kiro_go() {
+    fn responses_parallel_function_calls_merge() {
         let req: ResponsesRequest = serde_json::from_value(json!({
             "model": "claude-sonnet-4.5",
             "input": [
@@ -1963,7 +2073,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_input_parts_accumulate_and_output_text_is_assistant_like_kiro_go() {
+    fn responses_input_parts_accumulate_and_output_text_is_assistant() {
         let req: ResponsesRequest = serde_json::from_value(json!({
             "model": "claude-sonnet-4.5",
             "input": [
@@ -1984,9 +2094,8 @@ mod tests {
             .content
             .as_array()
             .expect("user input should be an array");
-        assert_eq!(user_blocks.len(), 2);
-        assert_eq!(user_blocks[0]["text"], "alpha");
-        assert_eq!(user_blocks[1]["text"], "beta");
+        assert_eq!(user_blocks.len(), 1);
+        assert_eq!(user_blocks[0]["text"], "alphabeta");
         assert_eq!(
             messages_req.messages[1].content,
             json!([{ "type": "text", "text": "assistant done" }])
@@ -1994,7 +2103,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_object_input_is_supported_like_kiro_go() {
+    fn responses_object_input_is_supported() {
         let req: ResponsesRequest = serde_json::from_value(json!({
             "model": "claude-sonnet-4.5",
             "input": {
@@ -2016,7 +2125,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_message_text_only_array_collapses_like_kiro_go() {
+    fn responses_message_text_only_array_collapses() {
         let req: ResponsesRequest = serde_json::from_value(json!({
             "model": "claude-sonnet-4.5",
             "input": [{
@@ -2046,7 +2155,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_function_call_uses_id_fallback_like_kiro_go() {
+    fn responses_function_call_uses_id_fallback() {
         let req: ResponsesRequest = serde_json::from_value(json!({
             "model": "claude-sonnet-4.5",
             "input": [
@@ -2073,7 +2182,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_missing_model_defaults_like_kiro_go() {
+    fn responses_missing_model_defaults() {
         let req: ResponsesRequest = serde_json::from_value(json!({
             "input": "hello"
         }))
@@ -2085,7 +2194,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_blank_model_defaults_like_kiro_go() {
+    fn responses_blank_model_defaults() {
         let req: ResponsesRequest = serde_json::from_value(json!({
             "model": "   ",
             "input": "hello"

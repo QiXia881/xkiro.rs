@@ -224,11 +224,8 @@ impl KiroEndpoint for CliEndpoint {
         let mut body = serde_json::json!({
             "overageConfiguration": { "overageStatus": overage_status },
         });
-        // CLI 端点也允许带 profileArn（API Key 凭据无；SSO OIDC 不带）
-        let auth_method = ctx.credentials.auth_method.as_deref();
-        let is_sso_oidc = matches!(auth_method, Some("builder-id") | Some("idc"))
-            || (ctx.credentials.client_id.is_some() && ctx.credentials.client_secret.is_some());
-        if !is_sso_oidc {
+        // CLI 端点也允许带 profileArn（API 密钥凭据无；SSO OIDC 不带）
+        if !ctx.credentials.is_aws_sso_oidc_credential() {
             if let Some(arn) = ctx.credentials.profile_arn_trimmed() {
                 body["profileArn"] = serde_json::Value::String(arn.to_string());
             }

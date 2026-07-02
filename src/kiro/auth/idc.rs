@@ -71,7 +71,7 @@ fn build_device_register_request(start_url: &str) -> RegisterClientRequest {
 
 fn build_sso_token_register_request(start_url: &str) -> RegisterClientRequest {
     RegisterClientRequest {
-        client_name: "Kiro API Proxy".to_string(),
+        client_name: "xkiro.rs".to_string(),
         client_type: "public".to_string(),
         scopes: IAM_SSO_CODE_SCOPES
             .iter()
@@ -133,17 +133,17 @@ async fn register_sso_token_client(
         .json(&body)
         .send()
         .await
-        .context("注册 SSO Token OIDC 客户端请求失败")?;
+        .context("注册 SSO 令牌 OIDC 客户端请求失败")?;
 
     let status = resp.status();
     if !status.is_success() {
         let body_text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("注册 SSO Token OIDC 客户端失败 {}: {}", status, body_text);
+        anyhow::bail!("注册 SSO 令牌 OIDC 客户端失败 {}: {}", status, body_text);
     }
 
     resp.json::<RegisterClientResponse>()
         .await
-        .context("解析 SSO Token 注册响应失败")
+        .context("解析 SSO 令牌注册响应失败")
 }
 
 fn build_iam_sso_authorize_url(
@@ -258,17 +258,17 @@ pub async fn exchange_iam_sso_code(
         .json(&body)
         .send()
         .await
-        .context("IAM SSO 授权码换 Token 请求失败")?;
+        .context("IAM SSO 授权码换令牌请求失败")?;
 
     let status = resp.status();
     if !status.is_success() {
         let body_text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("IAM SSO 授权码换 Token 失败 {}: {}", status, body_text);
+        anyhow::bail!("IAM SSO 授权码换令牌失败 {}: {}", status, body_text);
     }
 
     resp.json::<CreateTokenResponse>()
         .await
-        .context("解析 IAM SSO Token 响应失败")
+        .context("解析 IAM SSO 令牌响应失败")
 }
 
 pub async fn start_device_authorization(
@@ -370,10 +370,10 @@ pub async fn poll_token(
 }
 
 // ============================================================================
-// SSO Token 导入所需的额外 OIDC 函数
+// SSO 令牌导入所需的额外 OIDC 函数
 // ============================================================================
 
-/// Bearer Token 验证响应
+/// Bearer 令牌验证响应
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WhoAmIResponse {
@@ -383,7 +383,7 @@ pub struct WhoAmIResponse {
     pub arn: Option<String>,
 }
 
-/// 设备会话 Token 响应
+/// 设备会话令牌响应
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DeviceSessionResponse {
@@ -413,7 +413,7 @@ struct ApproveAuthRequest {
     pub user_session_id: String,
 }
 
-/// 验证 Bearer Token（GET /token/whoAmI）
+/// 验证 Bearer 令牌（GET /token/whoAmI）
 pub async fn verify_bearer_token(
     portal_base: &str,
     bearer_token: &str,
@@ -428,12 +428,12 @@ pub async fn verify_bearer_token(
         .header("Accept", "application/json")
         .send()
         .await
-        .context("验证 Bearer Token 请求失败")?;
+        .context("验证 Bearer 令牌请求失败")?;
 
     let status = resp.status();
     if !status.is_success() {
         let body_text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("验证 Bearer Token 失败 {}: {}", status, body_text);
+        anyhow::bail!("验证 Bearer 令牌失败 {}: {}", status, body_text);
     }
 
     resp.json::<WhoAmIResponse>()
@@ -441,7 +441,7 @@ pub async fn verify_bearer_token(
         .context("解析验证响应失败")
 }
 
-/// 获取设备会话 Token（POST /session/device）
+/// 获取设备会话令牌（POST /session/device）
 pub async fn get_device_session_token(
     portal_base: &str,
     bearer_token: &str,
@@ -457,12 +457,12 @@ pub async fn get_device_session_token(
         .body("{}")
         .send()
         .await
-        .context("获取设备会话 Token 请求失败")?;
+        .context("获取设备会话令牌请求失败")?;
 
     let status = resp.status();
     if !status.is_success() {
         let body_text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("获取设备会话 Token 失败 {}: {}", status, body_text);
+        anyhow::bail!("获取设备会话令牌失败 {}: {}", status, body_text);
     }
 
     let session_resp = resp
@@ -543,7 +543,7 @@ pub async fn approve_auth(
     Ok(())
 }
 
-/// 完整的 SSO Token 导入流程（7 步）
+/// 完整的 SSO 令牌导入流程（7 步）
 pub async fn import_sso_token(
     bearer_token: &str,
     region: &str,
@@ -568,10 +568,10 @@ pub async fn import_sso_token(
     )
     .await?;
 
-    // 3. 验证 Bearer Token
+    // 3. 验证 Bearer 令牌
     verify_bearer_token(&portal_base, bearer_token, proxy).await?;
 
-    // 4. 获取设备会话 Token
+    // 4. 获取设备会话令牌
     let session_token = get_device_session_token(&portal_base, bearer_token, proxy).await?;
 
     // 5. 接受用户代码
@@ -583,13 +583,13 @@ pub async fn import_sso_token(
         approve_auth(&oidc_base, device_context, &session_token, proxy).await?;
     }
 
-    // 7. 轮询 Token
+    // 7. 轮询令牌
     let mut interval = device_auth.interval.max(1);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
 
     loop {
         if std::time::Instant::now() > deadline {
-            anyhow::bail!("SSO Token 导入超时（2 分钟）");
+            anyhow::bail!("SSO 令牌导入超时（2 分钟）");
         }
 
         match poll_token(
@@ -641,7 +641,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn iam_sso_register_request_matches_kiro_go_shape() {
+    fn iam_sso_register_request_uses_builder_id_code_shape() {
         let value = build_iam_sso_register_request(BUILDER_ID_START_URL);
 
         assert_eq!(value["clientName"], "Kiro");
@@ -659,11 +659,11 @@ mod tests {
     }
 
     #[test]
-    fn sso_token_register_request_matches_kiro_go_shape() {
+    fn sso_token_register_request_uses_device_code_shape() {
         let value =
             serde_json::to_value(build_sso_token_register_request(BUILDER_ID_START_URL)).unwrap();
 
-        assert_eq!(value["clientName"], "Kiro API Proxy");
+        assert_eq!(value["clientName"], "xkiro.rs");
         assert_eq!(value["clientType"], "public");
         assert_eq!(value["issuerUrl"], BUILDER_ID_START_URL);
         assert_eq!(
@@ -677,7 +677,7 @@ mod tests {
     }
 
     #[test]
-    fn device_register_request_matches_kiro_go_builder_id_shape() {
+    fn device_register_request_uses_builder_id_device_shape() {
         let value =
             serde_json::to_value(build_device_register_request(BUILDER_ID_START_URL)).unwrap();
 

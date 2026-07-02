@@ -10,7 +10,7 @@ import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { useCredentialModels } from '@/hooks/use-credentials'
 import { parseError } from '@/lib/utils'
-import type { AvailableModel } from '@/api/credentials'
+import type { AvailableModel } from '@/types/api'
 
 interface ModelsDialogProps {
   credentialId: number | null
