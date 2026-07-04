@@ -19,7 +19,7 @@ use parking_lot::{Mutex, RwLock};
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
 use crate::model::config::{CompressionConfig, PromptFilterConfig};
-use crate::model::runtime::{PromptRuntimeConfig, SharedPromptConfig};
+use crate::model::runtime::{PromptRuntimeConfig, SharedModelMappingConfig, SharedPromptConfig};
 
 use super::cache_tracker::CacheTracker;
 use super::types::ErrorResponse;
@@ -298,6 +298,8 @@ pub struct AppState {
     pub compression_config: Arc<RwLock<CompressionConfig>>,
     /// 共享系统提示清洗配置（运行时可修改）
     pub prompt_filter_config: Arc<RwLock<PromptFilterConfig>>,
+    /// 共享用户模型映射运行时（仅 OpenAI 路径应用，运行时可修改）
+    pub model_mapping_config: SharedModelMappingConfig,
     /// 共享系统提示注入运行时配置（运行时可修改）
     pub prompt_runtime: SharedPromptConfig,
     /// Prompt Cache 运行时配置（共享引用，支持热更新）
@@ -331,6 +333,9 @@ impl AppState {
             profile_arn: None,
             compression_config: Arc::new(RwLock::new(CompressionConfig::default())),
             prompt_filter_config: Arc::new(RwLock::new(PromptFilterConfig::default())),
+            model_mapping_config: Arc::new(RwLock::new(
+                crate::model::runtime::ModelMappingRuntime::default(),
+            )),
             prompt_runtime: Arc::new(RwLock::new(PromptRuntimeConfig {
                 enabled: false,
                 enabled_presets: Vec::new(),
@@ -413,6 +418,12 @@ impl AppState {
     /// 设置系统提示注入运行时配置（接受共享引用）
     pub fn with_prompt_runtime(mut self, runtime: SharedPromptConfig) -> Self {
         self.prompt_runtime = runtime;
+        self
+    }
+
+    /// 设置模型映射运行时配置（接受共享引用）
+    pub fn with_model_mapping_config(mut self, config: SharedModelMappingConfig) -> Self {
+        self.model_mapping_config = config;
         self
     }
 

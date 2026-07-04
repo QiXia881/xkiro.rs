@@ -7,11 +7,109 @@
 //! 当 Admin API 写入这些配置时，会同步回写到 `config.json`，确保下次重启
 //! 也能保留更改。
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use parking_lot::RwLock;
 
-use super::config::{Config, SystemPromptPosition, UserPreset};
+use super::config::{Config, ModelMappingRule, SystemPromptPosition, UserPreset};
+
+/// 用户模型映射运行时
+///
+/// 在硬编码 `map_model_with_thinking_suffix` 之前作为 OVERRIDE 层：命中首条
+/// 启用且 `source_model` 精确匹配、`target_models` 非空的规则后，把入站模型名
+/// 改写为目标模型。仅在 OpenAI / OpenAI-Responses 协议路径生效。
+///
+/// - "replace" / "alias"：取 `target_models[0]`
+/// - "loadbalance"：`weights` 为空或与 `target_models` 长度不符 → 轮询
+///   （per-rule `AtomicUsize` 计数器）；否则按 `weights` 加权随机
+///
+/// 规则列表为空时 `resolve` 恒返回 `None`，与未启用此模块行为一致。
+#[derive(Debug, Default)]
+pub struct ModelMappingRuntime {
+    rules: Vec<ModelMappingRule>,
+    /// loadbalance 轮询计数器（key = rule.id）
+    counters: HashMap<String, AtomicUsize>,
+}
+
+impl ModelMappingRuntime {
+    pub fn new(rules: Vec<ModelMappingRule>) -> Self {
+        let counters = rules
+            .iter()
+            .filter(|r| r.rule_type == "loadbalance")
+            .map(|r| (r.id.clone(), AtomicUsize::new(0)))
+            .collect();
+        Self { rules, counters }
+    }
+
+    pub fn from_config(cfg: &Config) -> Self {
+        Self::new(cfg.model_mappings.clone())
+    }
+
+    pub fn rules(&self) -> &[ModelMappingRule] {
+        &self.rules
+    }
+
+    /// 用新规则替换运行时状态（丢弃旧的轮询计数器）
+    pub fn replace(&mut self, rules: Vec<ModelMappingRule>) {
+        *self = Self::new(rules);
+    }
+
+    /// 解析请求模型名的 OVERRIDE 目标。
+    ///
+    /// 返回 `Some(target)` 表示命中规则并改写；`None` 表示无匹配规则，
+    /// 调用方应保持入站模型名不变（后续仍走硬编码归一化）。
+    pub fn resolve(&self, requested_model: &str) -> Option<String> {
+        let rule = self.rules.iter().find(|r| {
+            r.enabled && r.source_model == requested_model && !r.target_models.is_empty()
+        })?;
+
+        match rule.rule_type.as_str() {
+            "loadbalance" => Some(self.pick_loadbalance(rule)),
+            // "replace" | "alias" | 其它 → 取第一个目标
+            _ => Some(rule.target_models[0].clone()),
+        }
+    }
+
+    fn pick_loadbalance(&self, rule: &ModelMappingRule) -> String {
+        let targets = &rule.target_models;
+
+        // weights 为空或长度不匹配 → 轮询
+        if rule.weights.is_empty() || rule.weights.len() != targets.len() {
+            let idx = self
+                .counters
+                .get(&rule.id)
+                .map(|c| c.fetch_add(1, Ordering::Relaxed))
+                .unwrap_or(0)
+                % targets.len();
+            return targets[idx].clone();
+        }
+
+        // 加权随机
+        let total: u64 = rule.weights.iter().map(|w| *w as u64).sum();
+        if total == 0 {
+            return targets[0].clone();
+        }
+        let mut pick = fastrand::u64(0..total);
+        for (i, w) in rule.weights.iter().enumerate() {
+            let w = *w as u64;
+            if pick < w {
+                return targets[i].clone();
+            }
+            pick -= w;
+        }
+        targets[targets.len() - 1].clone()
+    }
+}
+
+/// 跨模块共享的可变模型映射运行时句柄
+pub type SharedModelMappingConfig = Arc<RwLock<ModelMappingRuntime>>;
+
+/// 从 `Config` 构建共享模型映射句柄
+pub fn model_mapping_from_config(cfg: &Config) -> SharedModelMappingConfig {
+    Arc::new(RwLock::new(ModelMappingRuntime::from_config(cfg)))
+}
 
 /// Prompt 注入运行时配置
 ///
@@ -175,5 +273,111 @@ mod tests {
         });
         c.enabled_presets.push("blank".to_string());
         assert!(c.build_injection_text().is_none());
+    }
+
+    // ---- ModelMappingRuntime ----
+
+    fn rule(
+        id: &str,
+        rule_type: &str,
+        source: &str,
+        targets: &[&str],
+        weights: &[u32],
+    ) -> ModelMappingRule {
+        ModelMappingRule {
+            id: id.into(),
+            name: id.into(),
+            enabled: true,
+            rule_type: rule_type.into(),
+            source_model: source.into(),
+            target_models: targets.iter().map(|s| s.to_string()).collect(),
+            weights: weights.to_vec(),
+        }
+    }
+
+    #[test]
+    fn model_mapping_empty_is_passthrough() {
+        let rt = ModelMappingRuntime::new(Vec::new());
+        assert_eq!(rt.resolve("gpt-4o"), None);
+        assert_eq!(rt.resolve("claude-sonnet-4"), None);
+    }
+
+    #[test]
+    fn model_mapping_replace_maps_source_to_target() {
+        let rt = ModelMappingRuntime::new(vec![rule(
+            "r1",
+            "replace",
+            "gpt-4o",
+            &["claude-sonnet-4.5"],
+            &[],
+        )]);
+        assert_eq!(rt.resolve("gpt-4o").as_deref(), Some("claude-sonnet-4.5"));
+        // 非匹配源保持 None（passthrough）
+        assert_eq!(rt.resolve("gpt-4-turbo"), None);
+    }
+
+    #[test]
+    fn model_mapping_alias_takes_first_target() {
+        let rt = ModelMappingRuntime::new(vec![rule("r1", "alias", "foo", &["bar", "baz"], &[])]);
+        assert_eq!(rt.resolve("foo").as_deref(), Some("bar"));
+    }
+
+    #[test]
+    fn model_mapping_loadbalance_round_robin_cycles() {
+        let rt = ModelMappingRuntime::new(vec![rule(
+            "lb",
+            "loadbalance",
+            "src",
+            &["a", "b", "c"],
+            &[],
+        )]);
+        // 轮询严格按顺序循环
+        assert_eq!(rt.resolve("src").as_deref(), Some("a"));
+        assert_eq!(rt.resolve("src").as_deref(), Some("b"));
+        assert_eq!(rt.resolve("src").as_deref(), Some("c"));
+        assert_eq!(rt.resolve("src").as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn model_mapping_disabled_rule_skipped() {
+        let mut r = rule("r1", "replace", "gpt-4o", &["claude-sonnet-4.5"], &[]);
+        r.enabled = false;
+        let rt = ModelMappingRuntime::new(vec![r]);
+        assert_eq!(rt.resolve("gpt-4o"), None);
+    }
+
+    #[test]
+    fn model_mapping_empty_targets_skipped() {
+        let rt = ModelMappingRuntime::new(vec![rule("r1", "replace", "gpt-4o", &[], &[])]);
+        assert_eq!(rt.resolve("gpt-4o"), None);
+    }
+
+    #[test]
+    fn model_mapping_first_matching_rule_wins() {
+        let rt = ModelMappingRuntime::new(vec![
+            rule("r1", "replace", "gpt-4o", &["first"], &[]),
+            rule("r2", "replace", "gpt-4o", &["second"], &[]),
+        ]);
+        assert_eq!(rt.resolve("gpt-4o").as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn model_mapping_weighted_all_weight_on_one() {
+        // weights 长度匹配且总和>0：权重全压在索引 1
+        let rt =
+            ModelMappingRuntime::new(vec![rule("lb", "loadbalance", "src", &["a", "b"], &[0, 1])]);
+        for _ in 0..20 {
+            assert_eq!(rt.resolve("src").as_deref(), Some("b"));
+        }
+    }
+
+    #[test]
+    fn model_mapping_weight_len_mismatch_falls_back_to_round_robin() {
+        // weights 长度与 targets 不符 → 退化为轮询
+        let rt =
+            ModelMappingRuntime::new(vec![rule("lb", "loadbalance", "src", &["a", "b"], &[5])]);
+        assert_eq!(rt.resolve("src").as_deref(), Some("a"));
+        assert_eq!(rt.resolve("src").as_deref(), Some("b"));
+        assert_eq!(rt.resolve("src").as_deref(), Some("a"));
     }
 }

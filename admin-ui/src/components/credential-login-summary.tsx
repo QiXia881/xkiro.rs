@@ -2,6 +2,7 @@ import type { CredentialLoginDetails } from '@/types/api'
 import { getCredentialMaterialLabels as materialLabels } from '@/lib/credential-material'
 import {
   compactCredentialMetadataValue,
+  CREDENTIAL_SUMMARY_IDENTITY_KEYS,
   getCredentialIdentityRows,
   getCredentialMetadataRows,
 } from '@/lib/credential-metadata'
@@ -21,7 +22,7 @@ export function CredentialLoginSummary({
     { label: '凭据 ID', value: credentialId ?? details?.id },
     { label: '认证', value: authLabel },
     ...getCredentialIdentityRows(details, {
-      keys: ['email', 'nickname', 'label', 'sourceAccountId', 'status', 'addedAt'],
+      keys: CREDENTIAL_SUMMARY_IDENTITY_KEYS,
     }),
     ...getCredentialMetadataRows(details),
     { label: '材料', value: materialLabels(details, { exclude: ['hasToken', 'hasRefreshToken'] }).join(', ') },

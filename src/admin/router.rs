@@ -17,11 +17,11 @@ use super::{
         get_api_key, get_api_keys, get_cached_balances, get_cached_credential_alias_models,
         get_common_config, get_compression_config, get_credential_alias_full,
         get_credential_alias_overage, get_credential_balance, get_credential_models,
-        get_credential_overage, get_endpoint_config, get_global_config, get_prompt_filter_config,
-        get_proxy_config, get_proxy_url_config, get_request_logs, get_runtime_stats, get_stats,
-        get_system_prompt, get_system_status, get_thinking_config, get_version,
-        import_credential_record, import_credentials, import_proxies, import_sso_token,
-        list_credential_alias_views, list_proxies, poll_builder_id_login,
+        get_credential_overage, get_endpoint_config, get_global_config, get_model_mappings,
+        get_prompt_filter_config, get_proxy_config, get_proxy_url_config, get_request_logs,
+        get_runtime_stats, get_stats, get_system_prompt, get_system_status, get_thinking_config,
+        get_version, import_credential_record, import_credentials, import_proxies,
+        import_sso_token, list_credential_alias_views, list_proxies, poll_builder_id_login,
         poll_builder_id_login_by_body, poll_idc_login, poll_kiro_sso_login, poll_social_login,
         refresh_all_credential_models, refresh_credential_alias, refresh_credential_alias_models,
         refresh_credential_models, reset_api_key_usage, reset_failure_count, reset_stats,
@@ -32,8 +32,8 @@ use super::{
         start_kiro_sso_login, start_social_login, test_credential, test_credential_alias,
         test_proxy, update_access_settings, update_api_key, update_common_config,
         update_credential_alias, update_endpoint_config, update_global_config,
-        update_prompt_filter_config, update_proxy, update_proxy_config, update_proxy_url_config,
-        update_system_prompt, update_thinking_config, upsert_user_preset,
+        update_model_mappings, update_prompt_filter_config, update_proxy, update_proxy_config,
+        update_proxy_url_config, update_system_prompt, update_thinking_config, upsert_user_preset,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -273,6 +273,14 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/prompt-filter",
             get(get_prompt_filter_config).post(update_prompt_filter_config),
+        )
+        .route(
+            "/config/model-mappings",
+            get(get_model_mappings).post(update_model_mappings),
+        )
+        .route(
+            "/model-mappings",
+            get(get_model_mappings).post(update_model_mappings),
         )
         .route(
             "/config/system-prompt",

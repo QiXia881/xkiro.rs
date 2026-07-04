@@ -69,7 +69,7 @@ pub fn count_tokens(text: &str) -> u64 {
     estimate_approx_tokens(text)
 }
 
-fn estimate_approx_tokens(text: &str) -> u64 {
+pub(crate) fn estimate_approx_tokens(text: &str) -> u64 {
     if text.is_empty() {
         return 0;
     }

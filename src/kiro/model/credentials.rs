@@ -10,6 +10,12 @@ use std::path::Path;
 use crate::http_client::ProxyConfig;
 use crate::model::config::Config;
 
+pub const KIRO_BUILDER_ID_PROFILE_ARN: &str =
+    "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX";
+pub const KIRO_SOCIAL_PROFILE_ARN: &str =
+    "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK";
+pub const KIRO_BUILDER_ID_START_URL: &str = "https://view.awsapps.com/start";
+
 /// Kiro OAuth 凭据
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -121,6 +127,63 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
 
+    /// 导入来源 / 凭据元数据（透传保真）
+    ///
+    /// `#[serde(flatten)]` 保持这些键在顶层的 camelCase 线格式不变，
+    /// 仅在 Rust 侧收拢到子结构，缩小主结构的逻辑表面。
+    #[serde(flatten)]
+    pub meta: CredentialSourceMetadata,
+
+    /// 凭据级代理 URL（可选）
+    /// 支持 http/https/socks5 协议
+    /// 特殊值 "direct" 表示显式不使用代理（即使全局配置了代理）
+    /// 未配置时回退到全局代理配置
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
+
+    /// 凭据级代理认证用户名（可选）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_username: Option<String>,
+
+    /// 凭据级代理认证密码（可选）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_password: Option<String>,
+
+    /// 代理池引用 ID（可选）
+    /// 设置后运行时从代理池回填真实代理，凭证文件只保存引用。
+    #[serde(alias = "proxy_id", skip_serializing_if = "Option::is_none")]
+    pub proxy_id: Option<u64>,
+
+    /// 凭据是否被禁用（默认为 false）
+    #[serde(default)]
+    pub disabled: bool,
+
+    /// API 密钥（headless 模式）
+    /// 格式: ksk_xxxxxxxx
+    /// 设置后直接作为 Bearer 令牌使用，无需 refreshToken
+    #[serde(
+        alias = "kiroApiKey",
+        alias = "kiro_api_key",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub api_key: Option<String>,
+
+    /// 端点名称（可选）
+    ///
+    /// 决定该凭据走哪套 Kiro API。未配置时回退到 `config.defaultEndpoint`（默认 "ide"）。
+    /// 端点名必须在启动时注册的端点 registry 中存在。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+}
+
+/// 导入来源 / 凭据元数据（透传保真）
+///
+/// 这些字段几乎只经序列化往返（与 kiro-account-manager 账号池格式互通）或供 admin-ui 展示，
+/// 极少被核心调度逻辑读取。归组于此后经 `#[serde(flatten)]` 挂回 `KiroCredentials`，
+/// 顶层 JSON 线格式保持不变（camelCase、None 跳过），仅收拢 Rust 侧字段表面。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialSourceMetadata {
     /// 导入来源 ID（可能是非数字字符串 ID）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_account_id: Option<String>,
@@ -302,47 +365,6 @@ pub struct KiroCredentials {
     /// allowOverage 导入提示，仅用于加载后归一到 overage_status，不再写回。
     #[serde(rename = "allowOverage", default, skip_serializing)]
     pub allow_overage_import: bool,
-
-    /// 凭据级代理 URL（可选）
-    /// 支持 http/https/socks5 协议
-    /// 特殊值 "direct" 表示显式不使用代理（即使全局配置了代理）
-    /// 未配置时回退到全局代理配置
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub proxy_url: Option<String>,
-
-    /// 凭据级代理认证用户名（可选）
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub proxy_username: Option<String>,
-
-    /// 凭据级代理认证密码（可选）
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub proxy_password: Option<String>,
-
-    /// 代理池引用 ID（可选）
-    /// 设置后运行时从代理池回填真实代理，凭证文件只保存引用。
-    #[serde(alias = "proxy_id", skip_serializing_if = "Option::is_none")]
-    pub proxy_id: Option<u64>,
-
-    /// 凭据是否被禁用（默认为 false）
-    #[serde(default)]
-    pub disabled: bool,
-
-    /// API 密钥（headless 模式）
-    /// 格式: ksk_xxxxxxxx
-    /// 设置后直接作为 Bearer 令牌使用，无需 refreshToken
-    #[serde(
-        alias = "kiroApiKey",
-        alias = "kiro_api_key",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub api_key: Option<String>,
-
-    /// 端点名称（可选）
-    ///
-    /// 决定该凭据走哪套 Kiro API。未配置时回退到 `config.defaultEndpoint`（默认 "ide"）。
-    /// 端点名必须在启动时注册的端点 registry 中存在。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub endpoint: Option<String>,
 }
 
 /// 判断是否为零（用于跳过序列化）
@@ -525,6 +547,28 @@ impl KiroCredentials {
         }
     }
 
+    pub fn is_valid_profile_arn(value: &str) -> bool {
+        let value = value.trim();
+        value.starts_with("arn:") && value.contains(":profile/")
+    }
+
+    pub fn clean_profile_arn(value: Option<String>) -> Option<String> {
+        value
+            .as_deref()
+            .map(str::trim)
+            .filter(|arn| Self::is_valid_profile_arn(arn))
+            .map(str::to_string)
+    }
+
+    pub fn profile_arn_region_from_value(value: &str) -> Option<&str> {
+        let parts: Vec<&str> = value.splitn(6, ':').collect();
+        if parts.len() < 6 || parts[0] != "arn" || parts[2] != "codewhisperer" {
+            return None;
+        }
+        let region = parts[3].trim();
+        (!region.is_empty()).then_some(region)
+    }
+
     /// 获取默认凭据文件路径
     pub fn default_credentials_path() -> &'static str {
         "credentials.json"
@@ -549,12 +593,55 @@ impl KiroCredentials {
 
     pub fn profile_arn_region(&self) -> Option<&str> {
         let profile_arn = self.profile_arn_trimmed()?;
-        let parts: Vec<&str> = profile_arn.splitn(6, ':').collect();
-        if parts.len() < 6 || parts[0] != "arn" || parts[2] != "codewhisperer" {
+        Self::profile_arn_region_from_value(profile_arn)
+    }
+
+    pub fn management_profile_arn(&self) -> Option<&str> {
+        if self.is_enterprise_idc_credential() {
             return None;
         }
-        let region = parts[3].trim();
-        (!region.is_empty()).then_some(region)
+
+        self.profile_arn_trimmed()
+            .or_else(|| self.default_management_profile_arn())
+    }
+
+    fn default_management_profile_arn(&self) -> Option<&'static str> {
+        let provider = self.provider.as_deref().map(str::trim);
+        if provider.is_some_and(|value| value.eq_ignore_ascii_case("Enterprise")) {
+            return None;
+        }
+        if provider.is_some_and(|value| value.eq_ignore_ascii_case("BuilderId")) {
+            return Some(KIRO_BUILDER_ID_PROFILE_ARN);
+        }
+        if provider.is_some_and(|value| {
+            value.eq_ignore_ascii_case("Google")
+                || value.eq_ignore_ascii_case("Github")
+                || value.eq_ignore_ascii_case("GitHub")
+        }) {
+            return Some(KIRO_SOCIAL_PROFILE_ARN);
+        }
+
+        match self.canonical_auth_method() {
+            Some("social") => Some(KIRO_SOCIAL_PROFILE_ARN),
+            Some("idc")
+                if self
+                    .start_url
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|value| {
+                        value.trim_end_matches('/') == KIRO_BUILDER_ID_START_URL
+                    })
+                    || self.auth_method.as_deref().is_some_and(|value| {
+                        matches!(
+                            value.trim().to_ascii_lowercase().as_str(),
+                            "builderid" | "builder-id" | "builder_id" | "builder id"
+                        )
+                    }) =>
+            {
+                Some(KIRO_BUILDER_ID_PROFILE_ARN)
+            }
+            _ => None,
+        }
     }
 
     /// 获取 Kiro/Q data-plane region。
@@ -597,19 +684,20 @@ impl KiroCredentials {
     }
 
     pub fn apply_allow_overage_import_hint(&mut self) -> bool {
-        if !self.allow_overage_import {
+        if !self.meta.allow_overage_import {
             return false;
         }
         if self
+            .meta
             .overage_status
             .as_deref()
             .map(str::trim)
             .filter(|status| !status.is_empty())
             .is_none()
         {
-            self.overage_status = Some("ENABLED".to_string());
+            self.meta.overage_status = Some("ENABLED".to_string());
         }
-        self.allow_overage_import = false;
+        self.meta.allow_overage_import = false;
         true
     }
 
@@ -617,7 +705,7 @@ impl KiroCredentials {
     ///
     /// Free 订阅不支持 Opus 模型，需要 PRO 或更高等级订阅
     pub fn supports_opus(&self) -> bool {
-        match &self.subscription_title {
+        match &self.meta.subscription_title {
             Some(title) => {
                 let title_upper = title.to_uppercase();
                 // 如果包含 FREE，则不支持 Opus
@@ -645,7 +733,7 @@ impl KiroCredentials {
         self.profile_arn
             .as_deref()
             .map(str::trim)
-            .filter(|arn| !arn.is_empty())
+            .filter(|arn| Self::is_valid_profile_arn(arn))
     }
 
     /// 检查是否为 API 密钥凭据
@@ -673,6 +761,14 @@ impl KiroCredentials {
             .as_deref()
             .map(|m| canonicalize_auth_method_value(m).eq_ignore_ascii_case("external_idp"))
             .unwrap_or(false)
+    }
+
+    pub fn is_enterprise_idc_credential(&self) -> bool {
+        self.is_aws_sso_oidc_credential()
+            && self
+                .provider
+                .as_deref()
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("Enterprise"))
     }
 }
 
@@ -768,6 +864,43 @@ mod tests {
         assert!(output.contains("ssoSessionId"));
     }
 
+    // AC-1：归组后 meta 字段必须保持顶层 flat camelCase 线格式，且双次往返 byte 一致。
+    // 覆盖大 u64/i64（超 2^53）+ f64 + 字符串，防止 flatten 归组回归。
+    #[test]
+    fn meta_fields_stay_flat_and_roundtrip_byte_identical() {
+        let wire = r#"{"refreshToken":"r","subscriptionType":"PRO_PLUS","subscriptionTitle":"KIRO PRO+","overageStatus":"ENABLED","usagePercent":42.5,"usageCurrent":10.0,"usageLimit":100.0,"totalTokens":9007199254740993,"lastUsedAt":1700000000123456789,"banTime":1700000000,"errorCount":3,"requestCount":7,"nickname":"nick","status":"active","sourceAccountId":"acct-1"}"#;
+
+        let creds = KiroCredentials::from_json(wire).unwrap();
+        // 归组字段落到 meta 子结构
+        assert_eq!(creds.meta.subscription_type.as_deref(), Some("PRO_PLUS"));
+        assert_eq!(creds.meta.total_tokens, Some(9_007_199_254_740_993));
+        assert_eq!(creds.meta.last_used_at, Some(1_700_000_000_123_456_789));
+        assert_eq!(creds.meta.usage_percent, Some(42.5));
+
+        // 顶层键仍是 flat camelCase（flatten 未引入嵌套 "meta" 对象）
+        let value = serde_json::to_value(&creds).unwrap();
+        let obj = value.as_object().unwrap();
+        assert!(obj.get("meta").is_none(), "flatten 不得产生嵌套 meta 键");
+        assert_eq!(
+            obj.get("subscriptionType").and_then(|v| v.as_str()),
+            Some("PRO_PLUS")
+        );
+        assert_eq!(
+            obj.get("totalTokens").and_then(|v| v.as_u64()),
+            Some(9_007_199_254_740_993)
+        );
+        assert_eq!(
+            obj.get("lastUsedAt").and_then(|v| v.as_i64()),
+            Some(1_700_000_000_123_456_789)
+        );
+
+        // 双次往返 byte 一致
+        let first = serde_json::to_string(&creds).unwrap();
+        let reparsed = KiroCredentials::from_json(&first).unwrap();
+        let second = serde_json::to_string(&reparsed).unwrap();
+        assert_eq!(first, second, "meta 归组后往返必须 byte 一致");
+    }
+
     #[test]
     fn test_to_json() {
         let creds = KiroCredentials {
@@ -789,9 +922,6 @@ mod tests {
             api_region: None,
             machine_id: None,
             email: None,
-            subscription_title: None,
-            overage_status: None,
-            allow_overage_import: false,
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
@@ -879,8 +1009,8 @@ mod tests {
             KiroCredentials::from_json(r#"{"refreshToken":"test","allowOverage":true}"#).unwrap();
 
         assert!(creds.apply_allow_overage_import_hint());
-        assert_eq!(creds.overage_status.as_deref(), Some("ENABLED"));
-        assert!(!creds.allow_overage_import);
+        assert_eq!(creds.meta.overage_status.as_deref(), Some("ENABLED"));
+        assert!(!creds.meta.allow_overage_import);
         let json = creds.to_pretty_json().unwrap();
         assert!(json.contains("overageStatus"));
         assert!(!json.contains("allowOverage"));
@@ -890,8 +1020,8 @@ mod tests {
         )
         .unwrap();
         assert!(preset.apply_allow_overage_import_hint());
-        assert_eq!(preset.overage_status.as_deref(), Some("DISABLED"));
-        assert!(!preset.allow_overage_import);
+        assert_eq!(preset.meta.overage_status.as_deref(), Some("DISABLED"));
+        assert!(!preset.meta.allow_overage_import);
     }
 
     // ============ 区域字段测试 ============
@@ -943,9 +1073,6 @@ mod tests {
             api_region: None,
             machine_id: None,
             email: None,
-            subscription_title: None,
-            overage_status: None,
-            allow_overage_import: false,
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
@@ -989,9 +1116,6 @@ mod tests {
             api_region: None,
             machine_id: None,
             email: None,
-            subscription_title: None,
-            overage_status: None,
-            allow_overage_import: false,
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
@@ -1110,6 +1234,73 @@ mod tests {
     }
 
     #[test]
+    fn test_profile_arn_trimmed_ignores_non_arn_values() {
+        let mut creds = KiroCredentials::default();
+        creds.profile_arn = Some("e3438419-4424-4e57-8990-ef76bd749a44".to_string());
+
+        assert_eq!(creds.profile_arn_trimmed(), None);
+    }
+
+    #[test]
+    fn test_clean_profile_arn_trims_and_rejects_non_arn_values() {
+        assert_eq!(
+            KiroCredentials::clean_profile_arn(Some(
+                " arn:aws:codewhisperer:profile/test ".to_string()
+            ))
+            .as_deref(),
+            Some("arn:aws:codewhisperer:profile/test")
+        );
+        assert_eq!(
+            KiroCredentials::clean_profile_arn(Some(
+                "e3438419-4424-4e57-8990-ef76bd749a44".to_string()
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn test_management_profile_arn_uses_kam_defaults_for_builder_and_social() {
+        let mut builder = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            provider: Some("BuilderId".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            builder.management_profile_arn(),
+            Some(KIRO_BUILDER_ID_PROFILE_ARN)
+        );
+
+        builder.profile_arn =
+            Some("arn:aws:codewhisperer:eu-central-1:123:profile/custom".to_string());
+        assert_eq!(
+            builder.management_profile_arn(),
+            Some("arn:aws:codewhisperer:eu-central-1:123:profile/custom")
+        );
+
+        let social = KiroCredentials {
+            auth_method: Some("social".to_string()),
+            provider: Some("GitHub".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            social.management_profile_arn(),
+            Some(KIRO_SOCIAL_PROFILE_ARN)
+        );
+    }
+
+    #[test]
+    fn test_management_profile_arn_omits_enterprise_even_with_cached_arn() {
+        let enterprise = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            provider: Some("Enterprise".to_string()),
+            profile_arn: Some("arn:aws:codewhisperer:us-east-1:123:profile/ignored".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(enterprise.management_profile_arn(), None);
+    }
+
+    #[test]
     fn test_profile_arn_region_parses_codewhisperer_arn() {
         let mut creds = KiroCredentials::default();
         creds.profile_arn =
@@ -1166,9 +1357,6 @@ mod tests {
             api_region: None,
             machine_id: Some("c".repeat(64)),
             email: None,
-            subscription_title: None,
-            overage_status: None,
-            allow_overage_import: false,
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,

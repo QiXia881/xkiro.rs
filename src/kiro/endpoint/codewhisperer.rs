@@ -13,104 +13,54 @@ use reqwest::RequestBuilder;
 use uuid::Uuid;
 
 use super::{
-    KiroEndpoint, PreferenceRequestParts, RequestContext, UsageRequestParts,
-    codewhisperer_rest_host_for_region, q_rest_host_for_region,
+    IdeEndpoint, KiroEndpoint, PreferenceRequestParts, RequestContext, UsageRequestParts,
+    apply_stream_token_type_headers, codewhisperer_rest_host_for_region,
 };
 use crate::kiro::model::credentials::KiroCredentials;
 
 /// CodeWhisperer 端点名称
 pub const CODEWHISPERER_ENDPOINT_NAME: &str = "codewhisperer";
 
+/// CodeWhisperer 请求的 `X-Amz-Target`
+const CODEWHISPERER_API_TARGET: &str =
+    "AmazonCodeWhispererStreamingService.GenerateAssistantResponse";
+
 /// CodeWhisperer 端点
-pub struct CodewhispererEndpoint;
+///
+/// 与 IDE 端点共享绝大部分逻辑（profileArn 注入、User-Agent、runtime headers、
+/// usage / preference 请求），仅在以下三点真正不同，故内部持有一个 [`IdeEndpoint`]
+/// 委托共享部分，只保留差异：
+/// - host：`codewhisperer.` / 区域化 `q.` 而非 IDE 固定的 `q.`
+/// - `decorate_api` 需要额外的 `X-Amz-Target` header
+/// - streaming API 名称（实际字节与 IDE 相同，直接复用 IDE 的 UA 构造器）
+pub struct CodewhispererEndpoint {
+    ide: IdeEndpoint,
+}
 
 impl CodewhispererEndpoint {
     pub fn new() -> Self {
-        Self
+        Self {
+            ide: IdeEndpoint::new(),
+        }
     }
 
     fn api_region<'a>(&self, ctx: &'a RequestContext<'_>) -> &'a str {
         ctx.credentials.effective_kiro_api_region(ctx.config)
     }
 
-    fn host_for_region(api_region: &str) -> String {
-        codewhisperer_rest_host_for_region(api_region)
-    }
-
     fn host(&self, ctx: &RequestContext<'_>) -> String {
-        Self::host_for_region(self.api_region(ctx))
+        codewhisperer_rest_host_for_region(self.api_region(ctx))
     }
 
-    fn preference_host(&self, ctx: &RequestContext<'_>) -> String {
-        q_rest_host_for_region(self.api_region(ctx))
-    }
-
-    fn x_amz_user_agent(&self, ctx: &RequestContext<'_>) -> String {
-        format!(
-            "aws-sdk-js/1.0.34 KiroIDE-{}-{}",
-            ctx.config.kiro_version, ctx.machine_id
-        )
-    }
-
-    fn user_agent(&self, ctx: &RequestContext<'_>) -> String {
-        format!(
-            "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.34 m/E KiroIDE-{}-{}",
-            ctx.config.system_version,
-            ctx.config.node_version,
-            ctx.config.kiro_version,
-            ctx.machine_id
-        )
-    }
-
-    fn mcp_profile_arn_header_value(credentials: &KiroCredentials) -> Option<&str> {
-        if credentials.is_aws_sso_oidc_credential() {
-            return None;
-        }
-        credentials.profile_arn_trimmed()
-    }
-
+    /// profileArn 注入逻辑与 IDE 完全一致，直接委托。
+    ///
+    /// 保留此关联函数是为了让既有测试 `CodewhispererEndpoint::inject_profile_arn`
+    /// 继续以相同签名调用。
     fn inject_profile_arn(
         request_body: &str,
         credentials: &KiroCredentials,
     ) -> anyhow::Result<String> {
-        if credentials.is_aws_sso_oidc_credential() {
-            let mut request: serde_json::Value = serde_json::from_str(request_body)?;
-            if let Some(obj) = request.as_object_mut() {
-                obj.remove("profileArn");
-            }
-            return Ok(serde_json::to_string(&request)?);
-        }
-
-        if let Some(profile_arn) = Self::mcp_profile_arn_header_value(credentials) {
-            let mut request: serde_json::Value = serde_json::from_str(request_body)?;
-            let obj = request
-                .as_object_mut()
-                .ok_or_else(|| anyhow::anyhow!("request body is not a JSON object"))?;
-            obj.insert(
-                "profileArn".to_string(),
-                serde_json::Value::String(profile_arn.to_string()),
-            );
-            return Ok(serde_json::to_string(&request)?);
-        }
-
-        let Ok(mut request) = serde_json::from_str::<serde_json::Value>(request_body) else {
-            return Ok(request_body.to_string());
-        };
-        let Some(obj) = request.as_object_mut() else {
-            return Ok(request_body.to_string());
-        };
-        if let Some(serde_json::Value::String(profile_arn)) = obj.get_mut("profileArn") {
-            let trimmed = profile_arn.trim();
-            if trimmed.is_empty() {
-                obj.remove("profileArn");
-            } else if trimmed.len() != profile_arn.len() {
-                *profile_arn = trimmed.to_string();
-            } else {
-                return Ok(request_body.to_string());
-            }
-            return Ok(serde_json::to_string(&request)?);
-        }
-        Ok(request_body.to_string())
+        IdeEndpoint::inject_profile_arn(request_body, credentials)
     }
 }
 
@@ -396,49 +346,37 @@ impl KiroEndpoint for CodewhispererEndpoint {
     }
 
     fn decorate_api(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
-        let mut req = req
+        // 与 IDE decorate_api 的头集合一致，仅 host 不同并额外附带 X-Amz-Target。
+        // reqwest 的 `.header()` 是追加而非覆盖，无法直接委托 IDE（会产生重复 host），
+        // 故此处复用 IDE 的 UA 构造器与 tokenType 追加逻辑，只保留真正的差异。
+        let req = req
             .header("Accept", "*/*")
             .header("x-amzn-codewhisperer-optout", "true")
             .header("x-amzn-kiro-agent-mode", "vibe")
-            .header("x-amz-user-agent", self.x_amz_user_agent(ctx))
-            .header("user-agent", self.user_agent(ctx))
+            .header("x-amz-user-agent", self.ide.x_amz_user_agent(ctx))
+            .header("user-agent", self.ide.user_agent(ctx))
             .header("host", self.host(ctx))
             .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
             .header("amz-sdk-request", "attempt=1; max=3")
-            .header(
-                "X-Amz-Target",
-                "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
-            )
+            .header("X-Amz-Target", CODEWHISPERER_API_TARGET)
             .header("Authorization", format!("Bearer {}", ctx.token));
 
-        if ctx.credentials.is_api_key_credential() {
-            req = req.header("tokentype", "API_KEY");
-        }
-        if ctx.credentials.is_external_idp_credential() {
-            req = req.header("TokenType", "EXTERNAL_IDP");
-        }
-        req
+        apply_stream_token_type_headers(req, ctx.credentials)
     }
 
     fn decorate_mcp(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
         let mut req = req
-            .header("x-amz-user-agent", self.x_amz_user_agent(ctx))
-            .header("user-agent", self.user_agent(ctx))
+            .header("x-amz-user-agent", self.ide.x_amz_user_agent(ctx))
+            .header("user-agent", self.ide.user_agent(ctx))
             .header("host", self.host(ctx))
             .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
             .header("amz-sdk-request", "attempt=1; max=3")
             .header("Authorization", format!("Bearer {}", ctx.token));
 
-        if let Some(profile_arn) = Self::mcp_profile_arn_header_value(ctx.credentials) {
+        if let Some(profile_arn) = IdeEndpoint::mcp_profile_arn_header_value(ctx.credentials) {
             req = req.header("x-amzn-kiro-profile-arn", profile_arn);
         }
-        if ctx.credentials.is_api_key_credential() {
-            req = req.header("tokentype", "API_KEY");
-        }
-        if ctx.credentials.is_external_idp_credential() {
-            req = req.header("TokenType", "EXTERNAL_IDP");
-        }
-        req
+        apply_stream_token_type_headers(req, ctx.credentials)
     }
 
     fn transform_api_body(&self, body: &str, ctx: &RequestContext<'_>) -> anyhow::Result<String> {
@@ -450,56 +388,9 @@ impl KiroEndpoint for CodewhispererEndpoint {
         ctx: &RequestContext<'_>,
         need_email: bool,
     ) -> anyhow::Result<UsageRequestParts> {
-        let host = self.host(ctx);
-        let mut url = if need_email {
-            format!(
-                "https://{}/getUsageLimits?isEmailRequired=true&origin=AI_EDITOR&resourceType=AGENTIC_REQUEST",
-                host
-            )
-        } else {
-            format!(
-                "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST",
-                host
-            )
-        };
-        if let Some(profile_arn) = ctx.credentials.profile_arn_trimmed() {
-            url.push_str(&format!("&profileArn={}", urlencoding::encode(profile_arn)));
-        }
-
-        let mut headers = vec![
-            ("Accept", "application/json".to_string()),
-            (
-                "x-amz-user-agent",
-                format!(
-                    "aws-sdk-js/1.0.0 KiroIDE-{}-{}",
-                    ctx.config.kiro_version, ctx.machine_id
-                ),
-            ),
-            (
-                "user-agent",
-                format!(
-                    "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
-                    ctx.config.system_version,
-                    ctx.config.node_version,
-                    ctx.config.kiro_version,
-                    ctx.machine_id
-                ),
-            ),
-            ("host", host),
-            ("amz-sdk-invocation-id", Uuid::new_v4().to_string()),
-            ("amz-sdk-request", "attempt=1; max=1".to_string()),
-            ("Authorization", format!("Bearer {}", ctx.token)),
-            ("Connection", "close".to_string()),
-        ];
-
-        if ctx.credentials.is_api_key_credential() {
-            headers.push(("tokentype", "API_KEY".to_string()));
-        }
-        if ctx.credentials.is_external_idp_credential() {
-            headers.push(("TokenType", "EXTERNAL_IDP".to_string()));
-        }
-
-        Ok(UsageRequestParts { url, headers })
+        // getUsageLimits 请求与 IDE 完全一致：IDE 的 rest_host 与本端点 host 都解析为
+        // codewhisperer_rest_host_for_region，产出字节相同，直接委托。
+        self.ide.usage_request_parts(ctx, need_email)
     }
 
     fn set_preference_request_parts(
@@ -507,54 +398,7 @@ impl KiroEndpoint for CodewhispererEndpoint {
         ctx: &RequestContext<'_>,
         overage_status: &str,
     ) -> anyhow::Result<PreferenceRequestParts> {
-        let host = self.preference_host(ctx);
-        let url = format!("https://{}/setUserPreference", host);
-
-        let mut body = serde_json::json!({
-            "overageConfiguration": { "overageStatus": overage_status },
-        });
-        if let Some(profile_arn) = ctx.credentials.profile_arn_trimmed() {
-            body["profileArn"] = serde_json::Value::String(profile_arn.to_string());
-        }
-
-        let mut headers = vec![
-            ("Accept", "application/json".to_string()),
-            ("content-type", "application/json".to_string()),
-            (
-                "x-amz-user-agent",
-                format!(
-                    "aws-sdk-js/1.0.0 KiroIDE-{}-{}",
-                    ctx.config.kiro_version, ctx.machine_id
-                ),
-            ),
-            (
-                "user-agent",
-                format!(
-                    "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
-                    ctx.config.system_version,
-                    ctx.config.node_version,
-                    ctx.config.kiro_version,
-                    ctx.machine_id
-                ),
-            ),
-            ("host", host),
-            ("amz-sdk-invocation-id", Uuid::new_v4().to_string()),
-            ("amz-sdk-request", "attempt=1; max=1".to_string()),
-            ("Authorization", format!("Bearer {}", ctx.token)),
-            ("Connection", "close".to_string()),
-        ];
-
-        if ctx.credentials.is_api_key_credential() {
-            headers.push(("tokentype", "API_KEY".to_string()));
-        }
-        if ctx.credentials.is_external_idp_credential() {
-            headers.push(("TokenType", "EXTERNAL_IDP".to_string()));
-        }
-
-        Ok(PreferenceRequestParts {
-            url,
-            headers,
-            body: serde_json::to_string(&body)?,
-        })
+        // setUserPreference 请求与 IDE 完全一致：两端都用 q_rest_host_for_region，直接委托。
+        self.ide.set_preference_request_parts(ctx, overage_status)
     }
 }

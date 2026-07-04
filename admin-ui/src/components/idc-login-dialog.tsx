@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
-import { CheckCircle, Copy, Loader2 } from 'lucide-react'
+import { Copy, Loader2 } from 'lucide-react'
 import {
   Dialog,
   DialogContent,
@@ -11,9 +11,10 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { CredentialLoginSummary } from '@/components/credential-login-summary'
+import { LoginSuccessView } from '@/components/login-success-view'
+import { useLoginResult } from '@/hooks/use-login-result'
 import { completeIamSsoLogin, startIamSsoLogin } from '@/api/credentials'
-import type { CredentialLoginDetails, StartIamSsoLoginResponse } from '@/types/api'
+import type { StartIamSsoLoginResponse } from '@/types/api'
 import { extractErrorMessage } from '@/lib/utils'
 import { CREDENTIAL_AUTH_LABELS, formatCredentialAuthLabel } from '@/lib/credential-metadata'
 
@@ -23,27 +24,20 @@ interface IdcLoginDialogProps {
   onSuccess: () => void
 }
 
-type Step = 'form' | 'waiting' | 'done'
-
 export function IdcLoginDialog({ open, onOpenChange, onSuccess }: IdcLoginDialogProps) {
-  const [step, setStep] = useState<Step>('form')
+  const { step, setStep, credentialId, credentialAuthLabel, credentialDetails, markSuccess, reset: resetResult } =
+    useLoginResult(onSuccess)
   const [region, setRegion] = useState('us-east-1')
   const [startUrl, setStartUrl] = useState('')
   const [callbackUrl, setCallbackUrl] = useState('')
   const [isStarting, setIsStarting] = useState(false)
   const [isCompleting, setIsCompleting] = useState(false)
   const [session, setSession] = useState<StartIamSsoLoginResponse | null>(null)
-  const [credentialId, setCredentialId] = useState<number | null>(null)
-  const [credentialAuthLabel, setCredentialAuthLabel] = useState('')
-  const [credentialDetails, setCredentialDetails] = useState<CredentialLoginDetails | null>(null)
 
   const reset = () => {
-    setStep('form')
+    resetResult()
     setSession(null)
     setCallbackUrl('')
-    setCredentialId(null)
-    setCredentialAuthLabel('')
-    setCredentialDetails(null)
     setIsStarting(false)
     setIsCompleting(false)
   }
@@ -113,12 +107,7 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess }: IdcLoginDialog
         return
       }
       const authLabel = formatCredentialAuthLabel(details.provider, details.authMethod)
-      setCredentialId(details.id)
-      setCredentialAuthLabel(authLabel)
-      setCredentialDetails(details)
-      setStep('done')
-      onSuccess()
-      toast.success(`登录成功，已添加${authLabel ? ` ${authLabel}` : ''} 凭据 #${details.id}`)
+      markSuccess(details.id, authLabel, details)
     } catch (error) {
       toast.error('完成登录失败：' + extractErrorMessage(error))
     } finally {
@@ -188,15 +177,11 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess }: IdcLoginDialog
         )}
 
         {step === 'done' && (
-          <div className="flex flex-col items-center gap-3 py-4">
-            <CheckCircle className="h-10 w-10 text-green-500" />
-            <p className="text-sm font-medium">登录成功</p>
-            <CredentialLoginSummary
-              credentialId={credentialId}
-              authLabel={credentialAuthLabel}
-              details={credentialDetails}
-            />
-          </div>
+          <LoginSuccessView
+            credentialId={credentialId}
+            authLabel={credentialAuthLabel}
+            details={credentialDetails}
+          />
         )}
 
         <DialogFooter>

@@ -308,7 +308,7 @@ fn append_non_stream_assistant_delta(
     raw_content: &str,
     previous: &mut String,
 ) {
-    let delta = super::stream::normalize_chunk(raw_content, previous);
+    let delta = crate::common::text::normalize_chunk(raw_content, previous);
     text_content.push_str(&delta);
 }
 
@@ -317,7 +317,7 @@ fn append_non_stream_reasoning_delta(
     raw_text: &str,
     previous: &mut String,
 ) {
-    let delta = super::stream::normalize_chunk(raw_text, previous);
+    let delta = crate::common::text::normalize_chunk(raw_text, previous);
     if !delta.is_empty() {
         thinking_content.push_str(&delta);
     }
@@ -460,6 +460,63 @@ fn is_credential_queue_timeout_error(err: &Error) -> bool {
     s.contains("credential queue wait timeout")
 }
 
+/// 上游 provider 错误的语义分类。
+///
+/// Anthropic 与 OpenAI 两条协议路径共用同一分类逻辑（同一组 sentinel 谓词、
+/// 同一判定顺序），各自渲染自己的 error body/code/日志与状态码——渲染侧的差异
+/// （如 OpenAI 的 `context_length_exceeded` code、queue-timeout 的
+/// `overloaded_error` vs `rate_limit_error`）是有意保留的。
+///
+/// 用 enum 承载分类：新增分类时 `match` 穷尽性会强制两侧渲染同步，消除
+/// 此前 OpenAI 内联字符串匹配与 Anthropic 谓词各写一份带来的漂移风险（A3）。
+pub(crate) enum ProviderErrorClass {
+    /// 输入上下文过长（CONTENT_LENGTH_EXCEEDS_THRESHOLD / Input is too long）
+    InputTooLong,
+    /// 请求格式错误（Improperly formed request）
+    ImproperlyFormed,
+    /// 无可用凭据（没有可用的凭据）
+    NoCredentials,
+    /// 凭据队列等待超时（per-credential 并发满，credential queue wait timeout）
+    QueueTimeout,
+    /// 所有凭据配额耗尽（所有凭据已用尽）
+    QuotaExhausted,
+    /// 上游瞬态网络错误（连接类：error sending request / connection closed/reset）
+    TransientNetwork,
+    /// 上游瞬态错误（429/5xx 等，非网络）
+    TransientUpstream,
+    /// 其他未分类错误（→ 502 api_error）
+    Unclassified,
+}
+
+/// 把 provider 的 `anyhow::Error` 归类为 [`ProviderErrorClass`]。
+///
+/// 判定顺序与既有渲染完全一致，谓词沿用现有 `is_*_error`，保证零行为变化。
+pub(crate) fn classify_provider_error(err: &Error) -> ProviderErrorClass {
+    if is_input_too_long_error(err) {
+        return ProviderErrorClass::InputTooLong;
+    }
+    if is_improperly_formed_request_error(err) {
+        return ProviderErrorClass::ImproperlyFormed;
+    }
+    if is_no_credentials_error(err) {
+        return ProviderErrorClass::NoCredentials;
+    }
+    if is_credential_queue_timeout_error(err) {
+        return ProviderErrorClass::QueueTimeout;
+    }
+    if is_quota_exhausted_error(err) {
+        return ProviderErrorClass::QuotaExhausted;
+    }
+    if is_transient_upstream_error(err) {
+        let s = err.to_string().to_lowercase();
+        if is_network_error(&s) {
+            return ProviderErrorClass::TransientNetwork;
+        }
+        return ProviderErrorClass::TransientUpstream;
+    }
+    ProviderErrorClass::Unclassified
+}
+
 fn anthropic_inference_config(req: &MessagesRequest) -> Option<InferenceConfig> {
     let max_tokens = (req.max_tokens > 0).then_some(req.max_tokens);
     let temperature = req.temperature.filter(|v| *v > 0.0);
@@ -556,6 +613,72 @@ pub(crate) fn truncate_payload_to_body_limit(
     }))
 }
 
+/// [`serialize_and_fit_body`] 的失败分类。
+///
+/// 保持协议中立：caller 各自把它映射到自己的 error-response 类型
+/// （Anthropic `ErrorResponse` / OpenAI `OpenAIErrorResponse`），
+/// `TooLarge` 携带 body 回传以支持 anthropic 侧的 sensitive-logs 诊断。
+pub(crate) enum BodyFitError {
+    /// 序列化失败（初次或截断后重序列化）。
+    Serialize(serde_json::Error),
+    /// 安全截断后仍超过上游硬限制。
+    TooLarge {
+        body: String,
+        bytes: usize,
+        limit: usize,
+    },
+}
+
+/// 序列化 Kiro 请求体并使其满足上游硬性大小限制。
+///
+/// serialize → (超限则)安全截断历史 → recheck 的公共管道，
+/// Anthropic 与 OpenAI 两条 prepare 路径共用，避免大小限制逻辑漂移（ER-2）。
+/// `log_label` 仅用于截断成功时的 operator 日志前缀（非协议可观测）。
+pub(crate) fn serialize_and_fit_body(
+    kiro_request: &mut KiroRequest,
+    max_body: usize,
+    has_system_priming: bool,
+    log_label: &str,
+) -> Result<String, BodyFitError> {
+    let mut request_body = serde_json::to_string(kiro_request).map_err(BodyFitError::Serialize)?;
+
+    // 请求体大小预检（上游存在硬性请求体大小限制；按实际序列化后的总字节数判断）
+    if max_body > 0 && request_body.len() > max_body {
+        match truncate_payload_to_body_limit(
+            kiro_request,
+            max_body,
+            &mut request_body,
+            has_system_priming,
+        ) {
+            Ok(Some(outcome)) => {
+                tracing::warn!(
+                    conversation_id = kiro_request.conversation_state.conversation_id.as_str(),
+                    initial_bytes = outcome.initial_bytes,
+                    final_bytes = outcome.final_bytes,
+                    threshold = max_body,
+                    removed_history_messages = outcome.removed_history_messages,
+                    inserted_placeholder = outcome.inserted_placeholder,
+                    "{}请求体超过阈值，已按安全截断策略截断历史",
+                    log_label
+                );
+            }
+            Ok(None) => {}
+            Err(e) => return Err(BodyFitError::Serialize(e)),
+        }
+    }
+
+    // 安全截断后仍超限，说明当前消息/工具/图片本身已超过上游限制。
+    if max_body > 0 && request_body.len() > max_body {
+        return Err(BodyFitError::TooLarge {
+            bytes: request_body.len(),
+            limit: max_body,
+            body: request_body,
+        });
+    }
+
+    Ok(request_body)
+}
+
 fn system_priming_count(history: &[KiroMessage]) -> usize {
     if history.len() < 2 {
         return 0;
@@ -632,111 +755,111 @@ fn truncate_string_to_byte_budget(content: &mut String, budget: usize) {
 }
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
+///
+/// 分类走共享的 [`classify_provider_error`]，本函数只负责 Anthropic 风格的渲染
+/// （body/日志/状态码）——与 OpenAI 侧的渲染差异是有意的（见 `ProviderErrorClass`）。
 fn map_kiro_provider_error_to_response(request_body: &str, err: Error) -> Response {
-    if is_input_too_long_error(&err) {
-        tracing::warn!(
-            kiro_request_body_bytes = request_body.len(),
-            error = %err,
-            "上游拒绝请求：输入上下文过长（不应重试）"
-        );
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "invalid_request_error",
-                "Input is too long (CONTENT_LENGTH_EXCEEDS_THRESHOLD). Reduce conversation history/system/tools; retrying the same request will not help.",
-            )),
-        )
-            .into_response();
-    }
-
-    if is_improperly_formed_request_error(&err) {
-        tracing::warn!(
-            error = %err,
-            kiro_request_body_bytes = request_body.len(),
-            "上游拒绝请求：请求格式错误（可能由超大请求体、消息/工具序列异常或空内容块导致）"
-        );
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "invalid_request_error",
-                "Improperly formed request. This is often caused by oversized payloads, malformed message/tool sequences, or empty content blocks.",
-            )),
-        )
-            .into_response();
-    }
-
-    if is_no_credentials_error(&err) {
-        tracing::error!(error = %err, "没有可用的凭据");
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse::new(
-                "service_unavailable",
-                "No credentials available. Please add or enable credentials via Admin API or credentials.json.",
-            )),
-        )
-            .into_response();
-    }
-
-    if is_credential_queue_timeout_error(&err) {
-        tracing::warn!(error = %err, "凭据队列等待超时（per-credential 并发已满）");
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(ErrorResponse::new(
-                "overloaded_error",
-                "All credentials are busy. Please retry shortly.",
-            )),
-        )
-            .into_response();
-    }
-
-    if is_quota_exhausted_error(&err) {
-        tracing::warn!(error = %err, "所有凭据配额已耗尽");
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(ErrorResponse::new(
-                "rate_limit_error",
-                "All credentials quota exhausted. Please wait for quota reset or add new credentials.",
-            )),
-        )
-            .into_response();
-    }
-
-    if is_transient_upstream_error(&err) {
-        let err_str = err.to_string().to_lowercase();
-        if is_network_error(&err_str) {
+    match classify_provider_error(&err) {
+        ProviderErrorClass::InputTooLong => {
+            tracing::warn!(
+                kiro_request_body_bytes = request_body.len(),
+                error = %err,
+                "上游拒绝请求：输入上下文过长（不应重试）"
+            );
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(
+                    "invalid_request_error",
+                    "Input is too long (CONTENT_LENGTH_EXCEEDS_THRESHOLD). Reduce conversation history/system/tools; retrying the same request will not help.",
+                )),
+            )
+                .into_response()
+        }
+        ProviderErrorClass::ImproperlyFormed => {
+            tracing::warn!(
+                error = %err,
+                kiro_request_body_bytes = request_body.len(),
+                "上游拒绝请求：请求格式错误（可能由超大请求体、消息/工具序列异常或空内容块导致）"
+            );
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(
+                    "invalid_request_error",
+                    "Improperly formed request. This is often caused by oversized payloads, malformed message/tool sequences, or empty content blocks.",
+                )),
+            )
+                .into_response()
+        }
+        ProviderErrorClass::NoCredentials => {
+            tracing::error!(error = %err, "没有可用的凭据");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse::new(
+                    "service_unavailable",
+                    "No credentials available. Please add or enable credentials via Admin API or credentials.json.",
+                )),
+            )
+                .into_response()
+        }
+        ProviderErrorClass::QueueTimeout => {
+            tracing::warn!(error = %err, "凭据队列等待超时（per-credential 并发已满）");
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(ErrorResponse::new(
+                    "overloaded_error",
+                    "All credentials are busy. Please retry shortly.",
+                )),
+            )
+                .into_response()
+        }
+        ProviderErrorClass::QuotaExhausted => {
+            tracing::warn!(error = %err, "所有凭据配额已耗尽");
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(ErrorResponse::new(
+                    "rate_limit_error",
+                    "All credentials quota exhausted. Please wait for quota reset or add new credentials.",
+                )),
+            )
+                .into_response()
+        }
+        ProviderErrorClass::TransientNetwork => {
             tracing::warn!(error = %err, "上游网络错误，不输出请求体");
-            return (
+            (
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse::new(
                     "api_error",
                     format!("上游网络错误: {}", err),
                 )),
             )
-                .into_response();
+                .into_response()
         }
-        tracing::warn!(error = %err, "上游瞬态错误（429/5xx），不输出请求体");
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(ErrorResponse::new("rate_limit_error", err.to_string())),
-        )
-            .into_response();
+        ProviderErrorClass::TransientUpstream => {
+            tracing::warn!(error = %err, "上游瞬态错误（429/5xx），不输出请求体");
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(ErrorResponse::new("rate_limit_error", err.to_string())),
+            )
+                .into_response()
+        }
+        ProviderErrorClass::Unclassified => {
+            tracing::error!("Kiro API 调用失败: {}", err);
+            #[cfg(feature = "sensitive-logs")]
+            tracing::error!(
+                request_body_bytes = request_body.len(),
+                "上游报错，请求体大小: {} bytes",
+                request_body.len()
+            );
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse::new(
+                    "api_error",
+                    format!("上游 API 调用失败: {}", err),
+                )),
+            )
+                .into_response()
+        }
     }
-
-    tracing::error!("Kiro API 调用失败: {}", err);
-    #[cfg(feature = "sensitive-logs")]
-    tracing::error!(
-        request_body_bytes = request_body.len(),
-        "上游报错，请求体大小: {} bytes",
-        request_body.len()
-    );
-    (
-        StatusCode::BAD_GATEWAY,
-        Json(ErrorResponse::new(
-            "api_error",
-            format!("上游 API 调用失败: {}", err),
-        )),
-    )
-        .into_response()
 }
 
 /// 对日志/审计中的 user_id 做脱敏
@@ -1154,9 +1277,15 @@ fn prepare_request(
         profile_arn: None,
     };
 
-    let mut request_body = match serde_json::to_string(&kiro_request) {
+    let max_body = compression.max_request_body_bytes;
+    let request_body = match serialize_and_fit_body(
+        &mut kiro_request,
+        max_body,
+        has_system_priming,
+        "",
+    ) {
         Ok(body) => body,
-        Err(e) => {
+        Err(BodyFitError::Serialize(e)) => {
             tracing::error!("序列化请求失败: {}", e);
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1167,69 +1296,33 @@ fn prepare_request(
             )
                 .into_response());
         }
-    };
-
-    // 请求体大小预检（上游存在硬性请求体大小限制；按实际序列化后的总字节数判断）
-    let max_body = compression.max_request_body_bytes;
-    if max_body > 0 && request_body.len() > max_body {
-        match truncate_payload_to_body_limit(
-            &mut kiro_request,
-            max_body,
-            &mut request_body,
-            has_system_priming,
-        ) {
-            Ok(Some(outcome)) => {
-                tracing::warn!(
-                    conversation_id = kiro_request.conversation_state.conversation_id.as_str(),
-                    initial_bytes = outcome.initial_bytes,
-                    final_bytes = outcome.final_bytes,
-                    threshold = max_body,
-                    removed_history_messages = outcome.removed_history_messages,
-                    inserted_placeholder = outcome.inserted_placeholder,
-                    "请求体超过阈值，已按安全截断策略截断历史"
-                );
-            }
-            Ok(None) => {}
-            Err(e) => {
-                tracing::error!("安全截断策略历史截断序列化失败: {}", e);
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
+        Err(BodyFitError::TooLarge { body, bytes, limit }) => {
+            tracing::warn!(
+                conversation_id = kiro_request.conversation_state.conversation_id.as_str(),
+                request_body_bytes = bytes,
+                threshold = limit,
+                "安全截断策略执行后请求体仍超过安全阈值，拒绝发送"
+            );
+            #[cfg(feature = "sensitive-logs")]
+            tracing::error!(
+                "安全截断策略执行后仍超限，完整请求体（用于诊断）: {}",
+                truncate_base64_in_request_body(&body)
+            );
+            #[cfg(not(feature = "sensitive-logs"))]
+            let _ = &body;
+            return Err((
+                    StatusCode::BAD_REQUEST,
                     Json(ErrorResponse::new(
-                        "internal_error",
-                        format!("序列化请求失败: {}", e),
+                        "invalid_request_error",
+                        format!(
+                            "Request too large ({} bytes total; limit {}). Reduce current message/tool output or number/size of images.",
+                            bytes, limit
+                        ),
                     )),
                 )
                     .into_response());
-            }
         }
-    }
-
-    // 安全截断后仍超限，说明当前消息/工具/图片本身已超过上游限制。
-    if max_body > 0 && request_body.len() > max_body {
-        tracing::warn!(
-            conversation_id = kiro_request.conversation_state.conversation_id.as_str(),
-            request_body_bytes = request_body.len(),
-            threshold = max_body,
-            "安全截断策略执行后请求体仍超过安全阈值，拒绝发送"
-        );
-        #[cfg(feature = "sensitive-logs")]
-        tracing::error!(
-            "安全截断策略执行后仍超限，完整请求体（用于诊断）: {}",
-            truncate_base64_in_request_body(&request_body)
-        );
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "invalid_request_error",
-                format!(
-                    "Request too large ({} bytes total; limit {}). Reduce current message/tool output or number/size of images.",
-                    request_body.len(),
-                    max_body
-                ),
-            )),
-        )
-            .into_response());
-    }
+    };
 
     tracing::debug!(
         kiro_request_body_bytes = request_body.len(),
@@ -1684,6 +1777,29 @@ fn create_ping_sse() -> Bytes {
     Bytes::from("event: ping\ndata: {\"type\": \"ping\"}\n\n")
 }
 
+/// 流式上游结束时的 permit 释放 + credit 结算不变式。
+///
+/// 占用语义 = 一次上游来回，与客户端消费速度解耦：上游 body 一旦结束（正常或异常），
+/// 三个 permit（credential/global/proxy）必须一起释放，且若本次有 metering 用量则提交给
+/// token manager。三条流式循环（Anthropic / OpenAI chat / OpenAI responses）的 6 处收尾
+/// 共用此不变式（ER-1）。调用方先各自读出 `metering_usage`（field 或 method 访问差异留在外层），
+/// record_api_key_usage / 最终事件生成的时序仍由各 caller 保留，helper 不介入。
+pub(crate) fn settle_stream_permits(
+    tm: &crate::kiro::token_manager::MultiTokenManager,
+    credential_id: u64,
+    cred_permit: Option<OwnedSemaphorePermit>,
+    glb_permit: Option<OwnedSemaphorePermit>,
+    proxy_permit: Option<OwnedSemaphorePermit>,
+    metering_usage: Option<f64>,
+) {
+    drop(cred_permit);
+    drop(glb_permit);
+    drop(proxy_permit);
+    if let Some(usage) = metering_usage {
+        tm.apply_credit_usage(credential_id, usage);
+    }
+}
+
 /// 创建 SSE 事件流
 fn create_sse_stream(
     response: reqwest::Response,
@@ -1764,12 +1880,7 @@ fn create_sse_stream(
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
                             // 上游异常结束 → 立即释放 permit（占用语义 = 一次上游来回，不绑客户端消费速度）
-                            drop(cred_permit);
-                            drop(glb_permit);
-                            drop(proxy_permit);
-                            if let Some(m) = ctx.metering.as_ref() {
-                                tm.apply_credit_usage(credential_id, m.usage);
-                            }
+                            settle_stream_permits(&tm, credential_id, cred_permit, glb_permit, proxy_permit, ctx.metering.as_ref().map(|m| m.usage));
                             app_state.record_gateway_failure();
                             let final_events = ctx.generate_error_events(e.to_string());
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
@@ -1780,12 +1891,7 @@ fn create_sse_stream(
                         }
                         None => {
                             // 上游正常结束 → 立即释放 permit
-                            drop(cred_permit);
-                            drop(glb_permit);
-                            drop(proxy_permit);
-                            if let Some(m) = ctx.metering.as_ref() {
-                                tm.apply_credit_usage(credential_id, m.usage);
-                            }
+                            settle_stream_permits(&tm, credential_id, cred_permit, glb_permit, proxy_permit, ctx.metering.as_ref().map(|m| m.usage));
                             let final_events = ctx.generate_final_events();
                             let credits = ctx.metering.as_ref().map(|m| m.usage).unwrap_or(0.0);
                             let tokens = i64::from(ctx.final_input_tokens())

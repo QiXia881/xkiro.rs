@@ -137,6 +137,23 @@ pub(crate) fn q_rest_host_for_region(region: &str) -> String {
     format!("q.{}.amazonaws.com", region)
 }
 
+/// 为流式请求（API / MCP）追加 tokenType 相关头
+///
+/// API_KEY 凭据需要小写 `tokentype`，EXTERNAL_IDP 凭据需要首字母大写 `TokenType`。
+/// IDE 与 CodeWhisperer 端点的追加逻辑与顺序完全一致，抽取到此避免重复。
+pub(crate) fn apply_stream_token_type_headers(
+    mut req: RequestBuilder,
+    credentials: &KiroCredentials,
+) -> RequestBuilder {
+    if credentials.is_api_key_credential() {
+        req = req.header("tokentype", "API_KEY");
+    }
+    if credentials.is_external_idp_credential() {
+        req = req.header("TokenType", "EXTERNAL_IDP");
+    }
+    req
+}
+
 /// 默认的 MONTHLY_REQUEST_COUNT 判断逻辑
 ///
 /// 同时识别顶层 `reason` 字段和嵌套 `error.reason` 字段。

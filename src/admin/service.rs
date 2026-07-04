@@ -18,7 +18,7 @@ use crate::kiro::endpoint::{
     AMAZONQ_ENDPOINT_NAME, CLI_ENDPOINT_NAME, CODEWHISPERER_ENDPOINT_NAME, IDE_ENDPOINT_NAME,
 };
 use crate::kiro::machine_id;
-use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::model::credentials::{CredentialSourceMetadata, KiroCredentials};
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::{InferenceConfig, KiroRequest};
 use crate::kiro::model::usage_limits::{UsageLimitsResponse, normalize_subscription_type};
@@ -32,7 +32,7 @@ use crate::model::config::{
     CompressionConfig, CredentialMachineIdStrategy, PromptFilterConfig, SystemPromptPosition,
     UserPreset,
 };
-use crate::model::runtime::SharedPromptConfig;
+use crate::model::runtime::{SharedModelMappingConfig, SharedPromptConfig};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
@@ -57,20 +57,21 @@ use super::types::{
     CredentialsStatusResponse, EndpointConfigResponse, GenerateMachineIdResponse,
     GlobalConfigResponse, ImportCredentialRecordRequest, ImportCredentialsRequest,
     ImportCredentialsResponse, ImportSsoTokenRequest, ImportSsoTokenResponse,
-    PollBuilderIdLoginResponse, PollIdcLoginResponse, PollKiroSsoLoginResponse,
-    PollSocialLoginResponse, PresetItem, PromptFilterConfigResponse, PromptFilterRuleDto,
-    ProxyAutoAssignRequest, ProxyAutoAssignResponse, ProxyConfigResponse, ProxyImportRequest,
-    ProxyImportResponse, ProxyItem, ProxyListResponse, ProxyTestResponse, ProxyUpsertRequest,
-    ProxyUrlConfigResponse, RequestLogsResponse, RuntimeBalanceSnapshot, RuntimeStatsItem,
-    RuntimeStatsResponse, SetCredentialProxyByRegionRequest, SsoTokenImportResultItem,
-    StartBuilderIdLoginRequest, StartBuilderIdLoginResponse, StartIamSsoLoginResponse,
-    StartIdcLoginRequest, StartIdcLoginResponse, StartKiroSsoLoginRequest,
-    StartKiroSsoLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse, StatsResponse,
-    SystemPromptResponse, SystemStatusResponse, ThinkingConfigResponse,
-    UpdateAccessSettingsRequest, UpdateApiKeyRequest, UpdateCommonConfigRequest,
-    UpdateCompressionConfigRequest, UpdateEndpointConfigRequest, UpdateGlobalConfigRequest,
-    UpdatePromptFilterConfigRequest, UpdateProxyConfigRequest, UpdateSystemPromptRequest,
-    UpdateThinkingConfigRequest, UpsertUserPresetRequest, VersionResponse,
+    ModelMappingsResponse, PollBuilderIdLoginResponse, PollIdcLoginResponse,
+    PollKiroSsoLoginResponse, PollSocialLoginResponse, PresetItem, PromptFilterConfigResponse,
+    PromptFilterRuleDto, ProxyAutoAssignRequest, ProxyAutoAssignResponse, ProxyConfigResponse,
+    ProxyImportRequest, ProxyImportResponse, ProxyItem, ProxyListResponse, ProxyTestResponse,
+    ProxyUpsertRequest, ProxyUrlConfigResponse, RequestLogsResponse, RuntimeBalanceSnapshot,
+    RuntimeStatsItem, RuntimeStatsResponse, SetCredentialProxyByRegionRequest,
+    SsoTokenImportResultItem, StartBuilderIdLoginRequest, StartBuilderIdLoginResponse,
+    StartIamSsoLoginResponse, StartIdcLoginRequest, StartIdcLoginResponse,
+    StartKiroSsoLoginRequest, StartKiroSsoLoginResponse, StartSocialLoginRequest,
+    StartSocialLoginResponse, StatsResponse, SystemPromptResponse, SystemStatusResponse,
+    ThinkingConfigResponse, UpdateAccessSettingsRequest, UpdateApiKeyRequest,
+    UpdateCommonConfigRequest, UpdateCompressionConfigRequest, UpdateEndpointConfigRequest,
+    UpdateGlobalConfigRequest, UpdateModelMappingsRequest, UpdatePromptFilterConfigRequest,
+    UpdateProxyConfigRequest, UpdateSystemPromptRequest, UpdateThinkingConfigRequest,
+    UpsertUserPresetRequest, VersionResponse,
 };
 use crate::kiro::token_manager::{CachedBalanceInfo, CredentialEntrySnapshot};
 
@@ -240,6 +241,8 @@ pub struct AdminService {
     admin_api_key_runtime: Arc<RwLock<String>>,
     /// 共享提示过滤配置，与 AppState 同源（运行时热更新）
     prompt_filter_config: Arc<RwLock<PromptFilterConfig>>,
+    /// 用户模型映射运行时（共享引用，OpenAI 路径 OVERRIDE 层，支持热更新）
+    model_mapping_config: SharedModelMappingConfig,
     /// 共享 thinking 配置，与 AppState 同源（运行时热更新）
     thinking_config: Arc<RwLock<ThinkingRuntimeConfig>>,
     /// Prompt Cache 运行时（共享引用，支持 ttl/accounting 热更新）
@@ -284,6 +287,7 @@ impl AdminService {
         require_api_key_runtime: Arc<std::sync::atomic::AtomicBool>,
         admin_api_key_runtime: Arc<RwLock<String>>,
         prompt_filter_config: Arc<RwLock<PromptFilterConfig>>,
+        model_mapping_config: SharedModelMappingConfig,
         thinking_config: Arc<RwLock<ThinkingRuntimeConfig>>,
         prompt_cache_runtime: Arc<RwLock<PromptCacheRuntime>>,
         prompt_runtime: SharedPromptConfig,
@@ -305,6 +309,7 @@ impl AdminService {
             require_api_key_runtime,
             admin_api_key_runtime,
             prompt_filter_config,
+            model_mapping_config,
             thinking_config,
             prompt_cache_runtime,
             prompt_runtime,
@@ -875,10 +880,12 @@ impl AdminService {
             ));
         }
         let export_id = credentials
+            .meta
             .source_account_id
             .clone()
             .unwrap_or_else(|| id.to_string());
         let nickname = credentials
+            .meta
             .nickname
             .clone()
             .or_else(|| credentials.email.clone())
@@ -913,36 +920,41 @@ impl AdminService {
             sso_session_id: credentials.sso_session_id.clone(),
             proxy_url: entry.proxy_url.clone(),
             proxy_id: entry.proxy_id,
-            overage_status: credentials.overage_status.clone(),
-            overage_capability: credentials.overage_capability.clone(),
-            overage_cap: credentials.overage_cap.unwrap_or_default(),
-            overage_rate: credentials.overage_rate.unwrap_or_default(),
-            current_overages: credentials.current_overages.unwrap_or_default(),
-            overage_checked_at: credentials.overage_checked_at.unwrap_or_default(),
+            overage_status: credentials.meta.overage_status.clone(),
+            overage_capability: credentials.meta.overage_capability.clone(),
+            overage_cap: credentials.meta.overage_cap.unwrap_or_default(),
+            overage_rate: credentials.meta.overage_rate.unwrap_or_default(),
+            current_overages: credentials.meta.current_overages.unwrap_or_default(),
+            overage_checked_at: credentials.meta.overage_checked_at.unwrap_or_default(),
             enabled: !entry.disabled,
-            ban_status: credentials.ban_status.clone(),
-            ban_reason: credentials.ban_reason.clone(),
-            ban_time: credentials.ban_time.unwrap_or_default(),
-            subscription_type: credentials.subscription_type.clone(),
-            subscription_title: credentials.subscription_title.clone(),
-            days_remaining: credentials.days_remaining.unwrap_or_default(),
-            usage_current: credentials.usage_current.unwrap_or_default(),
-            usage_limit: credentials.usage_limit.unwrap_or_default(),
-            usage_percent: credentials.usage_percent.unwrap_or_default(),
-            next_reset_date: credentials.next_reset_date.clone(),
-            last_refresh: credentials.last_refresh.unwrap_or_default(),
-            trial_usage_current: credentials.trial_usage_current.unwrap_or_default(),
-            trial_usage_limit: credentials.trial_usage_limit.unwrap_or_default(),
-            trial_usage_percent: credentials.trial_usage_percent.unwrap_or_default(),
-            trial_status: credentials.trial_status.clone(),
-            trial_expires_at: credentials.trial_expires_at.unwrap_or_default(),
-            request_count: credentials.request_count.unwrap_or(entry.success_count),
+            ban_status: credentials.meta.ban_status.clone(),
+            ban_reason: credentials.meta.ban_reason.clone(),
+            ban_time: credentials.meta.ban_time.unwrap_or_default(),
+            subscription_type: credentials.meta.subscription_type.clone(),
+            subscription_title: credentials.meta.subscription_title.clone(),
+            days_remaining: credentials.meta.days_remaining.unwrap_or_default(),
+            usage_current: credentials.meta.usage_current.unwrap_or_default(),
+            usage_limit: credentials.meta.usage_limit.unwrap_or_default(),
+            usage_percent: credentials.meta.usage_percent.unwrap_or_default(),
+            next_reset_date: credentials.meta.next_reset_date.clone(),
+            last_refresh: credentials.meta.last_refresh.unwrap_or_default(),
+            trial_usage_current: credentials.meta.trial_usage_current.unwrap_or_default(),
+            trial_usage_limit: credentials.meta.trial_usage_limit.unwrap_or_default(),
+            trial_usage_percent: credentials.meta.trial_usage_percent.unwrap_or_default(),
+            trial_status: credentials.meta.trial_status.clone(),
+            trial_expires_at: credentials.meta.trial_expires_at.unwrap_or_default(),
+            request_count: credentials
+                .meta
+                .request_count
+                .unwrap_or(entry.success_count),
             error_count: credentials
+                .meta
                 .error_count
                 .unwrap_or(entry.failure_count as u64),
-            total_tokens: credentials.total_tokens.unwrap_or_default(),
-            total_credits: credentials.total_credits.unwrap_or_default(),
+            total_tokens: credentials.meta.total_tokens.unwrap_or_default(),
+            total_credits: credentials.meta.total_credits.unwrap_or_default(),
             last_used: credentials
+                .meta
                 .last_used_at
                 .or_else(|| Self::rfc3339_seconds_opt(entry.last_used_at.as_deref()))
                 .unwrap_or_default(),
@@ -1348,9 +1360,6 @@ impl AdminService {
             api_region: req.api_region,
             machine_id: req.machine_id,
             email: req.email,
-            subscription_title: None, // 将在首次获取使用额度时自动更新
-            overage_status: None,
-            allow_overage_import: false,
             proxy_url: req.proxy_url,
             proxy_username: req.proxy_username,
             proxy_password: req.proxy_password,
@@ -1359,7 +1368,13 @@ impl AdminService {
             api_key: req.api_key,
             endpoint: req.endpoint,
             concurrency: req.concurrency,
-            ..Default::default()
+            meta: CredentialSourceMetadata {
+                subscription_title: None,
+                // 将在首次获取使用额度时自动更新
+                overage_status: None,
+                allow_overage_import: false,
+                ..Default::default()
+            },
         };
         self.assign_machine_id_for_new_credential(&mut new_cred)?;
         self.assign_proxy_before_validation(&mut new_cred)?;
@@ -1406,7 +1421,7 @@ impl AdminService {
         let api_region = Self::clean_import_string(req.api_region);
         let user_id = Self::clean_import_string(req.user_id);
         let mut email = Self::clean_import_string(req.email);
-        let profile_arn = Self::clean_import_string(req.profile_arn);
+        let mut profile_arn = Self::clean_import_string(req.profile_arn);
         let proxy_url = Self::clean_import_string(req.proxy_url);
         let proxy_username = Self::clean_import_string(req.proxy_username);
         let proxy_password = Self::clean_import_string(req.proxy_password);
@@ -1495,6 +1510,7 @@ impl AdminService {
             })?)
         };
         let provider = Self::normalize_provider_for_auth_method(provider, &auth_method);
+        profile_arn = KiroCredentials::clean_profile_arn(profile_arn);
         let source_account_id = Self::clean_import_string(req.source_account_id)
             .or_else(|| Self::credential_record_import_source_id(req.id.as_ref()));
 
@@ -1524,51 +1540,6 @@ impl AdminService {
             api_region,
             machine_id: Self::clean_import_string(req.machine_id),
             email,
-            source_account_id,
-            label: Self::clean_import_string(req.label),
-            status: Self::clean_import_string(req.status),
-            added_at: Self::clean_import_string(req.added_at),
-            password: Self::clean_import_string(req.password),
-            subscription_title: Self::clean_import_string(req.subscription_title),
-            overage_status,
-            usage_data: req.usage_data,
-            group_id: Self::clean_import_string(req.group_id),
-            tag_links: req.tag_links,
-            available_models_cache: req.available_models_cache,
-            failure_count: req.failure_count,
-            last_failure_at: Self::clean_import_string(req.last_failure_at),
-            disabled_reason: Self::clean_import_string(req.disabled_reason),
-            success_count: req.success_count,
-            csrf_token: Self::clean_import_string(req.csrf_token),
-            nickname: Self::clean_import_string(req.nickname),
-            ban_status: Self::clean_import_string(req.ban_status),
-            ban_reason: Self::clean_import_string(req.ban_reason),
-            ban_time: req.ban_time,
-            subscription_type: Self::clean_import_string(req.subscription_type),
-            days_remaining: req.days_remaining,
-            usage_current: req.usage_current,
-            usage_limit: req.usage_limit,
-            usage_percent: req.usage_percent,
-            next_reset_date: Self::clean_import_string(req.next_reset_date),
-            last_refresh: req.last_refresh,
-            trial_usage_current: req.trial_usage_current,
-            trial_usage_limit: req.trial_usage_limit,
-            trial_usage_percent: req.trial_usage_percent,
-            trial_status: Self::clean_import_string(req.trial_status),
-            trial_expires_at: req.trial_expires_at,
-            overage_capability: Self::clean_import_string(req.overage_capability),
-            overage_cap: req.overage_cap,
-            overage_rate: req.overage_rate,
-            current_overages: req.current_overages,
-            overage_checked_at: req.overage_checked_at,
-            request_count: req.request_count,
-            error_count: req.error_count,
-            total_tokens: req.total_tokens,
-            total_credits: req.total_credits,
-            last_used_at: req.last_used_at,
-            created_at: req.created_at,
-            tags: req.tags,
-            allow_overage_import: false,
             proxy_url,
             proxy_username,
             proxy_password,
@@ -1576,7 +1547,54 @@ impl AdminService {
             disabled,
             api_key,
             endpoint,
-            ..Default::default()
+            meta: CredentialSourceMetadata {
+                source_account_id,
+                label: Self::clean_import_string(req.label),
+                status: Self::clean_import_string(req.status),
+                added_at: Self::clean_import_string(req.added_at),
+                password: Self::clean_import_string(req.password),
+                subscription_title: Self::clean_import_string(req.subscription_title),
+                overage_status,
+                usage_data: req.usage_data,
+                group_id: Self::clean_import_string(req.group_id),
+                tag_links: req.tag_links,
+                available_models_cache: req.available_models_cache,
+                failure_count: req.failure_count,
+                last_failure_at: Self::clean_import_string(req.last_failure_at),
+                disabled_reason: Self::clean_import_string(req.disabled_reason),
+                success_count: req.success_count,
+                csrf_token: Self::clean_import_string(req.csrf_token),
+                nickname: Self::clean_import_string(req.nickname),
+                ban_status: Self::clean_import_string(req.ban_status),
+                ban_reason: Self::clean_import_string(req.ban_reason),
+                ban_time: req.ban_time,
+                subscription_type: Self::clean_import_string(req.subscription_type),
+                days_remaining: req.days_remaining,
+                usage_current: req.usage_current,
+                usage_limit: req.usage_limit,
+                usage_percent: req.usage_percent,
+                next_reset_date: Self::clean_import_string(req.next_reset_date),
+                last_refresh: req.last_refresh,
+                trial_usage_current: req.trial_usage_current,
+                trial_usage_limit: req.trial_usage_limit,
+                trial_usage_percent: req.trial_usage_percent,
+                trial_status: Self::clean_import_string(req.trial_status),
+                trial_expires_at: req.trial_expires_at,
+                overage_capability: Self::clean_import_string(req.overage_capability),
+                overage_cap: req.overage_cap,
+                overage_rate: req.overage_rate,
+                current_overages: req.current_overages,
+                overage_checked_at: req.overage_checked_at,
+                request_count: req.request_count,
+                error_count: req.error_count,
+                total_tokens: req.total_tokens,
+                total_credits: req.total_credits,
+                last_used_at: req.last_used_at,
+                created_at: req.created_at,
+                tags: req.tags,
+                allow_overage_import: false,
+                ..Default::default()
+            },
         };
 
         let mut trusted_on_import = false;
@@ -3310,6 +3328,32 @@ impl AdminService {
         }
     }
 
+    /// 获取用户模型映射规则（仅 OpenAI 路径生效）
+    pub fn get_model_mappings(&self) -> ModelMappingsResponse {
+        ModelMappingsResponse {
+            rules: self.model_mapping_config.read().rules().to_vec(),
+        }
+    }
+
+    /// 更新用户模型映射规则（全量替换；持久化到 config.json 后同步运行时）
+    pub async fn update_model_mappings(
+        &self,
+        req: UpdateModelMappingsRequest,
+    ) -> Result<ModelMappingsResponse, AdminServiceError> {
+        let rules = req.rules;
+
+        self.token_manager.with_config_mut(|cfg| {
+            cfg.model_mappings = rules.clone();
+            cfg.save()
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))
+        })?;
+
+        // 持久化成功 → 同步运行时（丢弃旧轮询计数器）
+        self.model_mapping_config.write().replace(rules);
+
+        Ok(self.get_model_mappings())
+    }
+
     /// 更新系统提示注入配置（部分字段更新；持久化到 config.json）
     pub fn update_system_prompt(
         &self,
@@ -3562,11 +3606,12 @@ impl AdminService {
             })
             .unwrap_or_else(|| "BuilderId".to_string());
         let id = credential
+            .meta
             .source_account_id
             .clone()
             .or_else(|| credential.id.map(|id| id.to_string()))
             .unwrap_or_default();
-        let status = credential.status.clone().unwrap_or_else(|| {
+        let status = credential.meta.status.clone().unwrap_or_else(|| {
             if enabled {
                 "active".to_string()
             } else {
@@ -3577,13 +3622,13 @@ impl AdminService {
         CredentialSnapshotExportItem {
             id,
             email: credential.email.unwrap_or_default(),
-            nickname: credential.nickname.unwrap_or_default(),
+            nickname: credential.meta.nickname.unwrap_or_default(),
             provider,
             user_id: credential.user_id,
             machine_id: credential.machine_id,
             credentials: CredentialExportMaterial {
                 access_token: credential.access_token.unwrap_or_default(),
-                csrf_token: credential.csrf_token.unwrap_or_default(),
+                csrf_token: credential.meta.csrf_token.unwrap_or_default(),
                 refresh_token: credential.refresh_token.unwrap_or_default(),
                 client_id: credential.client_id,
                 client_secret: credential.client_secret,
@@ -3595,22 +3640,23 @@ impl AdminService {
             subscription: CredentialSnapshotExportSubscription {
                 subscription_type: Self::credential_export_subscription_type(
                     credential
+                        .meta
                         .subscription_type
                         .as_deref()
-                        .or(credential.subscription_title.as_deref()),
+                        .or(credential.meta.subscription_title.as_deref()),
                 ),
-                title: credential.subscription_title,
+                title: credential.meta.subscription_title,
             },
             usage: CredentialSnapshotExportUsage {
-                current: credential.usage_current.unwrap_or_default(),
-                limit: credential.usage_limit.unwrap_or_default(),
-                percent_used: credential.usage_percent.unwrap_or_default(),
-                last_updated: credential.last_refresh.unwrap_or(now),
+                current: credential.meta.usage_current.unwrap_or_default(),
+                limit: credential.meta.usage_limit.unwrap_or_default(),
+                percent_used: credential.meta.usage_percent.unwrap_or_default(),
+                last_updated: credential.meta.last_refresh.unwrap_or(now),
             },
-            tags: Self::credential_export_tags(credential.tags.as_ref()),
+            tags: Self::credential_export_tags(credential.meta.tags.as_ref()),
             status,
-            created_at: credential.created_at.unwrap_or(now),
-            last_used_at: credential.last_used_at.unwrap_or(now),
+            created_at: credential.meta.created_at.unwrap_or(now),
+            last_used_at: credential.meta.last_used_at.unwrap_or(now),
         }
     }
 
@@ -3892,14 +3938,14 @@ impl AdminService {
             email: credential.email.clone(),
             user_id: credential.user_id.clone(),
             machine_id: credential.machine_id.clone(),
-            group_id: credential.group_id.clone(),
-            tag_links: credential.tag_links.clone(),
-            has_usage_data: credential.usage_data.is_some(),
-            has_available_models_cache: credential.available_models_cache.is_some(),
-            source_failure_count: credential.failure_count,
-            source_last_failure_at: credential.last_failure_at.clone(),
-            source_disabled_reason: credential.disabled_reason.clone(),
-            source_success_count: credential.success_count,
+            group_id: credential.meta.group_id.clone(),
+            tag_links: credential.meta.tag_links.clone(),
+            has_usage_data: credential.meta.usage_data.is_some(),
+            has_available_models_cache: credential.meta.available_models_cache.is_some(),
+            source_failure_count: credential.meta.failure_count,
+            source_last_failure_at: credential.meta.last_failure_at.clone(),
+            source_disabled_reason: credential.meta.disabled_reason.clone(),
+            source_success_count: credential.meta.success_count,
             region: credential.region.clone(),
             auth_region: credential.auth_region.clone(),
             api_region: credential.api_region.clone(),
@@ -3911,7 +3957,7 @@ impl AdminService {
             scopes: credential.scopes.clone(),
             endpoint: credential.endpoint.clone(),
             will_refresh: false,
-            has_profile_arn: Self::has_import_string(&credential.profile_arn),
+            has_profile_arn: credential.profile_arn_trimmed().is_some(),
             has_token: Self::has_import_string(&credential.access_token),
             has_refresh_token: Self::has_import_string(&credential.refresh_token),
             has_client_id: Self::has_import_string(&credential.client_id),
@@ -4216,69 +4262,6 @@ impl AdminService {
             api_region: Self::get_clean_string(object, &["apiRegion", "api_region"]),
             machine_id: Self::get_clean_string(object, &["machineId", "machine_id"]),
             email: Self::get_clean_string(object, &["email"]),
-            source_account_id: Self::get_import_source_id(object),
-            label: Self::get_clean_string(object, &["label"]),
-            status: Self::get_clean_string(object, &["status"]),
-            added_at: Self::get_clean_string(object, &["addedAt", "added_at"]),
-            password: Self::get_clean_string(object, &["password"]),
-            subscription_title: Self::get_clean_string(
-                object,
-                &["subscriptionTitle", "subscription_title"],
-            ),
-            overage_status: Self::get_clean_string(object, &["overageStatus", "overage_status"]),
-            usage_data: Self::get_cloned_non_null_value(object, &["usageData", "usage_data"]),
-            group_id: Self::get_clean_string(object, &["groupId", "group_id"]),
-            tag_links: Self::get_cloned_non_null_value(object, &["tagLinks", "tag_links"]),
-            available_models_cache: Self::get_cloned_non_null_value(
-                object,
-                &["availableModelsCache", "available_models_cache"],
-            ),
-            failure_count: Self::get_u32(object, &["failureCount", "failure_count"]),
-            last_failure_at: Self::get_clean_string(object, &["lastFailureAt", "last_failure_at"]),
-            disabled_reason: Self::get_clean_string(object, &["disabledReason", "disabled_reason"]),
-            success_count: Self::get_u64(object, &["successCount", "success_count"]),
-            csrf_token: Self::get_clean_string(object, &["csrfToken", "csrf_token"]),
-            nickname: Self::get_clean_string(object, &["nickname"]),
-            ban_status: Self::get_clean_string(object, &["banStatus", "ban_status"]),
-            ban_reason: Self::get_clean_string(object, &["banReason", "ban_reason"]),
-            ban_time: Self::get_i64(object, &["banTime", "ban_time"]),
-            subscription_type: Self::get_clean_string(
-                object,
-                &["subscriptionType", "subscription_type"],
-            ),
-            days_remaining: Self::get_i64(object, &["daysRemaining", "days_remaining"]),
-            usage_current: Self::get_f64(object, &["usageCurrent", "usage_current"]),
-            usage_limit: Self::get_f64(object, &["usageLimit", "usage_limit"]),
-            usage_percent: Self::get_f64(object, &["usagePercent", "usage_percent"]),
-            next_reset_date: Self::get_clean_string(object, &["nextResetDate", "next_reset_date"]),
-            last_refresh: Self::get_i64(object, &["lastRefresh", "last_refresh"]),
-            trial_usage_current: Self::get_f64(
-                object,
-                &["trialUsageCurrent", "trial_usage_current"],
-            ),
-            trial_usage_limit: Self::get_f64(object, &["trialUsageLimit", "trial_usage_limit"]),
-            trial_usage_percent: Self::get_f64(
-                object,
-                &["trialUsagePercent", "trial_usage_percent"],
-            ),
-            trial_status: Self::get_clean_string(object, &["trialStatus", "trial_status"]),
-            trial_expires_at: Self::get_i64(object, &["trialExpiresAt", "trial_expires_at"]),
-            overage_capability: Self::get_clean_string(
-                object,
-                &["overageCapability", "overage_capability"],
-            ),
-            overage_cap: Self::get_f64(object, &["overageCap", "overage_cap"]),
-            overage_rate: Self::get_f64(object, &["overageRate", "overage_rate"]),
-            current_overages: Self::get_f64(object, &["currentOverages", "current_overages"]),
-            overage_checked_at: Self::get_i64(object, &["overageCheckedAt", "overage_checked_at"]),
-            request_count: Self::get_u64(object, &["requestCount", "request_count"]),
-            error_count: Self::get_u64(object, &["errorCount", "error_count"]),
-            total_tokens: Self::get_u64(object, &["totalTokens", "total_tokens"]),
-            total_credits: Self::get_f64(object, &["totalCredits", "total_credits"]),
-            last_used_at: Self::get_i64(object, &["lastUsedAt", "last_used_at", "lastUsed"]),
-            created_at: Self::get_i64(object, &["createdAt", "created_at"]),
-            tags: Self::get_cloned_non_null_value(object, &["tags"]),
-            allow_overage_import: false,
             proxy_url: Self::get_clean_string(object, &["proxyUrl", "proxyURL", "proxy_url"]),
             proxy_username: Self::get_clean_string(object, &["proxyUsername", "proxy_username"]),
             proxy_password: Self::get_clean_string(object, &["proxyPassword", "proxy_password"]),
@@ -4293,7 +4276,87 @@ impl AdminService {
                 &["apiKey", "api_key", "kiroApiKey", "kiro_api_key"],
             ),
             endpoint: Self::get_clean_string(object, &["endpoint"]),
-            ..Default::default()
+            meta: CredentialSourceMetadata {
+                source_account_id: Self::get_import_source_id(object),
+                label: Self::get_clean_string(object, &["label"]),
+                status: Self::get_clean_string(object, &["status"]),
+                added_at: Self::get_clean_string(object, &["addedAt", "added_at"]),
+                password: Self::get_clean_string(object, &["password"]),
+                subscription_title: Self::get_clean_string(
+                    object,
+                    &["subscriptionTitle", "subscription_title"],
+                ),
+                overage_status: Self::get_clean_string(
+                    object,
+                    &["overageStatus", "overage_status"],
+                ),
+                usage_data: Self::get_cloned_non_null_value(object, &["usageData", "usage_data"]),
+                group_id: Self::get_clean_string(object, &["groupId", "group_id"]),
+                tag_links: Self::get_cloned_non_null_value(object, &["tagLinks", "tag_links"]),
+                available_models_cache: Self::get_cloned_non_null_value(
+                    object,
+                    &["availableModelsCache", "available_models_cache"],
+                ),
+                failure_count: Self::get_u32(object, &["failureCount", "failure_count"]),
+                last_failure_at: Self::get_clean_string(
+                    object,
+                    &["lastFailureAt", "last_failure_at"],
+                ),
+                disabled_reason: Self::get_clean_string(
+                    object,
+                    &["disabledReason", "disabled_reason"],
+                ),
+                success_count: Self::get_u64(object, &["successCount", "success_count"]),
+                csrf_token: Self::get_clean_string(object, &["csrfToken", "csrf_token"]),
+                nickname: Self::get_clean_string(object, &["nickname"]),
+                ban_status: Self::get_clean_string(object, &["banStatus", "ban_status"]),
+                ban_reason: Self::get_clean_string(object, &["banReason", "ban_reason"]),
+                ban_time: Self::get_i64(object, &["banTime", "ban_time"]),
+                subscription_type: Self::get_clean_string(
+                    object,
+                    &["subscriptionType", "subscription_type"],
+                ),
+                days_remaining: Self::get_i64(object, &["daysRemaining", "days_remaining"]),
+                usage_current: Self::get_f64(object, &["usageCurrent", "usage_current"]),
+                usage_limit: Self::get_f64(object, &["usageLimit", "usage_limit"]),
+                usage_percent: Self::get_f64(object, &["usagePercent", "usage_percent"]),
+                next_reset_date: Self::get_clean_string(
+                    object,
+                    &["nextResetDate", "next_reset_date"],
+                ),
+                last_refresh: Self::get_i64(object, &["lastRefresh", "last_refresh"]),
+                trial_usage_current: Self::get_f64(
+                    object,
+                    &["trialUsageCurrent", "trial_usage_current"],
+                ),
+                trial_usage_limit: Self::get_f64(object, &["trialUsageLimit", "trial_usage_limit"]),
+                trial_usage_percent: Self::get_f64(
+                    object,
+                    &["trialUsagePercent", "trial_usage_percent"],
+                ),
+                trial_status: Self::get_clean_string(object, &["trialStatus", "trial_status"]),
+                trial_expires_at: Self::get_i64(object, &["trialExpiresAt", "trial_expires_at"]),
+                overage_capability: Self::get_clean_string(
+                    object,
+                    &["overageCapability", "overage_capability"],
+                ),
+                overage_cap: Self::get_f64(object, &["overageCap", "overage_cap"]),
+                overage_rate: Self::get_f64(object, &["overageRate", "overage_rate"]),
+                current_overages: Self::get_f64(object, &["currentOverages", "current_overages"]),
+                overage_checked_at: Self::get_i64(
+                    object,
+                    &["overageCheckedAt", "overage_checked_at"],
+                ),
+                request_count: Self::get_u64(object, &["requestCount", "request_count"]),
+                error_count: Self::get_u64(object, &["errorCount", "error_count"]),
+                total_tokens: Self::get_u64(object, &["totalTokens", "total_tokens"]),
+                total_credits: Self::get_f64(object, &["totalCredits", "total_credits"]),
+                last_used_at: Self::get_i64(object, &["lastUsedAt", "last_used_at", "lastUsed"]),
+                created_at: Self::get_i64(object, &["createdAt", "created_at"]),
+                tags: Self::get_cloned_non_null_value(object, &["tags"]),
+                allow_overage_import: false,
+                ..Default::default()
+            },
         };
 
         if credential.proxy_url.is_none()
@@ -4307,10 +4370,10 @@ impl AdminService {
             credential.proxy_username = credential.proxy_username.or(username);
             credential.proxy_password = credential.proxy_password.or(password);
         }
-        if credential.overage_status.is_none()
+        if credential.meta.overage_status.is_none()
             && Self::get_bool(object, &["allowOverage"]).unwrap_or(false)
         {
-            credential.overage_status = Some("ENABLED".to_string());
+            credential.meta.overage_status = Some("ENABLED".to_string());
         }
         credential
     }
@@ -4397,6 +4460,7 @@ impl AdminService {
         }
         credential.machine_id = machine_id::normalize_optional_machine_id(credential.machine_id);
         credential.canonicalize_auth_method();
+        credential.profile_arn = KiroCredentials::clean_profile_arn(credential.profile_arn.take());
         Ok(credential)
     }
 
@@ -4422,28 +4486,33 @@ impl AdminService {
         credential.api_region = Self::clean_import_string(credential.api_region.take());
         credential.machine_id = Self::clean_import_string(credential.machine_id.take());
         credential.email = Self::clean_import_string(credential.email.take());
-        credential.source_account_id =
-            Self::clean_import_string(credential.source_account_id.take());
-        credential.label = Self::clean_import_string(credential.label.take());
-        credential.status = Self::clean_import_string(credential.status.take());
-        credential.added_at = Self::clean_import_string(credential.added_at.take());
-        credential.password = Self::clean_import_string(credential.password.take());
-        credential.subscription_title =
-            Self::clean_import_string(credential.subscription_title.take());
-        credential.overage_status = Self::clean_import_string(credential.overage_status.take());
-        credential.group_id = Self::clean_import_string(credential.group_id.take());
-        credential.last_failure_at = Self::clean_import_string(credential.last_failure_at.take());
-        credential.disabled_reason = Self::clean_import_string(credential.disabled_reason.take());
-        credential.csrf_token = Self::clean_import_string(credential.csrf_token.take());
-        credential.nickname = Self::clean_import_string(credential.nickname.take());
-        credential.ban_status = Self::clean_import_string(credential.ban_status.take());
-        credential.ban_reason = Self::clean_import_string(credential.ban_reason.take());
-        credential.subscription_type =
-            Self::clean_import_string(credential.subscription_type.take());
-        credential.next_reset_date = Self::clean_import_string(credential.next_reset_date.take());
-        credential.trial_status = Self::clean_import_string(credential.trial_status.take());
-        credential.overage_capability =
-            Self::clean_import_string(credential.overage_capability.take());
+        credential.meta.source_account_id =
+            Self::clean_import_string(credential.meta.source_account_id.take());
+        credential.meta.label = Self::clean_import_string(credential.meta.label.take());
+        credential.meta.status = Self::clean_import_string(credential.meta.status.take());
+        credential.meta.added_at = Self::clean_import_string(credential.meta.added_at.take());
+        credential.meta.password = Self::clean_import_string(credential.meta.password.take());
+        credential.meta.subscription_title =
+            Self::clean_import_string(credential.meta.subscription_title.take());
+        credential.meta.overage_status =
+            Self::clean_import_string(credential.meta.overage_status.take());
+        credential.meta.group_id = Self::clean_import_string(credential.meta.group_id.take());
+        credential.meta.last_failure_at =
+            Self::clean_import_string(credential.meta.last_failure_at.take());
+        credential.meta.disabled_reason =
+            Self::clean_import_string(credential.meta.disabled_reason.take());
+        credential.meta.csrf_token = Self::clean_import_string(credential.meta.csrf_token.take());
+        credential.meta.nickname = Self::clean_import_string(credential.meta.nickname.take());
+        credential.meta.ban_status = Self::clean_import_string(credential.meta.ban_status.take());
+        credential.meta.ban_reason = Self::clean_import_string(credential.meta.ban_reason.take());
+        credential.meta.subscription_type =
+            Self::clean_import_string(credential.meta.subscription_type.take());
+        credential.meta.next_reset_date =
+            Self::clean_import_string(credential.meta.next_reset_date.take());
+        credential.meta.trial_status =
+            Self::clean_import_string(credential.meta.trial_status.take());
+        credential.meta.overage_capability =
+            Self::clean_import_string(credential.meta.overage_capability.take());
         credential.proxy_url = Self::clean_import_string(credential.proxy_url.take());
         credential.proxy_username = Self::clean_import_string(credential.proxy_username.take());
         credential.proxy_password = Self::clean_import_string(credential.proxy_password.take());
@@ -5065,8 +5134,8 @@ impl AdminService {
             credential.email = Some(email.to_string());
         }
 
-        credential.subscription_title = usage.subscription_title().map(str::to_string);
-        credential.overage_status = usage.overage_status().map(str::to_string);
+        credential.meta.subscription_title = usage.subscription_title().map(str::to_string);
+        credential.meta.overage_status = usage.overage_status().map(str::to_string);
 
         match crate::kiro::models::fetch_all_available_models(
             credential,
@@ -7006,46 +7075,46 @@ impl AdminService {
                 .and_then(|credential| credential.user_id.clone()),
             source_account_id: stored
                 .as_ref()
-                .and_then(|credential| credential.source_account_id.clone()),
+                .and_then(|credential| credential.meta.source_account_id.clone()),
             label: stored
                 .as_ref()
-                .and_then(|credential| credential.label.clone()),
+                .and_then(|credential| credential.meta.label.clone()),
             status: stored
                 .as_ref()
-                .and_then(|credential| credential.status.clone()),
+                .and_then(|credential| credential.meta.status.clone()),
             added_at: stored
                 .as_ref()
-                .and_then(|credential| credential.added_at.clone()),
+                .and_then(|credential| credential.meta.added_at.clone()),
             nickname: stored
                 .as_ref()
-                .and_then(|credential| credential.nickname.clone()),
+                .and_then(|credential| credential.meta.nickname.clone()),
             group_id: stored
                 .as_ref()
-                .and_then(|credential| credential.group_id.clone()),
+                .and_then(|credential| credential.meta.group_id.clone()),
             tag_links: stored
                 .as_ref()
-                .and_then(|credential| credential.tag_links.clone()),
+                .and_then(|credential| credential.meta.tag_links.clone()),
             has_usage_data: stored
                 .as_ref()
-                .is_some_and(|credential| credential.usage_data.is_some()),
+                .is_some_and(|credential| credential.meta.usage_data.is_some()),
             has_available_models_cache: stored
                 .as_ref()
-                .is_some_and(|credential| credential.available_models_cache.is_some()),
+                .is_some_and(|credential| credential.meta.available_models_cache.is_some()),
             source_failure_count: stored
                 .as_ref()
-                .and_then(|credential| credential.failure_count),
+                .and_then(|credential| credential.meta.failure_count),
             source_last_failure_at: stored
                 .as_ref()
-                .and_then(|credential| credential.last_failure_at.clone()),
+                .and_then(|credential| credential.meta.last_failure_at.clone()),
             source_disabled_reason: stored
                 .as_ref()
-                .and_then(|credential| credential.disabled_reason.clone()),
+                .and_then(|credential| credential.meta.disabled_reason.clone()),
             source_success_count: stored
                 .as_ref()
-                .and_then(|credential| credential.success_count),
+                .and_then(|credential| credential.meta.success_count),
             has_profile_arn: stored
                 .as_ref()
-                .is_some_and(|credential| Self::has_import_string(&credential.profile_arn)),
+                .is_some_and(|credential| credential.profile_arn_trimmed().is_some()),
             has_token: stored
                 .as_ref()
                 .is_some_and(|credential| Self::has_import_string(&credential.access_token)),
@@ -8171,6 +8240,7 @@ mod settings_tests {
             require_api_key_runtime.clone(),
             admin_api_key_runtime.clone(),
             Arc::new(RwLock::new(config.prompt_filter.clone())),
+            crate::model::runtime::model_mapping_from_config(&config),
             Arc::new(RwLock::new(ThinkingRuntimeConfig {
                 suffix: config.thinking_suffix.clone(),
                 openai_format: config.openai_thinking_format.clone(),
@@ -8691,7 +8761,7 @@ mod settings_tests {
         let (service, _, _, _) = test_service(config, credentials_path);
 
         let mut cred = KiroCredentials::default();
-        cred.source_account_id = Some("source-credential".to_string());
+        cred.meta.source_account_id = Some("source-credential".to_string());
         cred.refresh_token = Some("r".repeat(150));
         cred.access_token = Some("access-token".to_string());
         let id = service
@@ -8733,7 +8803,7 @@ mod settings_tests {
         let (service, _, _, _) = test_service(config, credentials_path);
 
         let mut cred = KiroCredentials::default();
-        cred.source_account_id = Some("source-credential".to_string());
+        cred.meta.source_account_id = Some("source-credential".to_string());
         cred.refresh_token = Some("r".repeat(150));
         cred.access_token = Some("access-token".to_string());
         service
@@ -8764,7 +8834,7 @@ mod settings_tests {
             .unwrap();
 
         let mut second = KiroCredentials::default();
-        second.source_account_id = Some(first_id.to_string());
+        second.meta.source_account_id = Some(first_id.to_string());
         second.refresh_token = Some("s".repeat(150));
         second.access_token = Some("access-2".to_string());
         let second_id = service
@@ -8794,7 +8864,7 @@ mod settings_tests {
         let (service, _, _, _) = test_service(config, credentials_path);
 
         let mut cred = KiroCredentials::default();
-        cred.source_account_id = Some("source-credential".to_string());
+        cred.meta.source_account_id = Some("source-credential".to_string());
         cred.refresh_token = Some("r".repeat(150));
         cred.access_token = Some("access-token".to_string());
         cred.expires_at = Some("2026-06-29T00:00:00Z".to_string());
@@ -8804,33 +8874,33 @@ mod settings_tests {
         cred.region = Some("us-east-1".to_string());
         cred.machine_id = Some("machine-1".to_string());
         cred.email = Some("user@example.com".to_string());
-        cred.nickname = Some("User".to_string());
+        cred.meta.nickname = Some("User".to_string());
         cred.weight = 4;
-        cred.overage_status = Some("ENABLED".to_string());
-        cred.overage_capability = Some("OVERAGE_CAPABLE".to_string());
-        cred.overage_cap = Some(50.0);
-        cred.overage_rate = Some(0.04);
-        cred.current_overages = Some(1.5);
-        cred.overage_checked_at = Some(1_782_691_200);
+        cred.meta.overage_status = Some("ENABLED".to_string());
+        cred.meta.overage_capability = Some("OVERAGE_CAPABLE".to_string());
+        cred.meta.overage_cap = Some(50.0);
+        cred.meta.overage_rate = Some(0.04);
+        cred.meta.current_overages = Some(1.5);
+        cred.meta.overage_checked_at = Some(1_782_691_200);
         cred.proxy_url = Some("http://proxy.local:8080".to_string());
-        cred.subscription_type = Some("PRO_PLUS".to_string());
-        cred.subscription_title = Some("KIRO PRO+".to_string());
-        cred.days_remaining = Some(20);
-        cred.usage_current = Some(3.0);
-        cred.usage_limit = Some(10.0);
-        cred.usage_percent = Some(30.0);
-        cred.next_reset_date = Some("2026-07-01".to_string());
-        cred.last_refresh = Some(1_782_691_201);
-        cred.trial_usage_current = Some(1.0);
-        cred.trial_usage_limit = Some(5.0);
-        cred.trial_usage_percent = Some(20.0);
-        cred.trial_status = Some("ACTIVE".to_string());
-        cred.trial_expires_at = Some(1_785_283_200);
-        cred.request_count = Some(7);
-        cred.error_count = Some(2);
-        cred.total_tokens = Some(1234);
-        cred.total_credits = Some(12.5);
-        cred.last_used_at = Some(1_782_691_202);
+        cred.meta.subscription_type = Some("PRO_PLUS".to_string());
+        cred.meta.subscription_title = Some("KIRO PRO+".to_string());
+        cred.meta.days_remaining = Some(20);
+        cred.meta.usage_current = Some(3.0);
+        cred.meta.usage_limit = Some(10.0);
+        cred.meta.usage_percent = Some(30.0);
+        cred.meta.next_reset_date = Some("2026-07-01".to_string());
+        cred.meta.last_refresh = Some(1_782_691_201);
+        cred.meta.trial_usage_current = Some(1.0);
+        cred.meta.trial_usage_limit = Some(5.0);
+        cred.meta.trial_usage_percent = Some(20.0);
+        cred.meta.trial_status = Some("ACTIVE".to_string());
+        cred.meta.trial_expires_at = Some(1_785_283_200);
+        cred.meta.request_count = Some(7);
+        cred.meta.error_count = Some(2);
+        cred.meta.total_tokens = Some(1234);
+        cred.meta.total_credits = Some(12.5);
+        cred.meta.last_used_at = Some(1_782_691_202);
         service
             .token_manager
             .add_prevalidated_credential(cred)
@@ -8895,19 +8965,19 @@ mod settings_tests {
         cred.access_token = Some("access-token".to_string());
         cred.email = Some("user@example.com".to_string());
         cred.user_id = Some("user-1".to_string());
-        cred.subscription_type = Some("PRO_PLUS".to_string());
-        cred.subscription_title = Some("KIRO PRO+".to_string());
-        cred.days_remaining = Some(12);
-        cred.usage_current = Some(4.0);
-        cred.usage_limit = Some(20.0);
-        cred.usage_percent = Some(20.0);
-        cred.next_reset_date = Some("2026-07-01".to_string());
-        cred.last_refresh = Some(1_782_691_201);
-        cred.trial_usage_current = Some(1.0);
-        cred.trial_usage_limit = Some(5.0);
-        cred.trial_usage_percent = Some(20.0);
-        cred.trial_status = Some("ACTIVE".to_string());
-        cred.trial_expires_at = Some(1_785_283_200);
+        cred.meta.subscription_type = Some("PRO_PLUS".to_string());
+        cred.meta.subscription_title = Some("KIRO PRO+".to_string());
+        cred.meta.days_remaining = Some(12);
+        cred.meta.usage_current = Some(4.0);
+        cred.meta.usage_limit = Some(20.0);
+        cred.meta.usage_percent = Some(20.0);
+        cred.meta.next_reset_date = Some("2026-07-01".to_string());
+        cred.meta.last_refresh = Some(1_782_691_201);
+        cred.meta.trial_usage_current = Some(1.0);
+        cred.meta.trial_usage_limit = Some(5.0);
+        cred.meta.trial_usage_percent = Some(20.0);
+        cred.meta.trial_status = Some("ACTIVE".to_string());
+        cred.meta.trial_expires_at = Some(1_785_283_200);
         let id = service
             .token_manager
             .add_prevalidated_credential(cred)
@@ -8947,7 +9017,7 @@ mod settings_tests {
         let (service, _, _, _) = test_service(config, credentials_path);
 
         let mut cred = KiroCredentials::default();
-        cred.source_account_id = Some("source-credential".to_string());
+        cred.meta.source_account_id = Some("source-credential".to_string());
         cred.access_token = Some("access-token".to_string());
         cred.refresh_token = Some("r".repeat(150));
         cred.client_id = Some("client-id".to_string());
@@ -8956,18 +9026,18 @@ mod settings_tests {
         cred.provider = Some("BuilderId".to_string());
         cred.email = Some("user@example.com".to_string());
         cred.user_id = Some("user-1".to_string());
-        cred.nickname = Some("Work".to_string());
+        cred.meta.nickname = Some("Work".to_string());
         cred.region = Some("us-east-1".to_string());
         cred.expires_at = Some("2026-06-29T00:00:00Z".to_string());
         cred.machine_id = Some("machine-1".to_string());
         cred.profile_arn = Some("profile-arn".to_string());
         cred.proxy_url = Some("http://proxy.local:8080".to_string());
         cred.weight = 5;
-        cred.request_count = Some(7);
-        cred.error_count = Some(2);
-        cred.total_tokens = Some(1234);
-        cred.total_credits = Some(12.5);
-        cred.last_used_at = Some(1_782_691_202);
+        cred.meta.request_count = Some(7);
+        cred.meta.error_count = Some(2);
+        cred.meta.total_tokens = Some(1234);
+        cred.meta.total_credits = Some(12.5);
+        cred.meta.last_used_at = Some(1_782_691_202);
         service
             .token_manager
             .add_prevalidated_credential(cred)
@@ -9025,7 +9095,7 @@ mod settings_tests {
         let (service, _, _, _) = test_service(config, credentials_path);
 
         let mut cred = KiroCredentials::default();
-        cred.source_account_id = Some("source-credential".to_string());
+        cred.meta.source_account_id = Some("source-credential".to_string());
         cred.access_token = Some("access-token".to_string());
         cred.refresh_token = Some("r".repeat(150));
         let id = service
@@ -9063,16 +9133,16 @@ mod settings_tests {
         let (service, _, _, _) = test_service(config, credentials_path);
 
         let mut cred = KiroCredentials::default();
-        cred.source_account_id = Some("source-credential".to_string());
+        cred.meta.source_account_id = Some("source-credential".to_string());
         cred.access_token = Some("access-token".to_string());
         cred.refresh_token = Some("r".repeat(150));
-        cred.subscription_title = Some("KIRO PRO+".to_string());
-        cred.overage_status = Some("ENABLED".to_string());
-        cred.overage_capability = Some("OVERAGE_CAPABLE".to_string());
-        cred.overage_cap = Some(50.0);
-        cred.overage_rate = Some(0.04);
-        cred.current_overages = Some(2.5);
-        cred.overage_checked_at = Some(1_782_691_200);
+        cred.meta.subscription_title = Some("KIRO PRO+".to_string());
+        cred.meta.overage_status = Some("ENABLED".to_string());
+        cred.meta.overage_capability = Some("OVERAGE_CAPABLE".to_string());
+        cred.meta.overage_cap = Some(50.0);
+        cred.meta.overage_rate = Some(0.04);
+        cred.meta.current_overages = Some(2.5);
+        cred.meta.overage_checked_at = Some(1_782_691_200);
         let id = service
             .token_manager
             .add_prevalidated_credential(cred)
@@ -9149,7 +9219,7 @@ mod settings_tests {
         let (service, _, _, _) = test_service(config, credentials_path);
 
         let mut cred = KiroCredentials::default();
-        cred.source_account_id = Some("source-credential".to_string());
+        cred.meta.source_account_id = Some("source-credential".to_string());
         cred.refresh_token = Some("r".repeat(150));
         cred.access_token = Some("access-token".to_string());
         let local_id = service
@@ -9211,7 +9281,7 @@ mod settings_tests {
             .unwrap();
 
         let mut second = KiroCredentials::default();
-        second.source_account_id = Some(first_id.to_string());
+        second.meta.source_account_id = Some(first_id.to_string());
         second.refresh_token = Some("s".repeat(150));
         second.access_token = Some("access-2".to_string());
         let second_id = service
@@ -9232,10 +9302,10 @@ mod settings_tests {
         let (service, _, _, _) = test_service(config, credentials_path);
 
         let mut first = KiroCredentials::default();
-        first.source_account_id = Some("source-1".to_string());
+        first.meta.source_account_id = Some("source-1".to_string());
         first.refresh_token = Some("r".repeat(150));
         first.access_token = Some("access-1".to_string());
-        first.csrf_token = Some("csrf-1".to_string());
+        first.meta.csrf_token = Some("csrf-1".to_string());
         first.expires_at = Some("2026-06-29T00:00:00Z".to_string());
         first.auth_method = Some("idc".to_string());
         first.provider = Some("BuilderId".to_string());
@@ -9243,25 +9313,25 @@ mod settings_tests {
         first.client_secret = Some("secret-1".to_string());
         first.region = Some("us-east-1".to_string());
         first.email = Some("first@example.com".to_string());
-        first.nickname = Some("First".to_string());
+        first.meta.nickname = Some("First".to_string());
         first.user_id = Some("user-1".to_string());
         first.machine_id = Some("machine-1".to_string());
-        first.subscription_type = Some("POWER".to_string());
-        first.subscription_title = Some("KIRO POWER".to_string());
-        first.usage_current = Some(3.0);
-        first.usage_limit = Some(10.0);
-        first.usage_percent = Some(30.0);
-        first.last_refresh = Some(1_782_691_200_000);
-        first.created_at = Some(1_782_691_100_000);
-        first.last_used_at = Some(1_782_691_150_000);
-        first.tags = Some(serde_json::json!(["alpha", 7, "beta"]));
+        first.meta.subscription_type = Some("POWER".to_string());
+        first.meta.subscription_title = Some("KIRO POWER".to_string());
+        first.meta.usage_current = Some(3.0);
+        first.meta.usage_limit = Some(10.0);
+        first.meta.usage_percent = Some(30.0);
+        first.meta.last_refresh = Some(1_782_691_200_000);
+        first.meta.created_at = Some(1_782_691_100_000);
+        first.meta.last_used_at = Some(1_782_691_150_000);
+        first.meta.tags = Some(serde_json::json!(["alpha", 7, "beta"]));
         let first_id = service
             .token_manager
             .add_prevalidated_credential(first)
             .unwrap();
 
         let mut second = KiroCredentials::default();
-        second.source_account_id = Some("source-2".to_string());
+        second.meta.source_account_id = Some("source-2".to_string());
         second.refresh_token = Some("s".repeat(150));
         second.access_token = Some("access-2".to_string());
         service
@@ -9484,8 +9554,48 @@ mod settings_tests {
         assert_eq!(imported.api_region.as_deref(), Some("eu-central-1"));
         assert_eq!(imported.machine_id.as_deref(), Some("machine-import"));
         assert_eq!(imported.proxy_url.as_deref(), Some("direct"));
-        assert_eq!(imported.overage_status.as_deref(), Some("DISABLED"));
+        assert_eq!(imported.meta.overage_status.as_deref(), Some("DISABLED"));
         assert_eq!(imported.endpoint.as_deref(), Some("ide"));
+    }
+
+    #[test]
+    fn import_credentials_external_idp_drops_uuid_profile_arn() {
+        let dir = temp_test_dir("external-idp-uuid-profile-arn");
+        let config = crate::model::config::Config::default();
+        let credentials_path = dir.join("credentials.json");
+        let (service, _, _, _) = test_service(config, credentials_path);
+        let response = service.import_credentials(ImportCredentialsRequest {
+            dry_run: false,
+            mode: CredentialImportMode::SkipExisting,
+            input: serde_json::json!({
+                "items": [{
+                    "provider": "Microsoft",
+                    "refreshToken": "e".repeat(150),
+                    "profileArn": "e3438419-4424-4e57-8990-ef76bd749a44",
+                    "clientId": "client-import",
+                    "authMethod": "microsoft",
+                    "userId": "https://login.microsoftonline.com/tenant/v2.0",
+                    "tokenEndpoint": "https://login.microsoftonline.com/tenant/oauth2/v2.0/token",
+                    "issuerUrl": "https://login.microsoftonline.com/tenant/v2.0",
+                    "scopes": "api://client-import/codewhisperer:conversations offline_access",
+                    "region": "us-east-1"
+                }]
+            }),
+        });
+
+        assert_eq!(response.summary.added, 1);
+        assert_eq!(response.summary.invalid, 0);
+        assert!(!response.items[0].has_profile_arn);
+
+        let snapshot = service.token_manager.snapshot();
+        let imported = service
+            .token_manager
+            .export_credentials_by_ids(&[snapshot.entries[0].id])
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(imported.auth_method.as_deref(), Some("external_idp"));
+        assert_eq!(imported.profile_arn, None);
     }
 
     #[test]
@@ -9602,20 +9712,20 @@ mod settings_tests {
         cred.machine_id = Some("machine-id".to_string());
         cred.endpoint = Some("ide".to_string());
         cred.proxy_username = Some("proxy-user".to_string());
-        cred.group_id = Some("group-1".to_string());
-        cred.tag_links = Some(serde_json::json!([{ "tagId": "tag-1", "tagName": "Tenant" }]));
-        cred.usage_data = Some(serde_json::json!({
+        cred.meta.group_id = Some("group-1".to_string());
+        cred.meta.tag_links = Some(serde_json::json!([{ "tagId": "tag-1", "tagName": "Tenant" }]));
+        cred.meta.usage_data = Some(serde_json::json!({
             "userInfo": { "email": "user@example.com" },
             "usageBreakdownList": [{ "currentUsage": 1, "usageLimit": 10 }]
         }));
-        cred.available_models_cache = Some(serde_json::json!({
+        cred.meta.available_models_cache = Some(serde_json::json!({
             "cachedAt": 1893456000,
             "response": { "availableModels": [] }
         }));
-        cred.failure_count = Some(2);
-        cred.last_failure_at = Some("2026-06-28T10:01:00Z".to_string());
-        cred.disabled_reason = Some("manual".to_string());
-        cred.success_count = Some(7);
+        cred.meta.failure_count = Some(2);
+        cred.meta.last_failure_at = Some("2026-06-28T10:01:00Z".to_string());
+        cred.meta.disabled_reason = Some("manual".to_string());
+        cred.meta.success_count = Some(7);
         let id = service.token_manager.add_imported_credential(cred).unwrap();
 
         let added = service.add_credential_response_from_stored(id, "ok".to_string(), None);
@@ -9809,37 +9919,43 @@ mod settings_tests {
             .pop()
             .unwrap();
         assert_eq!(
-            imported.source_account_id.as_deref(),
+            imported.meta.source_account_id.as_deref(),
             Some("source-single-credential")
         );
-        assert_eq!(imported.label.as_deref(), Some("Single import"));
-        assert_eq!(imported.status.as_deref(), Some("active"));
-        assert_eq!(imported.added_at.as_deref(), Some("2026/06/29 10:00:00"));
-        assert_eq!(imported.password.as_deref(), Some("source-password"));
-        assert_eq!(imported.nickname.as_deref(), Some("Single Credential"));
-        assert_eq!(imported.group_id.as_deref(), Some("group-single"));
-        assert!(imported.tag_links.is_some());
-        assert!(imported.usage_data.is_some());
-        assert!(imported.available_models_cache.is_some());
-        assert_eq!(imported.failure_count, Some(4));
+        assert_eq!(imported.meta.label.as_deref(), Some("Single import"));
+        assert_eq!(imported.meta.status.as_deref(), Some("active"));
         assert_eq!(
-            imported.last_failure_at.as_deref(),
+            imported.meta.added_at.as_deref(),
+            Some("2026/06/29 10:00:00")
+        );
+        assert_eq!(imported.meta.password.as_deref(), Some("source-password"));
+        assert_eq!(imported.meta.nickname.as_deref(), Some("Single Credential"));
+        assert_eq!(imported.meta.group_id.as_deref(), Some("group-single"));
+        assert!(imported.meta.tag_links.is_some());
+        assert!(imported.meta.usage_data.is_some());
+        assert!(imported.meta.available_models_cache.is_some());
+        assert_eq!(imported.meta.failure_count, Some(4));
+        assert_eq!(
+            imported.meta.last_failure_at.as_deref(),
             Some("2026-06-29T01:02:03Z")
         );
-        assert_eq!(imported.disabled_reason.as_deref(), Some("manual"));
-        assert_eq!(imported.success_count, Some(11));
-        assert_eq!(imported.subscription_type.as_deref(), Some("Pro"));
-        assert_eq!(imported.subscription_title.as_deref(), Some("KIRO PRO"));
-        assert_eq!(imported.usage_current, Some(12.5));
-        assert_eq!(imported.usage_limit, Some(100.0));
-        assert_eq!(imported.usage_percent, Some(12.5));
-        assert_eq!(imported.request_count, Some(19));
-        assert_eq!(imported.error_count, Some(2));
-        assert_eq!(imported.total_tokens, Some(12345));
-        assert_eq!(imported.total_credits, Some(6.5));
-        assert_eq!(imported.last_used_at, Some(1893456000));
-        assert_eq!(imported.created_at, Some(1893450000));
-        assert!(imported.tags.is_some());
+        assert_eq!(imported.meta.disabled_reason.as_deref(), Some("manual"));
+        assert_eq!(imported.meta.success_count, Some(11));
+        assert_eq!(imported.meta.subscription_type.as_deref(), Some("Pro"));
+        assert_eq!(
+            imported.meta.subscription_title.as_deref(),
+            Some("KIRO PRO")
+        );
+        assert_eq!(imported.meta.usage_current, Some(12.5));
+        assert_eq!(imported.meta.usage_limit, Some(100.0));
+        assert_eq!(imported.meta.usage_percent, Some(12.5));
+        assert_eq!(imported.meta.request_count, Some(19));
+        assert_eq!(imported.meta.error_count, Some(2));
+        assert_eq!(imported.meta.total_tokens, Some(12345));
+        assert_eq!(imported.meta.total_credits, Some(6.5));
+        assert_eq!(imported.meta.last_used_at, Some(1893456000));
+        assert_eq!(imported.meta.created_at, Some(1893450000));
+        assert!(imported.meta.tags.is_some());
 
         let details = service.credential_login_details_from_stored(response.credential_id);
         assert_eq!(details.group_id.as_deref(), Some("group-single"));
@@ -10135,19 +10251,23 @@ mod settings_tests {
         assert_eq!(converted.auth_method.as_deref(), Some("idc"));
         assert_eq!(converted.provider.as_deref(), Some("BuilderId"));
         assert_eq!(converted.machine_id.as_deref(), Some("machine-builder"));
-        assert_eq!(converted.nickname.as_deref(), Some("Builder backup"));
-        assert_eq!(converted.csrf_token.as_deref(), Some("csrf-builder"));
-        assert_eq!(converted.status.as_deref(), Some("active"));
-        assert_eq!(converted.subscription_title.as_deref(), Some("KIRO PRO"));
-        assert_eq!(converted.subscription_type.as_deref(), Some("Pro"));
-        assert_eq!(converted.usage_current, Some(12.5));
-        assert_eq!(converted.usage_limit, Some(100.0));
-        assert_eq!(converted.usage_percent, Some(0.125));
-        assert_eq!(converted.last_refresh, Some(1_893_455_900_000_i64));
-        assert_eq!(converted.created_at, Some(1_893_455_000_000_i64));
-        assert_eq!(converted.last_used_at, Some(1_893_455_500_000_i64));
+        assert_eq!(converted.meta.nickname.as_deref(), Some("Builder backup"));
+        assert_eq!(converted.meta.csrf_token.as_deref(), Some("csrf-builder"));
+        assert_eq!(converted.meta.status.as_deref(), Some("active"));
+        assert_eq!(
+            converted.meta.subscription_title.as_deref(),
+            Some("KIRO PRO")
+        );
+        assert_eq!(converted.meta.subscription_type.as_deref(), Some("Pro"));
+        assert_eq!(converted.meta.usage_current, Some(12.5));
+        assert_eq!(converted.meta.usage_limit, Some(100.0));
+        assert_eq!(converted.meta.usage_percent, Some(0.125));
+        assert_eq!(converted.meta.last_refresh, Some(1_893_455_900_000_i64));
+        assert_eq!(converted.meta.created_at, Some(1_893_455_000_000_i64));
+        assert_eq!(converted.meta.last_used_at, Some(1_893_455_500_000_i64));
         assert_eq!(
             converted
+                .meta
                 .tags
                 .as_ref()
                 .and_then(serde_json::Value::as_array)
@@ -10155,7 +10275,7 @@ mod settings_tests {
             Some(2)
         );
         assert_eq!(
-            converted.source_account_id.as_deref(),
+            converted.meta.source_account_id.as_deref(),
             Some("source-credential-1")
         );
         assert_eq!(
@@ -10206,7 +10326,7 @@ mod settings_tests {
         assert!(converted.disabled);
         assert_eq!(converted.id, None);
         assert_eq!(
-            converted.source_account_id.as_deref(),
+            converted.meta.source_account_id.as_deref(),
             Some("source-credential")
         );
         assert_eq!(converted.region.as_deref(), Some("eu-west-1"));
@@ -10245,7 +10365,7 @@ mod settings_tests {
             .normalize_imported_credential(parsed.credentials.into_iter().next().unwrap())
             .unwrap();
         assert_eq!(
-            converted.source_account_id.as_deref(),
+            converted.meta.source_account_id.as_deref(),
             Some("source-canonical-credential")
         );
         assert_eq!(converted.auth_method.as_deref(), Some("idc"));
@@ -10334,47 +10454,50 @@ mod settings_tests {
             .unwrap();
 
         assert_eq!(
-            imported.source_account_id.as_deref(),
+            imported.meta.source_account_id.as_deref(),
             Some("source-config-credential")
         );
         assert_eq!(
             imported.expires_at.as_deref(),
             Some("2030-01-01T00:00:00+00:00")
         );
-        assert_eq!(imported.nickname.as_deref(), Some("Config credential"));
+        assert_eq!(imported.meta.nickname.as_deref(), Some("Config credential"));
         assert_eq!(imported.region.as_deref(), Some("us-west-2"));
         assert_eq!(imported.weight, 4);
         assert!(imported.disabled);
-        assert_eq!(imported.overage_status.as_deref(), Some("ENABLED"));
+        assert_eq!(imported.meta.overage_status.as_deref(), Some("ENABLED"));
         assert_eq!(
-            imported.overage_capability.as_deref(),
+            imported.meta.overage_capability.as_deref(),
             Some("OVERAGE_CAPABLE")
         );
-        assert_eq!(imported.overage_cap, Some(20.0));
-        assert_eq!(imported.overage_rate, Some(0.2));
-        assert_eq!(imported.current_overages, Some(3.5));
-        assert_eq!(imported.overage_checked_at, Some(1_893_455_000_i64));
-        assert_eq!(imported.ban_status.as_deref(), Some("SUSPENDED"));
-        assert_eq!(imported.ban_reason.as_deref(), Some("manual-test"));
-        assert_eq!(imported.ban_time, Some(1_893_455_100_i64));
-        assert_eq!(imported.subscription_type.as_deref(), Some("PRO_PLUS"));
-        assert_eq!(imported.subscription_title.as_deref(), Some("KIRO PRO+"));
-        assert_eq!(imported.days_remaining, Some(14));
-        assert_eq!(imported.usage_current, Some(42.0));
-        assert_eq!(imported.usage_limit, Some(100.0));
-        assert_eq!(imported.usage_percent, Some(0.42));
-        assert_eq!(imported.next_reset_date.as_deref(), Some("2030-02-01"));
-        assert_eq!(imported.last_refresh, Some(1_893_455_200_i64));
-        assert_eq!(imported.trial_usage_current, Some(1.0));
-        assert_eq!(imported.trial_usage_limit, Some(5.0));
-        assert_eq!(imported.trial_usage_percent, Some(0.2));
-        assert_eq!(imported.trial_status.as_deref(), Some("ACTIVE"));
-        assert_eq!(imported.trial_expires_at, Some(1_893_555_000_i64));
-        assert_eq!(imported.request_count, Some(11));
-        assert_eq!(imported.error_count, Some(2));
-        assert_eq!(imported.total_tokens, Some(12345));
-        assert_eq!(imported.total_credits, Some(6.75));
-        assert_eq!(imported.last_used_at, Some(1_893_455_300_i64));
+        assert_eq!(imported.meta.overage_cap, Some(20.0));
+        assert_eq!(imported.meta.overage_rate, Some(0.2));
+        assert_eq!(imported.meta.current_overages, Some(3.5));
+        assert_eq!(imported.meta.overage_checked_at, Some(1_893_455_000_i64));
+        assert_eq!(imported.meta.ban_status.as_deref(), Some("SUSPENDED"));
+        assert_eq!(imported.meta.ban_reason.as_deref(), Some("manual-test"));
+        assert_eq!(imported.meta.ban_time, Some(1_893_455_100_i64));
+        assert_eq!(imported.meta.subscription_type.as_deref(), Some("PRO_PLUS"));
+        assert_eq!(
+            imported.meta.subscription_title.as_deref(),
+            Some("KIRO PRO+")
+        );
+        assert_eq!(imported.meta.days_remaining, Some(14));
+        assert_eq!(imported.meta.usage_current, Some(42.0));
+        assert_eq!(imported.meta.usage_limit, Some(100.0));
+        assert_eq!(imported.meta.usage_percent, Some(0.42));
+        assert_eq!(imported.meta.next_reset_date.as_deref(), Some("2030-02-01"));
+        assert_eq!(imported.meta.last_refresh, Some(1_893_455_200_i64));
+        assert_eq!(imported.meta.trial_usage_current, Some(1.0));
+        assert_eq!(imported.meta.trial_usage_limit, Some(5.0));
+        assert_eq!(imported.meta.trial_usage_percent, Some(0.2));
+        assert_eq!(imported.meta.trial_status.as_deref(), Some("ACTIVE"));
+        assert_eq!(imported.meta.trial_expires_at, Some(1_893_555_000_i64));
+        assert_eq!(imported.meta.request_count, Some(11));
+        assert_eq!(imported.meta.error_count, Some(2));
+        assert_eq!(imported.meta.total_tokens, Some(12345));
+        assert_eq!(imported.meta.total_credits, Some(6.75));
+        assert_eq!(imported.meta.last_used_at, Some(1_893_455_300_i64));
 
         let status = service.get_all_credentials();
         let item = &status.credentials[0];
@@ -10405,18 +10528,24 @@ mod settings_tests {
         let exported = service.export_credential_backup(&[id]);
         let exported_credential = &exported.credentials[0].credential;
         assert_eq!(
-            exported_credential.source_account_id.as_deref(),
+            exported_credential.meta.source_account_id.as_deref(),
             Some("source-config-credential")
         );
         assert_eq!(
-            exported_credential.nickname.as_deref(),
+            exported_credential.meta.nickname.as_deref(),
             Some("Config credential")
         );
-        assert_eq!(exported_credential.overage_cap, Some(20.0));
-        assert_eq!(exported_credential.usage_current, Some(42.0));
-        assert_eq!(exported_credential.trial_status.as_deref(), Some("ACTIVE"));
-        assert_eq!(exported_credential.request_count, Some(11));
-        assert_eq!(exported_credential.last_used_at, Some(1_893_455_300_i64));
+        assert_eq!(exported_credential.meta.overage_cap, Some(20.0));
+        assert_eq!(exported_credential.meta.usage_current, Some(42.0));
+        assert_eq!(
+            exported_credential.meta.trial_status.as_deref(),
+            Some("ACTIVE")
+        );
+        assert_eq!(exported_credential.meta.request_count, Some(11));
+        assert_eq!(
+            exported_credential.meta.last_used_at,
+            Some(1_893_455_300_i64)
+        );
     }
 
     #[test]
@@ -10446,7 +10575,7 @@ mod settings_tests {
             "ssoSessionId": "session-enterprise",
             "idToken": "id-token-enterprise",
             "startUrl": "https://d-90660ceab3.awsapps.com/start/",
-            "profileArn": "profile-enterprise",
+            "profileArn": "arn:aws:codewhisperer:eu-west-1:123:profile/enterprise",
             "usageData": {
                 "userInfo": {
                     "email": "enterprise@example.com",
@@ -10494,13 +10623,16 @@ mod settings_tests {
             .unwrap();
 
         assert_eq!(
-            imported.source_account_id.as_deref(),
+            imported.meta.source_account_id.as_deref(),
             Some("source-enterprise-credential")
         );
-        assert_eq!(imported.label.as_deref(), Some("Work tenant"));
-        assert_eq!(imported.status.as_deref(), Some("active"));
-        assert_eq!(imported.added_at.as_deref(), Some("2026/06/28 10:00:00"));
-        assert_eq!(imported.password.as_deref(), Some("source-password"));
+        assert_eq!(imported.meta.label.as_deref(), Some("Work tenant"));
+        assert_eq!(imported.meta.status.as_deref(), Some("active"));
+        assert_eq!(
+            imported.meta.added_at.as_deref(),
+            Some("2026/06/28 10:00:00")
+        );
+        assert_eq!(imported.meta.password.as_deref(), Some("source-password"));
         assert_eq!(imported.auth_method.as_deref(), Some("idc"));
         assert_eq!(imported.provider.as_deref(), Some("Enterprise"));
         assert_eq!(imported.region.as_deref(), Some("eu-west-1"));
@@ -10515,18 +10647,19 @@ mod settings_tests {
         );
         assert_eq!(imported.id_token.as_deref(), Some("id-token-enterprise"));
         assert_eq!(imported.machine_id.as_deref(), Some("machine-enterprise"));
-        assert_eq!(imported.group_id.as_deref(), Some("group-1"));
-        assert_eq!(imported.failure_count, Some(2));
+        assert_eq!(imported.meta.group_id.as_deref(), Some("group-1"));
+        assert_eq!(imported.meta.failure_count, Some(2));
         assert_eq!(
-            imported.last_failure_at.as_deref(),
+            imported.meta.last_failure_at.as_deref(),
             Some("2026-06-28T10:01:00Z")
         );
-        assert_eq!(imported.disabled_reason.as_deref(), Some("manual"));
-        assert_eq!(imported.success_count, Some(7));
+        assert_eq!(imported.meta.disabled_reason.as_deref(), Some("manual"));
+        assert_eq!(imported.meta.success_count, Some(7));
         assert!(imported.disabled);
         assert_eq!(imported.proxy_url.as_deref(), Some("http://127.0.0.1:8080"));
         assert_eq!(
             imported
+                .meta
                 .usage_data
                 .as_ref()
                 .and_then(|value| value["userInfo"]["email"].as_str()),
@@ -10534,24 +10667,25 @@ mod settings_tests {
         );
         assert_eq!(
             imported
+                .meta
                 .tag_links
                 .as_ref()
                 .and_then(serde_json::Value::as_array)
                 .map(Vec::len),
             Some(1)
         );
-        assert!(imported.available_models_cache.is_some());
+        assert!(imported.meta.available_models_cache.is_some());
 
         let exported = service.export_credential_backup(&[id]);
         let exported_credential = &exported.credentials[0].credential;
         assert_eq!(exported_credential.region.as_deref(), Some("eu-west-1"));
         assert_eq!(
-            exported_credential.source_account_id.as_deref(),
+            exported_credential.meta.source_account_id.as_deref(),
             Some("source-enterprise-credential")
         );
         assert_eq!(
-            exported_credential.usage_data.as_ref(),
-            imported.usage_data.as_ref()
+            exported_credential.meta.usage_data.as_ref(),
+            imported.meta.usage_data.as_ref()
         );
 
         let status = service.get_all_credentials();
@@ -10615,7 +10749,7 @@ mod settings_tests {
             .unwrap();
 
         assert_eq!(
-            imported.source_account_id.as_deref(),
+            imported.meta.source_account_id.as_deref(),
             Some("nested-enterprise-credential")
         );
         assert_eq!(imported.auth_method.as_deref(), Some("idc"));
@@ -10659,7 +10793,7 @@ mod settings_tests {
                 "authMethod": "social",
                 "userId": "same-user",
                 "machineId": "machine-new",
-                "profileArn": "profile-new"
+                "profileArn": "arn:aws:codewhisperer:profile/new"
             }}]
         });
 
@@ -10682,7 +10816,10 @@ mod settings_tests {
             Some(expected_refresh.as_str())
         );
         assert_eq!(merged.machine_id.as_deref(), Some("machine-old"));
-        assert_eq!(merged.profile_arn.as_deref(), Some("profile-new"));
+        assert_eq!(
+            merged.profile_arn.as_deref(),
+            Some("arn:aws:codewhisperer:profile/new")
+        );
     }
 
     #[tokio::test]

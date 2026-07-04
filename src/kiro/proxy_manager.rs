@@ -151,7 +151,7 @@ impl ProxyManager {
             states.iter().map(|state| state.entry.clone()).collect()
         };
         let json = serde_json::to_string_pretty(&entries).context("序列化代理池失败")?;
-        let real_path = resolve_symlink_target(path);
+        let real_path = crate::common::io::resolve_symlink_target(path);
 
         let write = || -> anyhow::Result<()> {
             crate::common::io::atomic_write_string_secure(&real_path, &json)
@@ -353,15 +353,6 @@ pub struct ProxyView {
     pub entry: ProxyEntry,
     pub health: ProxyHealth,
     pub available_permits: Option<usize>,
-}
-
-fn resolve_symlink_target(path: &Path) -> PathBuf {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            std::fs::read_link(path).unwrap_or_else(|_| path.to_path_buf())
-        }
-        _ => path.to_path_buf(),
-    }
 }
 
 #[cfg(test)]

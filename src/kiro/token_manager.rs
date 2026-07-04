@@ -317,7 +317,7 @@ async fn refresh_social_token(
         new_credentials.refresh_token = Some(new_refresh_token);
     }
 
-    if let Some(profile_arn) = data.profile_arn {
+    if let Some(profile_arn) = KiroCredentials::clean_profile_arn(data.profile_arn) {
         new_credentials.profile_arn = Some(profile_arn);
     }
 
@@ -424,7 +424,7 @@ async fn refresh_idc_token(
     }
 
     // 同步更新 profile_arn（如果 IAM Identity Center 响应中包含）
-    if let Some(profile_arn) = data.profile_arn {
+    if let Some(profile_arn) = KiroCredentials::clean_profile_arn(data.profile_arn) {
         new_credentials.profile_arn = Some(profile_arn);
     }
 
@@ -556,31 +556,6 @@ pub(crate) async fn set_user_preference(
 // 多凭据 Token 管理器
 // ============================================================================
 
-/// 解析路径的真实目标（穿透 symlink）。
-///
-/// 用于 `persist_credentials` 的原子写入：保证 rename 替换的是 symlink
-/// 指向的真实文件，而不是 symlink 本身。
-///
-/// 优先 `canonicalize`（目标存在时最可靠），失败时 fallback 到 `read_link`，
-/// 都失败则返回原路径（保持既有路径语义）。
-fn resolve_symlink_target(path: &Path) -> PathBuf {
-    if let Ok(real) = std::fs::canonicalize(path) {
-        return real;
-    }
-
-    if let Ok(target) = std::fs::read_link(path) {
-        if target.is_absolute() {
-            return target;
-        }
-        if let Some(parent) = path.parent() {
-            return parent.join(target);
-        }
-        return target;
-    }
-
-    path.to_path_buf()
-}
-
 /// 单个凭据条目的状态
 struct CredentialEntry {
     /// 凭据唯一 ID
@@ -599,6 +574,40 @@ struct CredentialEntry {
     success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     last_used_at: Option<String>,
+    /// 认证类禁用的下一次自动重探时间（A4 自愈调度）。
+    ///
+    /// 运行时字段：不落盘，重启后重置为 None（重启即视为一次全新重探）。
+    /// A2 状态映射：Some(pending) 即 OPEN 态；到点被重探一次即 HALF_OPEN。
+    reprobe_next: Option<DateTime<Utc>>,
+    /// 自愈退避级别（0 = 未调度重探）。指数退避：1→1min 2→5min 3→30min 4+→2h。
+    ///
+    /// 运行时字段：不落盘。
+    recovery_backoff_level: u8,
+    /// 最近一次失败快照（运行时字段，不落盘）。
+    ///
+    /// 供前端秒级轮询感知封禁/调用失败：`code` 为稳定分类标签，
+    /// 前端映射为可读文案；`at` 为失败发生时刻。成功/恢复/手动启用时清空。
+    last_error: Option<CredentialLastError>,
+}
+
+/// 凭据最近一次失败快照（运行时内存字段）。
+#[derive(Debug, Clone)]
+struct CredentialLastError {
+    code: &'static str,
+    at: DateTime<Utc>,
+}
+
+impl CredentialEntry {
+    fn record_error(&mut self, code: &'static str) {
+        self.last_error = Some(CredentialLastError {
+            code,
+            at: Utc::now(),
+        });
+    }
+
+    fn clear_error(&mut self) {
+        self.last_error = None;
+    }
 }
 
 fn credentials_snapshot_for_persistence(entries: &[CredentialEntry]) -> Vec<KiroCredentials> {
@@ -607,9 +616,10 @@ fn credentials_snapshot_for_persistence(entries: &[CredentialEntry]) -> Vec<Kiro
         .map(|e| {
             let mut cred = e.credentials.clone();
             cred.canonicalize_auth_method();
+            cred.profile_arn = KiroCredentials::clean_profile_arn(cred.profile_arn.take());
             if let Some(reason) = persistent_disabled_reason(e.disabled_reason) {
                 cred.disabled = true;
-                cred.disabled_reason = Some(reason.to_string());
+                cred.meta.disabled_reason = Some(reason.to_string());
             } else {
                 cred.disabled = false;
             }
@@ -688,8 +698,8 @@ fn apply_social_login_update(existing: &mut KiroCredentials, incoming: &KiroCred
     existing.profile_arn = incoming.profile_arn.clone();
     existing.expires_at = incoming.expires_at.clone();
     existing.user_id = incoming.user_id.clone();
-    existing.subscription_title = incoming.subscription_title.clone();
-    existing.overage_status = incoming.overage_status.clone();
+    existing.meta.subscription_title = incoming.meta.subscription_title.clone();
+    existing.meta.overage_status = incoming.meta.overage_status.clone();
 
     if non_empty_trimmed(existing.auth_method.as_deref()).is_none() {
         existing.auth_method = incoming.auth_method.clone();
@@ -744,6 +754,31 @@ enum DisabledReason {
     InsufficientBalance,
     /// 模型临时不可用（全局禁用）
     ModelUnavailable,
+}
+
+/// 判定某禁用原因是否属于「认证类可自愈」集合（A4 自动重探资格）。
+///
+/// 仅认证凭证本身临时失效的场景可自动重探：AuthenticationFailed /
+/// TooManyRefreshFailures / InvalidRefreshToken。其余原因语义不同，
+/// 不走本路径：suspended/manual/config 为设计上的粘性禁用；quota/balance
+/// 由各自路径恢复；ModelUnavailable 由全局 check_and_recover 恢复。
+fn is_auth_recoverable_reason(reason: DisabledReason) -> bool {
+    matches!(
+        reason,
+        DisabledReason::AuthenticationFailed
+            | DisabledReason::TooManyRefreshFailures
+            | DisabledReason::InvalidRefreshToken
+    )
+}
+
+/// 自愈重探的指数退避时长：1→1min 2→5min 3→30min 4+→2h（封顶）。
+fn backoff_duration(level: u8) -> Duration {
+    match level {
+        0 | 1 => Duration::minutes(1),
+        2 => Duration::minutes(5),
+        3 => Duration::minutes(30),
+        _ => Duration::hours(2),
+    }
 }
 
 /// 统计数据持久化条目
@@ -1192,6 +1227,9 @@ impl MultiTokenManager {
                     },
                     success_count: 0,
                     last_used_at: None,
+                    reprobe_next: None,
+                    recovery_backoff_level: 0,
+                    last_error: None,
                 }
             })
             .collect();
@@ -2294,11 +2332,17 @@ impl MultiTokenManager {
                 entry.disabled_reason = Some(reason);
                 entry.last_used_at = Some(now.to_rfc3339());
                 entry.credentials.disabled = true;
-                entry.credentials.disabled_reason =
+                entry.credentials.meta.disabled_reason =
                     persistent_disabled_reason(Some(reason)).map(std::string::ToString::to_string);
-                entry.credentials.ban_status = Some("BANNED".to_string());
-                entry.credentials.ban_reason = Some(ban_reason.to_string());
-                entry.credentials.ban_time = Some(now.timestamp());
+                entry.credentials.meta.ban_status = Some("BANNED".to_string());
+                entry.credentials.meta.ban_reason = Some(ban_reason.to_string());
+                entry.credentials.meta.ban_time = Some(now.timestamp());
+                // A4：认证类禁用登记首次自愈重探（level 1 → 1min）。
+                // 非认证类（如 CredentialSuspended）保持粘性禁用，不调度。
+                if is_auth_recoverable_reason(reason) {
+                    entry.recovery_backoff_level = 1;
+                    entry.reprobe_next = Some(now + backoff_duration(1));
+                }
             }
         }
         self.remove_affinity_by_credential(id);
@@ -2774,7 +2818,7 @@ impl MultiTokenManager {
         // 原子写入 + chmod 0o600 (Unix)：rename 在同一文件系统上是原子操作，
         // 临时文件在 rename 前 set_permissions(0o600)，防同主机其他用户读取凭据。
         // 解析 symlink 以确保 rename 写入真实目标（而非替换 symlink 本身）。
-        let real_path = resolve_symlink_target(path);
+        let real_path = crate::common::io::resolve_symlink_target(path);
 
         let do_atomic_write = || -> anyhow::Result<()> {
             crate::common::io::atomic_write_string_secure(&real_path, &json)
@@ -2942,69 +2986,69 @@ impl MultiTokenManager {
             let mut changed = false;
 
             if let Some(status) = usage_limits.overage_status()
-                && credentials.overage_status.as_deref() != Some(status)
+                && credentials.meta.overage_status.as_deref() != Some(status)
             {
-                credentials.overage_status = Some(status.to_string());
+                credentials.meta.overage_status = Some(status.to_string());
                 changed = true;
             }
             if let Some(capability) = usage_limits.overage_capability()
-                && credentials.overage_capability.as_deref() != Some(capability)
+                && credentials.meta.overage_capability.as_deref() != Some(capability)
             {
-                credentials.overage_capability = Some(capability.to_string());
+                credentials.meta.overage_capability = Some(capability.to_string());
                 changed = true;
             }
             if let Some(subscription_type) = usage_limits.subscription_type()
-                && credentials.subscription_type.as_deref() != Some(subscription_type.as_str())
+                && credentials.meta.subscription_type.as_deref() != Some(subscription_type.as_str())
             {
-                credentials.subscription_type = Some(subscription_type);
+                credentials.meta.subscription_type = Some(subscription_type);
                 changed = true;
             }
             if let Some(subscription_title) = usage_limits.subscription_title()
-                && credentials.subscription_title.as_deref() != Some(subscription_title)
+                && credentials.meta.subscription_title.as_deref() != Some(subscription_title)
             {
-                credentials.subscription_title = Some(subscription_title.to_string());
+                credentials.meta.subscription_title = Some(subscription_title.to_string());
                 changed = true;
             }
-            if credentials.overage_cap != Some(usage_limits.overage_cap()) {
-                credentials.overage_cap = Some(usage_limits.overage_cap());
+            if credentials.meta.overage_cap != Some(usage_limits.overage_cap()) {
+                credentials.meta.overage_cap = Some(usage_limits.overage_cap());
                 changed = true;
             }
-            if credentials.overage_rate != Some(usage_limits.overage_rate()) {
-                credentials.overage_rate = Some(usage_limits.overage_rate());
+            if credentials.meta.overage_rate != Some(usage_limits.overage_rate()) {
+                credentials.meta.overage_rate = Some(usage_limits.overage_rate());
                 changed = true;
             }
-            if credentials.current_overages != Some(current_overages) {
-                credentials.current_overages = Some(current_overages);
+            if credentials.meta.current_overages != Some(current_overages) {
+                credentials.meta.current_overages = Some(current_overages);
                 changed = true;
             }
-            if credentials.usage_current != Some(current_usage) {
-                credentials.usage_current = Some(current_usage);
+            if credentials.meta.usage_current != Some(current_usage) {
+                credentials.meta.usage_current = Some(current_usage);
                 changed = true;
             }
-            if credentials.usage_limit != Some(usage_limit) {
-                credentials.usage_limit = Some(usage_limit);
+            if credentials.meta.usage_limit != Some(usage_limit) {
+                credentials.meta.usage_limit = Some(usage_limit);
                 changed = true;
             }
-            if credentials.usage_percent != Some(usage_percent) {
-                credentials.usage_percent = Some(usage_percent);
+            if credentials.meta.usage_percent != Some(usage_percent) {
+                credentials.meta.usage_percent = Some(usage_percent);
                 changed = true;
             }
             if let Some(next_reset_date) = next_reset_date
-                && credentials.next_reset_date.as_deref() != Some(next_reset_date.as_str())
+                && credentials.meta.next_reset_date.as_deref() != Some(next_reset_date.as_str())
             {
-                credentials.next_reset_date = Some(next_reset_date);
+                credentials.meta.next_reset_date = Some(next_reset_date);
                 changed = true;
             }
             if let Some(trial_current) = usage_limits.trial_usage_current()
-                && credentials.trial_usage_current != Some(trial_current)
+                && credentials.meta.trial_usage_current != Some(trial_current)
             {
-                credentials.trial_usage_current = Some(trial_current);
+                credentials.meta.trial_usage_current = Some(trial_current);
                 changed = true;
             }
             if let Some(trial_limit) = usage_limits.trial_usage_limit()
-                && credentials.trial_usage_limit != Some(trial_limit)
+                && credentials.meta.trial_usage_limit != Some(trial_limit)
             {
-                credentials.trial_usage_limit = Some(trial_limit);
+                credentials.meta.trial_usage_limit = Some(trial_limit);
                 changed = true;
             }
             if let Some(trial_limit) = usage_limits.trial_usage_limit() {
@@ -3013,29 +3057,29 @@ impl MultiTokenManager {
                 } else {
                     0.0
                 };
-                if credentials.trial_usage_percent != Some(trial_percent) {
-                    credentials.trial_usage_percent = Some(trial_percent);
+                if credentials.meta.trial_usage_percent != Some(trial_percent) {
+                    credentials.meta.trial_usage_percent = Some(trial_percent);
                     changed = true;
                 }
             }
             if let Some(trial_status) = usage_limits.trial_status()
-                && credentials.trial_status.as_deref() != Some(trial_status)
+                && credentials.meta.trial_status.as_deref() != Some(trial_status)
             {
-                credentials.trial_status = Some(trial_status.to_string());
+                credentials.meta.trial_status = Some(trial_status.to_string());
                 changed = true;
             }
             if let Some(trial_expires_at) = usage_limits.trial_expires_at()
-                && credentials.trial_expires_at != Some(trial_expires_at)
+                && credentials.meta.trial_expires_at != Some(trial_expires_at)
             {
-                credentials.trial_expires_at = Some(trial_expires_at);
+                credentials.meta.trial_expires_at = Some(trial_expires_at);
                 changed = true;
             }
-            if credentials.overage_checked_at != Some(checked_at) {
-                credentials.overage_checked_at = Some(checked_at);
+            if credentials.meta.overage_checked_at != Some(checked_at) {
+                credentials.meta.overage_checked_at = Some(checked_at);
                 changed = true;
             }
-            if credentials.last_refresh != Some(checked_at) {
-                credentials.last_refresh = Some(checked_at);
+            if credentials.meta.last_refresh != Some(checked_at) {
+                credentials.meta.last_refresh = Some(checked_at);
                 changed = true;
             }
 
@@ -3173,6 +3217,9 @@ impl MultiTokenManager {
 
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::TooManyRefreshFailures);
+            // A4：登记首次自愈重探（level 1 → 1min）。
+            entry.recovery_backoff_level = 1;
+            entry.reprobe_next = Some(Utc::now() + backoff_duration(1));
 
             tracing::error!(
                 "凭据 #{} 令牌已连续刷新失败 {} 次，已被禁用",
@@ -3213,6 +3260,9 @@ impl MultiTokenManager {
             entry.last_used_at = Some(Utc::now().to_rfc3339());
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::InvalidRefreshToken);
+            // A4：登记首次自愈重探（level 1 → 1min）。
+            entry.recovery_backoff_level = 1;
+            entry.reprobe_next = Some(Utc::now() + backoff_duration(1));
 
             tracing::error!(
                 "凭据 #{} refreshToken 已失效 (invalid_grant)，已立即禁用",
@@ -3259,20 +3309,20 @@ impl MultiTokenManager {
                     },
                     provider: e.credentials.provider.clone(),
                     user_id: e.credentials.user_id.clone(),
-                    source_account_id: e.credentials.source_account_id.clone(),
-                    label: e.credentials.label.clone(),
-                    status: e.credentials.status.clone(),
-                    added_at: e.credentials.added_at.clone(),
-                    nickname: e.credentials.nickname.clone(),
-                    group_id: e.credentials.group_id.clone(),
-                    tag_links: e.credentials.tag_links.clone(),
-                    usage_data: e.credentials.usage_data.clone(),
-                    has_available_models_cache: e.credentials.available_models_cache.is_some(),
-                    source_failure_count: e.credentials.failure_count,
-                    source_last_failure_at: e.credentials.last_failure_at.clone(),
-                    source_disabled_reason: e.credentials.disabled_reason.clone(),
-                    source_success_count: e.credentials.success_count,
-                    has_profile_arn: e.credentials.profile_arn.is_some(),
+                    source_account_id: e.credentials.meta.source_account_id.clone(),
+                    label: e.credentials.meta.label.clone(),
+                    status: e.credentials.meta.status.clone(),
+                    added_at: e.credentials.meta.added_at.clone(),
+                    nickname: e.credentials.meta.nickname.clone(),
+                    group_id: e.credentials.meta.group_id.clone(),
+                    tag_links: e.credentials.meta.tag_links.clone(),
+                    usage_data: e.credentials.meta.usage_data.clone(),
+                    has_available_models_cache: e.credentials.meta.available_models_cache.is_some(),
+                    source_failure_count: e.credentials.meta.failure_count,
+                    source_last_failure_at: e.credentials.meta.last_failure_at.clone(),
+                    source_disabled_reason: e.credentials.meta.disabled_reason.clone(),
+                    source_success_count: e.credentials.meta.success_count,
+                    has_profile_arn: e.credentials.profile_arn_trimmed().is_some(),
                     has_token: has_non_empty_secret(&e.credentials.access_token),
                     has_refresh_token: has_non_empty_secret(&e.credentials.refresh_token),
                     has_client_id: has_non_empty_secret(&e.credentials.client_id),
@@ -3296,35 +3346,35 @@ impl MultiTokenManager {
                     token_endpoint: e.credentials.token_endpoint.clone(),
                     issuer_url: e.credentials.issuer_url.clone(),
                     scopes: e.credentials.scopes.clone(),
-                    subscription_type: e.credentials.subscription_type.clone(),
-                    subscription_title: e.credentials.subscription_title.clone(),
-                    days_remaining: e.credentials.days_remaining,
-                    overage_status: e.credentials.overage_status.clone(),
-                    overage_capability: e.credentials.overage_capability.clone(),
-                    overage_cap: e.credentials.overage_cap,
-                    overage_rate: e.credentials.overage_rate,
-                    current_overages: e.credentials.current_overages,
-                    overage_checked_at: e.credentials.overage_checked_at,
-                    ban_status: e.credentials.ban_status.clone(),
-                    ban_reason: e.credentials.ban_reason.clone(),
-                    ban_time: e.credentials.ban_time,
-                    usage_current: e.credentials.usage_current,
-                    usage_limit: e.credentials.usage_limit,
-                    usage_percent: e.credentials.usage_percent,
-                    next_reset_date: e.credentials.next_reset_date.clone(),
-                    last_refresh: e.credentials.last_refresh,
-                    trial_usage_current: e.credentials.trial_usage_current,
-                    trial_usage_limit: e.credentials.trial_usage_limit,
-                    trial_usage_percent: e.credentials.trial_usage_percent,
-                    trial_status: e.credentials.trial_status.clone(),
-                    trial_expires_at: e.credentials.trial_expires_at,
-                    request_count: e.credentials.request_count,
-                    error_count: e.credentials.error_count,
-                    total_tokens: e.credentials.total_tokens,
-                    total_credits: e.credentials.total_credits,
-                    last_used: e.credentials.last_used_at,
-                    created_at: e.credentials.created_at,
-                    tags: e.credentials.tags.clone(),
+                    subscription_type: e.credentials.meta.subscription_type.clone(),
+                    subscription_title: e.credentials.meta.subscription_title.clone(),
+                    days_remaining: e.credentials.meta.days_remaining,
+                    overage_status: e.credentials.meta.overage_status.clone(),
+                    overage_capability: e.credentials.meta.overage_capability.clone(),
+                    overage_cap: e.credentials.meta.overage_cap,
+                    overage_rate: e.credentials.meta.overage_rate,
+                    current_overages: e.credentials.meta.current_overages,
+                    overage_checked_at: e.credentials.meta.overage_checked_at,
+                    ban_status: e.credentials.meta.ban_status.clone(),
+                    ban_reason: e.credentials.meta.ban_reason.clone(),
+                    ban_time: e.credentials.meta.ban_time,
+                    usage_current: e.credentials.meta.usage_current,
+                    usage_limit: e.credentials.meta.usage_limit,
+                    usage_percent: e.credentials.meta.usage_percent,
+                    next_reset_date: e.credentials.meta.next_reset_date.clone(),
+                    last_refresh: e.credentials.meta.last_refresh,
+                    trial_usage_current: e.credentials.meta.trial_usage_current,
+                    trial_usage_limit: e.credentials.meta.trial_usage_limit,
+                    trial_usage_percent: e.credentials.meta.trial_usage_percent,
+                    trial_status: e.credentials.meta.trial_status.clone(),
+                    trial_expires_at: e.credentials.meta.trial_expires_at,
+                    request_count: e.credentials.meta.request_count,
+                    error_count: e.credentials.meta.error_count,
+                    total_tokens: e.credentials.meta.total_tokens,
+                    total_credits: e.credentials.meta.total_credits,
+                    last_used: e.credentials.meta.last_used_at,
+                    created_at: e.credentials.meta.created_at,
+                    tags: e.credentials.meta.tags.clone(),
                     refresh_token_hash: if e.credentials.is_api_key_credential() {
                         None
                     } else {
@@ -3498,7 +3548,7 @@ impl MultiTokenManager {
                             manual_disabled = !enabled;
                         }
                         if let Some(nickname) = &nickname {
-                            cred.nickname = nickname.clone();
+                            cred.meta.nickname = nickname.clone();
                         }
                         if let Some(machine_id) = &machine_id {
                             cred.machine_id =
@@ -3538,7 +3588,7 @@ impl MultiTokenManager {
             entry.credentials.weight = weight;
         }
         if let Some(nickname) = nickname {
-            entry.credentials.nickname = nickname;
+            entry.credentials.meta.nickname = nickname;
         }
         if let Some(machine_id) = machine_id {
             entry.credentials.machine_id = machine_id::normalize_optional_machine_id(machine_id);
@@ -3714,6 +3764,8 @@ impl MultiTokenManager {
     }
 
     fn credential_for_persistence(mut credentials: KiroCredentials) -> KiroCredentials {
+        credentials.profile_arn =
+            KiroCredentials::clean_profile_arn(credentials.profile_arn.take());
         if credentials.proxy_id.is_some() {
             credentials.proxy_url = None;
             credentials.proxy_username = None;
@@ -4012,9 +4064,10 @@ impl MultiTokenManager {
             let changed = {
                 let mut entries = self.entries.lock();
                 if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                    let old_title = entry.credentials.subscription_title.clone();
+                    let old_title = entry.credentials.meta.subscription_title.clone();
                     if old_title.as_deref() != Some(subscription_title) {
-                        entry.credentials.subscription_title = Some(subscription_title.to_string());
+                        entry.credentials.meta.subscription_title =
+                            Some(subscription_title.to_string());
                         tracing::info!(
                             "凭据 #{} 订阅等级已更新: {:?} -> {}",
                             id,
@@ -4189,11 +4242,8 @@ impl MultiTokenManager {
         {
             let entries = self.entries.lock();
             if let Some(entry) = entries.iter().find(|e| e.id == id) {
-                if let Some(arn) = entry.credentials.profile_arn.as_deref() {
-                    let trimmed = arn.trim();
-                    if !trimmed.is_empty() {
-                        return Ok(trimmed.to_string());
-                    }
+                if let Some(arn) = entry.credentials.profile_arn_trimmed() {
+                    return Ok(arn.to_string());
                 }
             }
         }
@@ -4232,13 +4282,21 @@ impl MultiTokenManager {
             .await
             {
                 Ok(arn) => {
-                    tracing::info!(
-                        "凭据 #{} 通过 ListAvailableProfiles 获取到 profile_arn: {}",
-                        id,
-                        arn
-                    );
-                    self.update_profile_arn(id, &arn);
-                    return Ok(arn);
+                    if let Some(arn) = KiroCredentials::clean_profile_arn(Some(arn)) {
+                        tracing::info!(
+                            "凭据 #{} 通过 ListAvailableProfiles 获取到 profile_arn: {}",
+                            id,
+                            arn
+                        );
+                        self.update_profile_arn(id, &arn);
+                        return Ok(arn);
+                    } else {
+                        tracing::debug!("凭据 #{} ListAvailableProfiles 返回非法 profile_arn", id);
+                        (
+                            "ListAvailableProfiles 返回非法 profile_arn".to_string(),
+                            false,
+                        )
+                    }
                 }
                 Err(e) => {
                     let profile_unsupported = Self::is_builder_id_profile_unsupported_error(&e);
@@ -4255,27 +4313,22 @@ impl MultiTokenManager {
             let effective_proxy = credentials.effective_proxy(proxy_snap.as_ref());
             match refresh_token(&credentials, &config_snap, effective_proxy.as_ref()).await {
                 Ok(new_creds) => {
-                    if let Some(arn) = new_creds.profile_arn.clone() {
-                        let trimmed = arn.trim();
-                        if !trimmed.is_empty() {
-                            tracing::info!(
-                                "凭据 #{} 通过 token 刷新获取到 profile_arn: {}",
-                                id,
-                                trimmed
-                            );
-                            {
-                                let mut entries = self.entries.lock();
-                                if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                                    entry.credentials =
-                                        Self::credential_for_persistence(new_creds.clone());
-                                }
+                    if let Some(arn) =
+                        KiroCredentials::clean_profile_arn(new_creds.profile_arn.clone())
+                    {
+                        tracing::info!("凭据 #{} 通过 token 刷新获取到 profile_arn: {}", id, arn);
+                        {
+                            let mut entries = self.entries.lock();
+                            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                                entry.credentials =
+                                    Self::credential_for_persistence(new_creds.clone());
                             }
-                            self.profile_arn_suppressed_until.lock().remove(&id);
-                            if let Err(e) = self.persist_credentials() {
-                                tracing::warn!("profile_arn 更新后持久化失败: {}", e);
-                            }
-                            return Ok(trimmed.to_string());
                         }
+                        self.profile_arn_suppressed_until.lock().remove(&id);
+                        if let Err(e) = self.persist_credentials() {
+                            tracing::warn!("profile_arn 更新后持久化失败: {}", e);
+                        }
+                        return Ok(arn);
                     }
                 }
                 Err(e) => {
@@ -4428,10 +4481,14 @@ impl MultiTokenManager {
 
     /// 更新凭据的 profile_arn
     fn update_profile_arn(&self, id: u64, arn: &str) {
+        let Some(arn) = KiroCredentials::clean_profile_arn(Some(arn.to_string())) else {
+            tracing::warn!("忽略非法 profile_arn: {}", arn);
+            return;
+        };
         {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                entry.credentials.profile_arn = Some(arn.to_string());
+                entry.credentials.profile_arn = Some(arn);
             }
         }
         self.profile_arn_suppressed_until.lock().remove(&id);
@@ -4761,6 +4818,9 @@ impl MultiTokenManager {
                 disabled_reason: None,
                 success_count: 0,
                 last_used_at: None,
+                reprobe_next: None,
+                recovery_backoff_level: 0,
+                last_error: None,
             });
         }
 
@@ -4875,6 +4935,9 @@ impl MultiTokenManager {
                 },
                 success_count: 0,
                 last_used_at: None,
+                reprobe_next: None,
+                recovery_backoff_level: 0,
+                last_error: None,
             });
         }
 
@@ -5010,63 +5073,110 @@ impl MultiTokenManager {
         changed |= Self::fill_optional_string(&mut target.api_region, &source.api_region);
         changed |= Self::fill_optional_string(&mut target.machine_id, &source.machine_id);
         changed |= Self::fill_optional_string(&mut target.email, &source.email);
-        changed |=
-            Self::fill_optional_string(&mut target.source_account_id, &source.source_account_id);
-        changed |= Self::fill_optional_string(&mut target.label, &source.label);
-        changed |= Self::fill_optional_string(&mut target.status, &source.status);
-        changed |= Self::fill_optional_string(&mut target.added_at, &source.added_at);
-        changed |= Self::fill_optional_string(&mut target.password, &source.password);
-        changed |=
-            Self::fill_optional_string(&mut target.subscription_title, &source.subscription_title);
-        changed |= Self::fill_optional_string(&mut target.overage_status, &source.overage_status);
-        changed |= Self::fill_optional_value(&mut target.usage_data, &source.usage_data);
-        changed |= Self::fill_optional_string(&mut target.group_id, &source.group_id);
-        changed |= Self::fill_optional_value(&mut target.tag_links, &source.tag_links);
-        changed |= Self::fill_optional_value(
-            &mut target.available_models_cache,
-            &source.available_models_cache,
+        changed |= Self::fill_optional_string(
+            &mut target.meta.source_account_id,
+            &source.meta.source_account_id,
         );
-        changed |= Self::fill_optional_value(&mut target.failure_count, &source.failure_count);
-        changed |= Self::fill_optional_string(&mut target.last_failure_at, &source.last_failure_at);
-        changed |= Self::fill_optional_string(&mut target.disabled_reason, &source.disabled_reason);
-        changed |= Self::fill_optional_value(&mut target.success_count, &source.success_count);
-        changed |= Self::fill_optional_string(&mut target.csrf_token, &source.csrf_token);
-        changed |= Self::fill_optional_string(&mut target.nickname, &source.nickname);
-        changed |= Self::fill_optional_string(&mut target.ban_status, &source.ban_status);
-        changed |= Self::fill_optional_string(&mut target.ban_reason, &source.ban_reason);
-        changed |= Self::fill_optional_value(&mut target.ban_time, &source.ban_time);
+        changed |= Self::fill_optional_string(&mut target.meta.label, &source.meta.label);
+        changed |= Self::fill_optional_string(&mut target.meta.status, &source.meta.status);
+        changed |= Self::fill_optional_string(&mut target.meta.added_at, &source.meta.added_at);
+        changed |= Self::fill_optional_string(&mut target.meta.password, &source.meta.password);
+        changed |= Self::fill_optional_string(
+            &mut target.meta.subscription_title,
+            &source.meta.subscription_title,
+        );
+        changed |= Self::fill_optional_string(
+            &mut target.meta.overage_status,
+            &source.meta.overage_status,
+        );
+        changed |= Self::fill_optional_value(&mut target.meta.usage_data, &source.meta.usage_data);
+        changed |= Self::fill_optional_string(&mut target.meta.group_id, &source.meta.group_id);
+        changed |= Self::fill_optional_value(&mut target.meta.tag_links, &source.meta.tag_links);
+        changed |= Self::fill_optional_value(
+            &mut target.meta.available_models_cache,
+            &source.meta.available_models_cache,
+        );
         changed |=
-            Self::fill_optional_string(&mut target.subscription_type, &source.subscription_type);
-        changed |= Self::fill_optional_value(&mut target.days_remaining, &source.days_remaining);
-        changed |= Self::fill_optional_value(&mut target.usage_current, &source.usage_current);
-        changed |= Self::fill_optional_value(&mut target.usage_limit, &source.usage_limit);
-        changed |= Self::fill_optional_value(&mut target.usage_percent, &source.usage_percent);
-        changed |= Self::fill_optional_string(&mut target.next_reset_date, &source.next_reset_date);
-        changed |= Self::fill_optional_value(&mut target.last_refresh, &source.last_refresh);
+            Self::fill_optional_value(&mut target.meta.failure_count, &source.meta.failure_count);
+        changed |= Self::fill_optional_string(
+            &mut target.meta.last_failure_at,
+            &source.meta.last_failure_at,
+        );
+        changed |= Self::fill_optional_string(
+            &mut target.meta.disabled_reason,
+            &source.meta.disabled_reason,
+        );
         changed |=
-            Self::fill_optional_value(&mut target.trial_usage_current, &source.trial_usage_current);
+            Self::fill_optional_value(&mut target.meta.success_count, &source.meta.success_count);
+        changed |= Self::fill_optional_string(&mut target.meta.csrf_token, &source.meta.csrf_token);
+        changed |= Self::fill_optional_string(&mut target.meta.nickname, &source.meta.nickname);
+        changed |= Self::fill_optional_string(&mut target.meta.ban_status, &source.meta.ban_status);
+        changed |= Self::fill_optional_string(&mut target.meta.ban_reason, &source.meta.ban_reason);
+        changed |= Self::fill_optional_value(&mut target.meta.ban_time, &source.meta.ban_time);
+        changed |= Self::fill_optional_string(
+            &mut target.meta.subscription_type,
+            &source.meta.subscription_type,
+        );
         changed |=
-            Self::fill_optional_value(&mut target.trial_usage_limit, &source.trial_usage_limit);
+            Self::fill_optional_value(&mut target.meta.days_remaining, &source.meta.days_remaining);
         changed |=
-            Self::fill_optional_value(&mut target.trial_usage_percent, &source.trial_usage_percent);
-        changed |= Self::fill_optional_string(&mut target.trial_status, &source.trial_status);
+            Self::fill_optional_value(&mut target.meta.usage_current, &source.meta.usage_current);
         changed |=
-            Self::fill_optional_value(&mut target.trial_expires_at, &source.trial_expires_at);
+            Self::fill_optional_value(&mut target.meta.usage_limit, &source.meta.usage_limit);
         changed |=
-            Self::fill_optional_string(&mut target.overage_capability, &source.overage_capability);
-        changed |= Self::fill_optional_value(&mut target.overage_cap, &source.overage_cap);
-        changed |= Self::fill_optional_value(&mut target.overage_rate, &source.overage_rate);
+            Self::fill_optional_value(&mut target.meta.usage_percent, &source.meta.usage_percent);
+        changed |= Self::fill_optional_string(
+            &mut target.meta.next_reset_date,
+            &source.meta.next_reset_date,
+        );
         changed |=
-            Self::fill_optional_value(&mut target.current_overages, &source.current_overages);
+            Self::fill_optional_value(&mut target.meta.last_refresh, &source.meta.last_refresh);
+        changed |= Self::fill_optional_value(
+            &mut target.meta.trial_usage_current,
+            &source.meta.trial_usage_current,
+        );
+        changed |= Self::fill_optional_value(
+            &mut target.meta.trial_usage_limit,
+            &source.meta.trial_usage_limit,
+        );
+        changed |= Self::fill_optional_value(
+            &mut target.meta.trial_usage_percent,
+            &source.meta.trial_usage_percent,
+        );
         changed |=
-            Self::fill_optional_value(&mut target.overage_checked_at, &source.overage_checked_at);
-        changed |= Self::fill_optional_value(&mut target.request_count, &source.request_count);
-        changed |= Self::fill_optional_value(&mut target.error_count, &source.error_count);
-        changed |= Self::fill_optional_value(&mut target.total_tokens, &source.total_tokens);
-        changed |= Self::fill_optional_value(&mut target.total_credits, &source.total_credits);
-        changed |= Self::fill_optional_value(&mut target.last_used_at, &source.last_used_at);
-        changed |= Self::fill_optional_value(&mut target.created_at, &source.created_at);
-        changed |= Self::fill_optional_value(&mut target.tags, &source.tags);
+            Self::fill_optional_string(&mut target.meta.trial_status, &source.meta.trial_status);
+        changed |= Self::fill_optional_value(
+            &mut target.meta.trial_expires_at,
+            &source.meta.trial_expires_at,
+        );
+        changed |= Self::fill_optional_string(
+            &mut target.meta.overage_capability,
+            &source.meta.overage_capability,
+        );
+        changed |=
+            Self::fill_optional_value(&mut target.meta.overage_cap, &source.meta.overage_cap);
+        changed |=
+            Self::fill_optional_value(&mut target.meta.overage_rate, &source.meta.overage_rate);
+        changed |= Self::fill_optional_value(
+            &mut target.meta.current_overages,
+            &source.meta.current_overages,
+        );
+        changed |= Self::fill_optional_value(
+            &mut target.meta.overage_checked_at,
+            &source.meta.overage_checked_at,
+        );
+        changed |=
+            Self::fill_optional_value(&mut target.meta.request_count, &source.meta.request_count);
+        changed |=
+            Self::fill_optional_value(&mut target.meta.error_count, &source.meta.error_count);
+        changed |=
+            Self::fill_optional_value(&mut target.meta.total_tokens, &source.meta.total_tokens);
+        changed |=
+            Self::fill_optional_value(&mut target.meta.total_credits, &source.meta.total_credits);
+        changed |=
+            Self::fill_optional_value(&mut target.meta.last_used_at, &source.meta.last_used_at);
+        changed |= Self::fill_optional_value(&mut target.meta.created_at, &source.meta.created_at);
+        changed |= Self::fill_optional_value(&mut target.meta.tags, &source.meta.tags);
         changed |= Self::fill_optional_string(&mut target.proxy_url, &source.proxy_url);
         changed |= Self::fill_optional_string(&mut target.proxy_username, &source.proxy_username);
         changed |= Self::fill_optional_string(&mut target.proxy_password, &source.proxy_password);
@@ -5132,6 +5242,9 @@ impl MultiTokenManager {
                 },
                 success_count: 0,
                 last_used_at: None,
+                reprobe_next: None,
+                recovery_backoff_level: 0,
+                last_error: None,
             });
         }
         if disabled {
@@ -5395,6 +5508,9 @@ impl MultiTokenManager {
                     disabled_reason: None,
                     success_count: 0,
                     last_used_at: None,
+                    reprobe_next: None,
+                    recovery_backoff_level: 0,
+                    last_error: None,
                 });
                 tracing::info!("社交登录已添加新凭据 #{}", id);
                 Ok(id)
@@ -5638,6 +5754,104 @@ impl MultiTokenManager {
             .collect()
     }
 
+    /// 获取到点应自愈重探的认证类禁用凭据 ID（A4）。
+    ///
+    /// 资格条件：已禁用 且 禁用原因属于认证类可自愈集合 且 已到 reprobe_next
+    /// 且 非 api_key 凭据。对应 A2 的 OPEN→HALF_OPEN：本 tick 允许单次重探。
+    pub fn get_ids_due_for_reprobe(&self) -> Vec<u64> {
+        let now = Utc::now();
+        let entries = self.entries.lock();
+        entries
+            .iter()
+            .filter(|e| {
+                e.disabled
+                    && e.disabled_reason
+                        .map(is_auth_recoverable_reason)
+                        .unwrap_or(false)
+                    && e.reprobe_next.map(|t| now >= t).unwrap_or(false)
+                    && !e.credentials.is_api_key_credential()
+            })
+            .map(|e| e.id)
+            .collect()
+    }
+
+    /// 应用一次自愈重探结果（A2 HALF_OPEN 的落地）。
+    ///
+    /// 仅对当前处于「认证类禁用」的条目生效；非该状态直接忽略，
+    /// 从而保证非禁用即将过期凭据的常规刷新行为完全不受影响。
+    /// - success=true：HALF_OPEN→CLOSED，重新启用并清空退避与封禁元数据。
+    /// - success=false：HALF_OPEN→OPEN，保持禁用并推进退避（level+1，封顶 4）。
+    ///
+    /// success 的判定由调用方负责：必须是「真实刷到新令牌」，而非
+    /// refresh_token_for_credential 的优雅降级（fallback），因为被禁用凭据的
+    /// 令牌已失效，降级复用旧令牌不代表认证已恢复。
+    fn apply_reprobe_outcome(&self, id: u64, success: bool) {
+        let mut re_enabled = false;
+        {
+            let mut entries = self.entries.lock();
+            let entry = match entries.iter_mut().find(|e| e.id == id) {
+                Some(e) => e,
+                None => return,
+            };
+            if !(entry.disabled
+                && entry
+                    .disabled_reason
+                    .map(is_auth_recoverable_reason)
+                    .unwrap_or(false))
+            {
+                return;
+            }
+            if success {
+                entry.disabled = false;
+                entry.disabled_reason = None;
+                entry.failure_count = 0;
+                entry.refresh_failure_count = 0;
+                entry.reprobe_next = None;
+                entry.recovery_backoff_level = 0;
+                entry.credentials.disabled = false;
+                entry.credentials.meta.disabled_reason = None;
+                entry.credentials.meta.ban_status = None;
+                entry.credentials.meta.ban_reason = None;
+                entry.credentials.meta.ban_time = None;
+                re_enabled = true;
+                tracing::info!("凭据 #{} 自愈重探成功，已重新启用", id);
+            } else {
+                let new_level = entry.recovery_backoff_level.saturating_add(1).min(4);
+                entry.recovery_backoff_level = new_level;
+                entry.reprobe_next = Some(Utc::now() + backoff_duration(new_level));
+                tracing::warn!(
+                    "凭据 #{} 自愈重探失败，退避升至 level {}（下次 {}）",
+                    id,
+                    new_level,
+                    entry
+                        .reprobe_next
+                        .map(|t| t.to_rfc3339())
+                        .unwrap_or_default()
+                );
+            }
+        }
+        if re_enabled {
+            if let Err(e) = self.persist_credentials() {
+                tracing::warn!("凭据 #{} 自愈重新启用后持久化失败: {}", id, e);
+            }
+        }
+    }
+
+    /// 判定某凭据当前是否处于「认证类禁用」（自愈重探对象）。
+    fn is_auth_disabled_for_reprobe(&self, id: u64) -> bool {
+        let entries = self.entries.lock();
+        entries
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| {
+                e.disabled
+                    && e.disabled_reason
+                        .map(is_auth_recoverable_reason)
+                        .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    }
+
     /// 启动后台令牌刷新任务
     ///
     /// 重复调用会先停止旧任务，再启动新任务。
@@ -5659,16 +5873,42 @@ impl MultiTokenManager {
             move |id| {
                 let manager = Arc::clone(&manager_for_refresh);
                 Box::pin(async move {
+                    // 复用同一刷新入口。若该 id 当前是认证类禁用，则本次即为
+                    // A4 自愈重探（A2 HALF_OPEN）：需按「是否真正刷到新令牌」
+                    // 判定成败并推进/清空退避；否则保持原有即将过期刷新语义不变。
+                    let is_reprobe = manager.is_auth_disabled_for_reprobe(id);
                     match manager.refresh_token_for_credential(id).await {
-                        Ok(_) => true,
+                        Ok(result) => {
+                            if is_reprobe {
+                                // fallback（优雅降级）不代表认证恢复，仅真实刷新算成功。
+                                let fresh = result.success && !result.used_fallback;
+                                manager.apply_reprobe_outcome(id, fresh);
+                                fresh
+                            } else {
+                                true
+                            }
+                        }
                         Err(e) => {
                             tracing::warn!("后台刷新凭据 #{} 令牌失败: {}", id, e);
+                            if is_reprobe {
+                                manager.apply_reprobe_outcome(id, false);
+                            }
                             false
                         }
                     }
                 })
             },
-            move |mins| manager_for_ids.get_expiring_credential_ids(mins.max(refresh_before_mins)),
+            move |mins| {
+                // A4：常规即将过期 ID 与到点自愈重探 ID 取并集（去重）。
+                let mut ids =
+                    manager_for_ids.get_expiring_credential_ids(mins.max(refresh_before_mins));
+                for id in manager_for_ids.get_ids_due_for_reprobe() {
+                    if !ids.contains(&id) {
+                        ids.push(id);
+                    }
+                }
+                ids
+            },
         ) {
             tracing::error!("启动后台刷新任务失败: {}", e);
         }
@@ -6105,7 +6345,7 @@ mod tests {
         let mut incoming =
             social_login_credential("Google", &"b".repeat(150), Some("user-1"), "machine-new");
         incoming.email = Some("new@example.com".to_string());
-        incoming.subscription_title = Some("KIRO PRO+".to_string());
+        incoming.meta.subscription_title = Some("KIRO PRO+".to_string());
 
         let id = manager
             .upsert_prevalidated_social_credential(incoming)
@@ -6124,7 +6364,10 @@ mod tests {
         assert_eq!(updated.user_id.as_deref(), Some("user-1"));
         assert_eq!(updated.machine_id.as_deref(), Some("machine-old"));
         assert_eq!(updated.email.as_deref(), Some("old@example.com"));
-        assert_eq!(updated.subscription_title.as_deref(), Some("KIRO PRO+"));
+        assert_eq!(
+            updated.meta.subscription_title.as_deref(),
+            Some("KIRO PRO+")
+        );
     }
 
     #[test]
@@ -6819,28 +7062,28 @@ mod tests {
         let auth = saved.iter().find(|cred| cred.id == Some(1)).unwrap();
         assert!(auth.disabled);
         assert_eq!(
-            auth.disabled_reason.as_deref(),
+            auth.meta.disabled_reason.as_deref(),
             Some("AuthenticationFailed")
         );
-        assert_eq!(auth.ban_status.as_deref(), Some("BANNED"));
+        assert_eq!(auth.meta.ban_status.as_deref(), Some("BANNED"));
         assert_eq!(
-            auth.ban_reason.as_deref(),
+            auth.meta.ban_reason.as_deref(),
             Some("Authentication failed - token invalid or expired")
         );
-        assert!(auth.ban_time.is_some());
+        assert!(auth.meta.ban_time.is_some());
 
         let suspended = saved.iter().find(|cred| cred.id == Some(2)).unwrap();
         assert!(suspended.disabled);
         assert_eq!(
-            suspended.disabled_reason.as_deref(),
+            suspended.meta.disabled_reason.as_deref(),
             Some("AccountSuspended")
         );
-        assert_eq!(suspended.ban_status.as_deref(), Some("BANNED"));
+        assert_eq!(suspended.meta.ban_status.as_deref(), Some("BANNED"));
         assert_eq!(
-            suspended.ban_reason.as_deref(),
+            suspended.meta.ban_reason.as_deref(),
             Some("AWS temporarily suspended - unusual user activity detected")
         );
-        assert!(suspended.ban_time.is_some());
+        assert!(suspended.meta.ban_time.is_some());
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -6875,8 +7118,8 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let quota = saved.iter().find(|cred| cred.id == Some(1)).unwrap();
         assert!(!quota.disabled);
-        assert!(quota.ban_status.is_none());
-        assert!(quota.ban_reason.is_none());
+        assert!(quota.meta.ban_status.is_none());
+        assert!(quota.meta.ban_reason.is_none());
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -7320,6 +7563,16 @@ mod tests {
             assert!(persisted.proxy_url.is_none());
             assert!(persisted.proxy_username.is_none());
             assert!(persisted.proxy_password.is_none());
+        }
+
+        #[test]
+        fn test_credential_for_persistence_clears_invalid_profile_arn() {
+            let mut credential = make_cred("persist-profile");
+            credential.profile_arn = Some("e3438419-4424-4e57-8990-ef76bd749a44".to_string());
+
+            let persisted = MultiTokenManager::credential_for_persistence(credential);
+
+            assert!(persisted.profile_arn.is_none());
         }
 
         #[test]
@@ -8042,5 +8295,179 @@ mod tests {
                 "持久化失败后 in-memory priority 不应被改动"
             );
         }
+    }
+
+    // ==================== A4 认证类自愈重探 ====================
+
+    fn auth_recoverable_credential(id: u64) -> KiroCredentials {
+        let mut cred = KiroCredentials::default();
+        cred.id = Some(id);
+        cred.access_token = Some(format!("access-{id}"));
+        cred.refresh_token = Some(format!("refresh-{id}"));
+        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        cred
+    }
+
+    #[test]
+    fn backoff_duration_follows_exponential_schedule_with_cap() {
+        assert_eq!(backoff_duration(1), Duration::minutes(1));
+        assert_eq!(backoff_duration(2), Duration::minutes(5));
+        assert_eq!(backoff_duration(3), Duration::minutes(30));
+        assert_eq!(backoff_duration(4), Duration::hours(2));
+        assert_eq!(backoff_duration(5), Duration::hours(2));
+    }
+
+    #[test]
+    fn is_auth_recoverable_reason_only_matches_auth_disabled_set() {
+        assert!(is_auth_recoverable_reason(
+            DisabledReason::AuthenticationFailed
+        ));
+        assert!(is_auth_recoverable_reason(
+            DisabledReason::TooManyRefreshFailures
+        ));
+        assert!(is_auth_recoverable_reason(
+            DisabledReason::InvalidRefreshToken
+        ));
+
+        assert!(!is_auth_recoverable_reason(
+            DisabledReason::CredentialSuspended
+        ));
+        assert!(!is_auth_recoverable_reason(
+            DisabledReason::InsufficientBalance
+        ));
+        assert!(!is_auth_recoverable_reason(DisabledReason::QuotaExceeded));
+        assert!(!is_auth_recoverable_reason(DisabledReason::Manual));
+        assert!(!is_auth_recoverable_reason(
+            DisabledReason::ModelUnavailable
+        ));
+    }
+
+    #[test]
+    fn get_ids_due_for_reprobe_selects_only_eligible_entries() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![
+                auth_recoverable_credential(1),
+                auth_recoverable_credential(2),
+                auth_recoverable_credential(3),
+                auth_recoverable_credential(4),
+            ],
+            None,
+            None,
+            true,
+        )
+        .expect("manager should build");
+
+        {
+            let mut entries = manager.entries.lock();
+            for entry in entries.iter_mut() {
+                match entry.id {
+                    // 认证类禁用，重探时间已过 → 应被选中
+                    1 => {
+                        entry.disabled = true;
+                        entry.disabled_reason = Some(DisabledReason::AuthenticationFailed);
+                        entry.recovery_backoff_level = 1;
+                        entry.reprobe_next = Some(Utc::now() - Duration::minutes(1));
+                    }
+                    // 认证类禁用，但重探时间在未来 → 不选
+                    2 => {
+                        entry.disabled = true;
+                        entry.disabled_reason = Some(DisabledReason::TooManyRefreshFailures);
+                        entry.recovery_backoff_level = 1;
+                        entry.reprobe_next = Some(Utc::now() + Duration::minutes(5));
+                    }
+                    // 非认证类禁用（粘性）→ 永不选
+                    3 => {
+                        entry.disabled = true;
+                        entry.disabled_reason = Some(DisabledReason::CredentialSuspended);
+                        entry.reprobe_next = Some(Utc::now() - Duration::minutes(1));
+                    }
+                    // 未禁用 → 永不选
+                    _ => {}
+                }
+            }
+        }
+
+        assert_eq!(manager.get_ids_due_for_reprobe(), vec![1]);
+    }
+
+    #[test]
+    fn apply_reprobe_outcome_drives_open_halfopen_closed_state_machine() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![auth_recoverable_credential(1)],
+            None,
+            None,
+            true,
+        )
+        .expect("manager should build");
+
+        // OPEN：认证类禁用，level 1，1min 后重探
+        {
+            let mut entries = manager.entries.lock();
+            let entry = &mut entries[0];
+            entry.disabled = true;
+            entry.disabled_reason = Some(DisabledReason::AuthenticationFailed);
+            entry.recovery_backoff_level = 1;
+            entry.reprobe_next = Some(Utc::now() + backoff_duration(1));
+        }
+
+        // HALF_OPEN→OPEN：重探失败 → level 升至 2，下次约 5min 后
+        manager.apply_reprobe_outcome(1, false);
+        {
+            let entries = manager.entries.lock();
+            let entry = &entries[0];
+            assert!(entry.disabled, "重探失败应保持禁用");
+            assert_eq!(entry.recovery_backoff_level, 2);
+            let next = entry.reprobe_next.expect("应有下次重探时间");
+            let delta = next - Utc::now();
+            assert!(
+                delta >= Duration::minutes(4) && delta <= Duration::minutes(6),
+                "下次重探应约 5min 后，实际 {delta}"
+            );
+        }
+
+        // HALF_OPEN→CLOSED：重探成功 → 重新启用，退避清零
+        manager.apply_reprobe_outcome(1, true);
+        {
+            let entries = manager.entries.lock();
+            let entry = &entries[0];
+            assert!(!entry.disabled, "重探成功应重新启用");
+            assert_eq!(entry.disabled_reason, None);
+            assert_eq!(entry.failure_count, 0);
+            assert_eq!(entry.refresh_failure_count, 0);
+            assert_eq!(entry.recovery_backoff_level, 0);
+            assert_eq!(entry.reprobe_next, None);
+        }
+    }
+
+    #[test]
+    fn apply_reprobe_outcome_ignores_non_auth_disabled_entries() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![auth_recoverable_credential(1)],
+            None,
+            None,
+            true,
+        )
+        .expect("manager should build");
+
+        // 非认证类禁用不应被自愈逻辑改动
+        {
+            let mut entries = manager.entries.lock();
+            let entry = &mut entries[0];
+            entry.disabled = true;
+            entry.disabled_reason = Some(DisabledReason::CredentialSuspended);
+        }
+
+        manager.apply_reprobe_outcome(1, true);
+
+        let entries = manager.entries.lock();
+        let entry = &entries[0];
+        assert!(entry.disabled, "非认证类禁用不应被重新启用");
+        assert_eq!(
+            entry.disabled_reason,
+            Some(DisabledReason::CredentialSuspended)
+        );
     }
 }

@@ -97,11 +97,13 @@ fn apply_frame_usage_to_responses(ctx: &mut OpenAIResponsesStream, frame: &Frame
 // ============================================================================
 
 fn map_provider_error(err: Error) -> Response {
-    let s = err.to_string();
-    let s_lower = s.to_lowercase();
+    // 错误分类统一走 anthropic::classify_provider_error（单源判定顺序 + 谓词），
+    // 此处仅按 OpenAI 协议渲染各自的 body/code，避免分类逻辑与 anthropic 侧漂移。
+    // 注意有意差异：QueueTimeout 在 OpenAI 侧渲染为 rate_limit_error（anthropic 侧为 overloaded_error）。
+    use crate::anthropic::ProviderErrorClass;
 
-    if s.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") || s.contains("Input is too long") {
-        return (
+    match crate::anthropic::classify_provider_error(&err) {
+        ProviderErrorClass::InputTooLong => (
             StatusCode::BAD_REQUEST,
             Json(
                 OpenAIErrorResponse::new(
@@ -111,92 +113,67 @@ fn map_provider_error(err: Error) -> Response {
                 .with_code("context_length_exceeded"),
             ),
         )
-            .into_response();
-    }
-    if s.contains("Improperly formed request") {
-        return (
+            .into_response(),
+        ProviderErrorClass::ImproperlyFormed => (
             StatusCode::BAD_REQUEST,
             Json(OpenAIErrorResponse::new(
                 "invalid_request_error",
                 "Improperly formed request.",
             )),
         )
-            .into_response();
-    }
-    if s.contains("没有可用的凭据") {
-        return (
+            .into_response(),
+        ProviderErrorClass::NoCredentials => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(OpenAIErrorResponse::new(
                 "service_unavailable",
                 "No credentials available.",
             )),
         )
-            .into_response();
-    }
-    if s.contains("credential queue wait timeout") {
-        return (
+            .into_response(),
+        ProviderErrorClass::QueueTimeout => (
             StatusCode::TOO_MANY_REQUESTS,
             Json(OpenAIErrorResponse::new(
                 "rate_limit_error",
                 "All credentials are busy. Please retry shortly.",
             )),
         )
-            .into_response();
-    }
-    if s.contains("所有凭据已用尽") {
-        return (
+            .into_response(),
+        ProviderErrorClass::QuotaExhausted => (
             StatusCode::TOO_MANY_REQUESTS,
             Json(OpenAIErrorResponse::new(
                 "rate_limit_error",
                 "All credentials quota exhausted.",
             )),
         )
-            .into_response();
-    }
-
-    let transient = s_lower.contains("429 too many requests")
-        || s_lower.contains("insufficient_model_capacity")
-        || s_lower.contains("high traffic")
-        || s_lower.contains("408 request timeout")
-        || s_lower.contains("502 bad gateway")
-        || s_lower.contains("503 service unavailable")
-        || s_lower.contains("504 gateway timeout")
-        || s_lower.contains("error sending request")
-        || s_lower.contains("connection closed")
-        || s_lower.contains("connection reset");
-    if transient {
-        let is_network = s_lower.contains("error sending request")
-            || s_lower.contains("connection closed")
-            || s_lower.contains("connection reset");
-        if is_network {
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(OpenAIErrorResponse::new(
-                    "api_error",
-                    format!("上游网络错误: {}", err),
-                )),
-            )
-                .into_response();
-        }
-        return (
+            .into_response(),
+        ProviderErrorClass::TransientNetwork => (
+            StatusCode::BAD_GATEWAY,
+            Json(OpenAIErrorResponse::new(
+                "api_error",
+                format!("上游网络错误: {}", err),
+            )),
+        )
+            .into_response(),
+        ProviderErrorClass::TransientUpstream => (
             StatusCode::TOO_MANY_REQUESTS,
             Json(OpenAIErrorResponse::new(
                 "rate_limit_error",
                 err.to_string(),
             )),
         )
-            .into_response();
+            .into_response(),
+        ProviderErrorClass::Unclassified => {
+            tracing::error!("Kiro API 调用失败: {}", err);
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(OpenAIErrorResponse::new(
+                    "api_error",
+                    format!("上游 API 调用失败: {}", err),
+                )),
+            )
+                .into_response()
+        }
     }
-
-    tracing::error!("Kiro API 调用失败: {}", err);
-    (
-        StatusCode::BAD_GATEWAY,
-        Json(OpenAIErrorResponse::new(
-            "api_error",
-            format!("上游 API 调用失败: {}", err),
-        )),
-    )
-        .into_response()
 }
 
 // ============================================================================
@@ -215,7 +192,7 @@ struct PreparedRequest {
 
 fn prepare_kiro_request(
     state: &AppState,
-    payload: crate::anthropic::types::MessagesRequest,
+    mut payload: crate::anthropic::types::MessagesRequest,
     fallback_input_tokens: Option<i32>,
     inference_config: Option<InferenceConfig>,
 ) -> Result<PreparedRequest, Response> {
@@ -224,6 +201,16 @@ fn prepare_kiro_request(
     let compression = state.compression_config.read().clone();
     let prompt_filter = state.prompt_filter_config.read().clone();
     let thinking_suffix = state.thinking_config.read().suffix.clone();
+
+    // 用户模型映射 OVERRIDE 层（仅 OpenAI / OpenAI-Responses 路径）：
+    // 命中规则后先把入站模型名 source → target 改写，改写结果继续走下面的
+    // 硬编码 `map_model_with_thinking_suffix` 归一化。无命中时保持原样，
+    // 行为与未启用此模块一致。改写 payload.model 使 convert_request_with_thinking_suffix
+    // 内部重新派生的 model_id 也一致。
+    if let Some(mapped) = state.model_mapping_config.read().resolve(&payload.model) {
+        payload.model = mapped;
+    }
+
     let model = map_model_with_thinking_suffix(&payload.model, &thinking_suffix);
     let conversion_result = match convert_request_with_thinking_suffix(
         &payload,
@@ -260,9 +247,15 @@ fn prepare_kiro_request(
         profile_arn: None,
     };
 
-    let mut request_body = match serde_json::to_string(&kiro_request) {
-        Ok(b) => b,
-        Err(e) => {
+    let max_body = compression.max_request_body_bytes;
+    let request_body = match crate::anthropic::serialize_and_fit_body(
+        &mut kiro_request,
+        max_body,
+        has_system_priming,
+        "OpenAI ",
+    ) {
+        Ok(body) => body,
+        Err(crate::anthropic::BodyFitError::Serialize(e)) => {
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(OpenAIErrorResponse::new(
@@ -272,61 +265,26 @@ fn prepare_kiro_request(
             )
                 .into_response());
         }
-    };
-
-    let max_body = compression.max_request_body_bytes;
-    if max_body > 0 && request_body.len() > max_body {
-        match crate::anthropic::truncate_payload_to_body_limit(
-            &mut kiro_request,
-            max_body,
-            &mut request_body,
-            has_system_priming,
-        ) {
-            Ok(Some(outcome)) => {
-                tracing::warn!(
-                    conversation_id = kiro_request.conversation_state.conversation_id.as_str(),
-                    initial_bytes = outcome.initial_bytes,
-                    final_bytes = outcome.final_bytes,
-                    threshold = max_body,
-                    removed_history_messages = outcome.removed_history_messages,
-                    inserted_placeholder = outcome.inserted_placeholder,
-                    "OpenAI 请求体超过阈值，已按安全截断策略截断历史"
-                );
-            }
-            Ok(None) => {}
-            Err(e) => {
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(OpenAIErrorResponse::new(
-                        "internal_error",
-                        format!("序列化请求失败: {}", e),
-                    )),
-                )
-                    .into_response());
-            }
+        Err(crate::anthropic::BodyFitError::TooLarge { bytes, limit, .. }) => {
+            tracing::warn!(
+                conversation_id = kiro_request.conversation_state.conversation_id.as_str(),
+                request_body_bytes = bytes,
+                threshold = limit,
+                "OpenAI 安全截断策略执行后请求体仍超过安全阈值，拒绝发送"
+            );
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(OpenAIErrorResponse::new(
+                    "invalid_request_error",
+                    format!(
+                        "Request too large ({} bytes total; limit {}). Reduce current message/tool output or number/size of images.",
+                        bytes, limit
+                    ),
+                )),
+            )
+                .into_response());
         }
-    }
-
-    if max_body > 0 && request_body.len() > max_body {
-        tracing::warn!(
-            conversation_id = kiro_request.conversation_state.conversation_id.as_str(),
-            request_body_bytes = request_body.len(),
-            threshold = max_body,
-            "OpenAI 安全截断策略执行后请求体仍超过安全阈值，拒绝发送"
-        );
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(OpenAIErrorResponse::new(
-                "invalid_request_error",
-                format!(
-                    "Request too large ({} bytes total; limit {}). Reduce current message/tool output or number/size of images.",
-                    request_body.len(),
-                    max_body
-                ),
-            )),
-        )
-            .into_response());
-    }
+    };
 
     let input_tokens = fallback_input_tokens.unwrap_or_else(|| {
         token::count_all_tokens(
@@ -794,12 +752,7 @@ fn create_chat_sse_stream(
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
-                            drop(cred_permit);
-                            drop(glb_permit);
-                            drop(proxy_permit);
-                            if let Some(m) = ctx.metering() {
-                                tm.apply_credit_usage(credential_id, m.usage);
-                            }
+                            crate::anthropic::settle_stream_permits(&tm, credential_id, cred_permit, glb_permit, proxy_permit, ctx.metering().map(|m| m.usage));
                             app_state.record_gateway_failure();
                             let final_bytes: Vec<Result<Bytes, Infallible>> = ctx
                                 .abort_events()
@@ -809,12 +762,7 @@ fn create_chat_sse_stream(
                             Some((stream::iter(final_bytes), (body_stream, ctx, decoder, true, ping, None, None, None, tm, credential_id, app_state, api_key_id)))
                         }
                         None => {
-                            drop(cred_permit);
-                            drop(glb_permit);
-                            drop(proxy_permit);
-                            if let Some(m) = ctx.metering() {
-                                tm.apply_credit_usage(credential_id, m.usage);
-                            }
+                            crate::anthropic::settle_stream_permits(&tm, credential_id, cred_permit, glb_permit, proxy_permit, ctx.metering().map(|m| m.usage));
                             let credits = ctx.metering().map(|m| m.usage).unwrap_or(0.0);
                             let tokens = i64::from(ctx.final_input_tokens())
                                 + i64::from(ctx.final_output_tokens());
@@ -1291,12 +1239,7 @@ fn create_responses_sse_stream(
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
-                            drop(cred_permit);
-                            drop(glb_permit);
-                            drop(proxy_permit);
-                            if let Some(m) = ctx.metering() {
-                                tm.apply_credit_usage(credential_id, m.usage);
-                            }
+                            crate::anthropic::settle_stream_permits(&tm, credential_id, cred_permit, glb_permit, proxy_permit, ctx.metering().map(|m| m.usage));
                             app_state.record_gateway_failure();
                             let final_bytes: Vec<Result<Bytes, Infallible>> = ctx
                                 .failed_events(e.to_string())
@@ -1306,12 +1249,7 @@ fn create_responses_sse_stream(
                             Some((stream::iter(final_bytes), (body_stream, ctx, decoder, true, ping, None, None, None, tm, credential_id, store_ctx, app_state, api_key_id)))
                         }
                         None => {
-                            drop(cred_permit);
-                            drop(glb_permit);
-                            drop(proxy_permit);
-                            if let Some(m) = ctx.metering() {
-                                tm.apply_credit_usage(credential_id, m.usage);
-                            }
+                            crate::anthropic::settle_stream_permits(&tm, credential_id, cred_permit, glb_permit, proxy_permit, ctx.metering().map(|m| m.usage));
                             let credits = ctx.metering().map(|m| m.usage).unwrap_or(0.0);
                             let tokens = i64::from(ctx.final_input_tokens())
                                 + i64::from(ctx.final_output_tokens());
@@ -2240,6 +2178,107 @@ mod tests {
         assert_eq!(
             body["conversationState"]["currentMessage"]["userInputMessage"]["modelId"],
             "claude-opus-4.8"
+        );
+    }
+
+    #[test]
+    fn test_prepare_kiro_request_applies_user_model_mapping_override() {
+        // 用户映射 OVERRIDE 层命中：gpt-4o → claude-sonnet-4.5 会覆写入站模型名，
+        // 且改写结果流入序列化后的 modelId（与 prepared.model 一致）。
+        let state = test_state_with_compression(crate::model::config::CompressionConfig::default());
+        {
+            let rule = crate::model::config::ModelMappingRule {
+                id: "r1".to_string(),
+                name: "gpt to sonnet".to_string(),
+                enabled: true,
+                rule_type: "replace".to_string(),
+                source_model: "gpt-4o".to_string(),
+                target_models: vec!["claude-sonnet-4.5".to_string()],
+                weights: Vec::new(),
+            };
+            state.model_mapping_config.write().replace(vec![rule]);
+        }
+
+        let req = chat_req(serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hello"}]
+        }));
+        let messages_request = chat_completions_to_messages_request(&req);
+
+        let prepared = prepare_kiro_request(&state, messages_request, None, None).expect("prepare");
+        let body: serde_json::Value =
+            serde_json::from_str(&prepared.request_body).expect("request body json");
+
+        assert_eq!(prepared.model, "claude-sonnet-4.5");
+        assert_eq!(
+            body["conversationState"]["currentMessage"]["userInputMessage"]["modelId"],
+            "claude-sonnet-4.5"
+        );
+    }
+
+    #[test]
+    fn test_prepare_kiro_request_no_mapping_is_byte_identical() {
+        // 无匹配规则时行为与今日完全一致：gpt-4o 仍走硬编码归一化 → claude-sonnet-4.5。
+        // 与空映射运行时结果对比，确保 OVERRIDE 层无命中即无副作用。
+        let state_empty =
+            test_state_with_compression(crate::model::config::CompressionConfig::default());
+        let state_unmatched =
+            test_state_with_compression(crate::model::config::CompressionConfig::default());
+        {
+            let rule = crate::model::config::ModelMappingRule {
+                id: "r1".to_string(),
+                name: "unrelated".to_string(),
+                enabled: true,
+                rule_type: "replace".to_string(),
+                source_model: "some-other-model".to_string(),
+                target_models: vec!["claude-haiku-4.5".to_string()],
+                weights: Vec::new(),
+            };
+            state_unmatched
+                .model_mapping_config
+                .write()
+                .replace(vec![rule]);
+        }
+
+        let payload = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+
+        let prepared_empty = prepare_kiro_request(
+            &state_empty,
+            chat_completions_to_messages_request(&chat_req(payload.clone())),
+            None,
+            None,
+        )
+        .expect("prepare empty");
+        let prepared_unmatched = prepare_kiro_request(
+            &state_unmatched,
+            chat_completions_to_messages_request(&chat_req(payload)),
+            None,
+            None,
+        )
+        .expect("prepare unmatched");
+
+        // 未命中映射与无映射：mapped model 一致，请求体在剔除随机 agentContinuationId
+        // 后逐字段一致（硬编码归一化保留，OVERRIDE 层无副作用）。
+        assert_eq!(prepared_empty.model, "claude-sonnet-4.5");
+        assert_eq!(prepared_empty.model, prepared_unmatched.model);
+
+        let normalize = |body: &str| -> serde_json::Value {
+            let mut v: serde_json::Value = serde_json::from_str(body).expect("body json");
+            // agentContinuationId 为每次调用随机生成，剔除后比较其余字段。
+            if let Some(cs) = v
+                .get_mut("conversationState")
+                .and_then(|cs| cs.as_object_mut())
+            {
+                cs.remove("agentContinuationId");
+            }
+            v
+        };
+        assert_eq!(
+            normalize(&prepared_empty.request_body),
+            normalize(&prepared_unmatched.request_body)
         );
     }
 

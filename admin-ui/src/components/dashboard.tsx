@@ -17,9 +17,11 @@ import { RequestLogsDialog } from '@/components/request-logs-dialog'
 import { ProxyPoolDialog } from '@/components/proxy-pool-dialog'
 import { useCredentials, useDeleteCredential, useResetFailure } from '@/hooks/use-credentials'
 import { useRuntimeStats } from '@/hooks/use-runtime-stats'
-import { getCredentialBalance, refreshBatch, refreshBalancesBatch, getCachedBalances, exportCredentialBackup } from '@/api/credentials'
+import { useCredentialSelection } from '@/hooks/use-credential-selection'
+import { useBalanceMap } from '@/hooks/use-balance-map'
+import { getCredentialBalance, refreshBatch, refreshBalancesBatch, exportCredentialBackup } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
-import type { BalanceResponse, CredentialStatusItem } from '@/types/api'
+import type { CredentialStatusItem } from '@/types/api'
 
 const EMPTY_CREDENTIALS: CredentialStatusItem[] = []
 
@@ -33,7 +35,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [modelsDialogOpen, setModelsDialogOpen] = useState(false)
   const [addCredDialogOpen, setAddCredDialogOpen] = useState(false)
   const [requestLogsDialogOpen, setRequestLogsDialogOpen] = useState(false)
-  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
+  const { selectedIds, toggleSelect, deselectAll } = useCredentialSelection()
   const [verifyDialogOpen, setVerifyDialogOpen] = useState(false)
   const [settingsDialogOpen, setSettingsDialogOpen] = useState(false)
   const [systemPromptDialogOpen, setSystemPromptDialogOpen] = useState(false)
@@ -41,8 +43,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [verifying, setVerifying] = useState(false)
   const [verifyProgress, setVerifyProgress] = useState({ current: 0, total: 0 })
   const [verifyResults, setVerifyResults] = useState<Map<number, VerifyResult>>(new Map())
-  const [balanceMap, setBalanceMap] = useState<Map<number, BalanceResponse>>(new Map())
-  const [loadingBalanceIds, setLoadingBalanceIds] = useState<Set<number>>(new Set())
   const [queryingInfo, setQueryingInfo] = useState(false)
   const [queryInfoProgress, setQueryInfoProgress] = useState({ current: 0, total: 0 })
   const [batchRefreshing, setBatchRefreshing] = useState(false)
@@ -68,6 +68,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { mutate: resetFailure } = useResetFailure()
   const { data: runtimeMap } = useRuntimeStats()
   const credentials = Array.isArray(data?.credentials) ? data.credentials : EMPTY_CREDENTIALS
+  const { balanceMap, setBalanceMap, loadingBalanceIds, setLoadingBalanceIds } = useBalanceMap(credentials, runtimeMap)
 
   // 计算分页
   const totalPages = Math.ceil(credentials.length / itemsPerPage)
@@ -96,40 +97,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
     setCurrentPage(1)
   }, [credentials.length])
 
-  // 只保留当前仍存在的凭据缓存，避免删除后残留旧数据
-  useEffect(() => {
-    if (credentials.length === 0) {
-      setBalanceMap(new Map())
-      setLoadingBalanceIds(new Set())
-      return
-    }
-
-    const validIds = new Set(credentials.map(credential => credential.id))
-
-    setBalanceMap(prev => {
-      const next = new Map<number, BalanceResponse>()
-      prev.forEach((value, id) => {
-        if (validIds.has(id)) {
-          next.set(id, value)
-        }
-      })
-      return next.size === prev.size ? prev : next
-    })
-
-    setLoadingBalanceIds(prev => {
-      if (prev.size === 0) {
-        return prev
-      }
-      const next = new Set<number>()
-      prev.forEach(id => {
-        if (validIds.has(id)) {
-          next.add(id)
-        }
-      })
-      return next.size === prev.size ? prev : next
-    })
-  }, [credentials])
-
   // 初始化时应用主题
   useEffect(() => {
     if (darkMode) {
@@ -138,85 +105,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
       document.documentElement.classList.remove('dark')
     }
   }, [])
-
-  // 首次挂载拉取后端缓存余额，预填到 balanceMap
-  // 后端启动时会并行预取所有未禁用凭据的余额并写入磁盘缓存，
-  // 这里直接复用，省掉用户进入页面后再手动点查询的步骤
-  useEffect(() => {
-    let cancelled = false
-    getCachedBalances()
-      .then(resp => {
-        if (cancelled) return
-        setBalanceMap(prev => {
-          const next = new Map(prev)
-          const cachedBalances = Array.isArray(resp.balances) ? resp.balances : []
-          cachedBalances.forEach(item => {
-            // 把 CachedBalanceItem 投影到 BalanceResponse 形状（字段一一对应）
-            next.set(item.id, {
-              id: item.id,
-              subscriptionTitle: item.subscriptionTitle,
-              subscriptionType: item.subscriptionType,
-              currentUsage: item.currentUsage,
-              usageLimit: item.usageLimit,
-              remaining: item.remaining,
-              usagePercentage: item.usagePercentage,
-              nextResetAt: item.nextResetAt,
-              overageCap: item.overageCap,
-              overageCapability: item.overageCapability,
-              overageStatus: item.overageStatus,
-            })
-          })
-          return next
-        })
-      })
-      .catch(() => {
-        // 缓存接口失败不打扰用户，让 dashboard 走原本的手动查询路径
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [])
-
-  // 把 runtime-stats（1s 轮询）里嵌的余额投影到 balanceMap，实现实时显示
-  // 后端余额来自 5min disk cache + 周期后台刷新；前端只负责消费快照
-  useEffect(() => {
-    if (!runtimeMap || runtimeMap.size === 0) return
-    setBalanceMap(prev => {
-      let mutated = false
-      const next = new Map(prev)
-      runtimeMap.forEach((runtime, id) => {
-        if (!runtime.balance) return
-        const existing = prev.get(id)
-        // 浅比较关键字段，避免无变化时触发卡片重渲染
-        if (
-          existing
-          && existing.currentUsage === runtime.balance.currentUsage
-          && existing.usageLimit === runtime.balance.usageLimit
-          && existing.remaining === runtime.balance.remaining
-          && existing.subscriptionType === runtime.balance.subscriptionType
-          && existing.overageStatus === runtime.balance.overageStatus
-          && existing.overageCap === runtime.balance.overageCap
-        ) {
-          return
-        }
-        next.set(id, {
-          id,
-          subscriptionTitle: runtime.balance.subscriptionTitle,
-          subscriptionType: runtime.balance.subscriptionType,
-          currentUsage: runtime.balance.currentUsage,
-          usageLimit: runtime.balance.usageLimit,
-          remaining: runtime.balance.remaining,
-          usagePercentage: runtime.balance.usagePercentage,
-          nextResetAt: runtime.balance.nextResetAt,
-          overageCap: runtime.balance.overageCap,
-          overageCapability: runtime.balance.overageCapability,
-          overageStatus: runtime.balance.overageStatus,
-        })
-        mutated = true
-      })
-      return mutated ? next : prev
-    })
-  }, [runtimeMap])
 
   const toggleDarkMode = () => {
     const next = !darkMode
@@ -244,21 +132,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
     storage.removeApiKey()
     queryClient.clear()
     onLogout()
-  }
-
-  // 选择管理
-  const toggleSelect = (id: number) => {
-    const newSelected = new Set(selectedIds)
-    if (newSelected.has(id)) {
-      newSelected.delete(id)
-    } else {
-      newSelected.add(id)
-    }
-    setSelectedIds(newSelected)
-  }
-
-  const deselectAll = () => {
-    setSelectedIds(new Set())
   }
 
   // 批量删除（仅删除已禁用项）

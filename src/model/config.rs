@@ -126,6 +126,36 @@ pub struct PromptFilterRule {
     pub replace: String,
 }
 
+fn default_model_mapping_rule_type() -> String {
+    "replace".to_string()
+}
+
+/// 用户自定义模型映射规则
+///
+/// 将入站请求中的 `source_model` 覆写为某个 `target_models` 元素，作为硬编码
+/// `map_model_with_thinking_suffix` 归一化之前的 OVERRIDE 层。
+///
+/// - `rule_type == "replace" | "alias"`：命中后取 `target_models[0]`
+/// - `rule_type == "loadbalance"`：按 `weights` 加权随机；`weights` 为空或长度
+///   与 `target_models` 不一致时退化为轮询（round-robin）
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelMappingRule {
+    pub id: String,
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// "replace" | "alias" | "loadbalance"（默认 "replace"）
+    #[serde(default = "default_model_mapping_rule_type")]
+    pub rule_type: String,
+    pub source_model: String,
+    #[serde(default)]
+    pub target_models: Vec<String>,
+    /// loadbalance 权重（默认空 = 轮询）
+    #[serde(default)]
+    pub weights: Vec<u32>,
+}
+
 /// xkiro.rs 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -254,6 +284,13 @@ pub struct Config {
     /// 系统提示清洗配置（默认全关，保持既有默认行为）
     #[serde(default)]
     pub prompt_filter: PromptFilterConfig,
+
+    /// 用户自定义模型映射规则（默认空 = 无操作，保持既有默认行为）
+    ///
+    /// 仅在 OpenAI / OpenAI-Responses 协议路径生效，作为硬编码模型归一化之前的
+    /// OVERRIDE 层。Anthropic Messages 路径不应用此表。
+    #[serde(default)]
+    pub model_mappings: Vec<ModelMappingRule>,
 
     /// 系统提示注入：自由文本补充内容（None 表示无）
     ///
@@ -486,6 +523,7 @@ impl Default for Config {
             endpoints: HashMap::new(),
             compression: CompressionConfig::default(),
             prompt_filter: PromptFilterConfig::default(),
+            model_mappings: Vec::new(),
             system_prompt: None,
             system_prompt_enabled: false,
             enabled_presets: Vec::new(),

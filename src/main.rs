@@ -275,6 +275,9 @@ async fn main() {
     // 共享系统提示清洗配置（admin API 可运行时修改）
     let prompt_filter_config = Arc::new(RwLock::new(config.prompt_filter.clone()));
 
+    // 共享用户模型映射运行时（admin API 可运行时修改，仅 OpenAI 路径应用）
+    let model_mapping_config = crate::model::runtime::model_mapping_from_config(&config);
+
     // 共享系统提示注入运行时配置（admin API 可运行时修改）
     let prompt_runtime = crate::model::runtime::shared_from_config(&config);
 
@@ -303,6 +306,7 @@ async fn main() {
         config.extract_thinking,
         compression_config.clone(),
         prompt_filter_config.clone(),
+        model_mapping_config.clone(),
         prompt_runtime.clone(),
         prompt_cache_runtime.clone(),
         thinking_config.clone(),
@@ -335,6 +339,7 @@ async fn main() {
                 require_api_key_runtime.clone(),
                 admin_api_key_runtime.clone(),
                 prompt_filter_config.clone(),
+                model_mapping_config.clone(),
                 thinking_config.clone(),
                 prompt_cache_runtime.clone(),
                 prompt_runtime.clone(),

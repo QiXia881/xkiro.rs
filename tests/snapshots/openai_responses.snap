@@ -1,0 +1,29 @@
+event: response.output_item.added
+data: {"item":{"content":[],"id":"msg_<ID>","role":"assistant","status":"in_progress","type":"message"},"output_index":0,"response_id":"resp_<ID>","type":"response.output_item.added"}
+
+event: response.content_part.added
+data: {"content_index":0,"item_id":"msg_<ID>","output_index":0,"part":{"text":"","type":"output_text"},"response_id":"resp_<ID>","type":"response.content_part.added"}
+
+event: response.output_text.delta
+data: {"content_index":0,"delta":"Hello world","item_id":"msg_<ID>","output_index":0,"response_id":"resp_<ID>","type":"response.output_text.delta"}
+
+event: response.content_part.done
+data: {"content_index":0,"item_id":"msg_<ID>","output_index":0,"part":{"text":"Hello world","type":"output_text"},"response_id":"resp_<ID>","type":"response.content_part.done"}
+
+event: response.output_item.done
+data: {"item":{"content":[{"annotations":[],"text":"Hello world","type":"output_text"}],"id":"msg_<ID>","role":"assistant","status":"completed","type":"message"},"output_index":0,"response_id":"resp_<ID>","type":"response.output_item.done"}
+
+event: response.output_item.added
+data: {"item":{"arguments":"","call_id":"call_snap","id":"fc_<ID>","name":"exec_command","status":"in_progress","type":"function_call"},"output_index":1,"response_id":"resp_<ID>","type":"response.output_item.added"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"{\"cmd\":\"ls\"}","item_id":"fc_<ID>","output_index":1,"response_id":"resp_<ID>","type":"response.function_call_arguments.delta"}
+
+event: response.output_item.done
+data: {"item":{"arguments":"{\"cmd\":\"ls\"}","call_id":"call_snap","id":"fc_<ID>","name":"exec_command","status":"completed","type":"function_call"},"output_index":1,"response_id":"resp_<ID>","type":"response.output_item.done"}
+
+event: response.completed
+data: {"response":{"created_at":<TS>,"id":"resp_<ID>","model":"claude-sonnet-4.5","object":"response","output":[{"content":[{"annotations":[],"text":"Hello world","type":"output_text"}],"id":"msg_<ID>","role":"assistant","status":"completed","type":"message"},{"arguments":"{\"cmd\":\"ls\"}","call_id":"call_snap","id":"fc_<ID>","name":"exec_command","status":"completed","type":"function_call"}],"previous_response_id":null,"status":"completed","usage":{"input_tokens":50000,"output_tokens":<N>,"total_tokens":<N>}},"type":"response.completed"}
+
+data: [DONE]
+

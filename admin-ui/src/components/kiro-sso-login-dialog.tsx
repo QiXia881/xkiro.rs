@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { CheckCircle, Copy, Loader2 } from 'lucide-react'
+import { Copy, Loader2 } from 'lucide-react'
 import { toast } from 'sonner'
 import {
   cancelKiroSsoLogin,
@@ -17,8 +17,9 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import { CredentialLoginSummary } from '@/components/credential-login-summary'
-import type { CredentialLoginDetails, StartKiroSsoLoginResponse } from '@/types/api'
+import { LoginSuccessView } from '@/components/login-success-view'
+import { useLoginResult } from '@/hooks/use-login-result'
+import type { StartKiroSsoLoginResponse } from '@/types/api'
 import { extractErrorMessage } from '@/lib/utils'
 import { CREDENTIAL_AUTH_LABELS, formatCredentialAuthLabel } from '@/lib/credential-metadata'
 
@@ -28,14 +29,10 @@ interface KiroSsoLoginDialogProps {
   onSuccess: () => void
 }
 
-type Step = 'intro' | 'waiting' | 'done'
-
 export function KiroSsoLoginDialog({ open, onOpenChange, onSuccess }: KiroSsoLoginDialogProps) {
-  const [step, setStep] = useState<Step>('intro')
+  const { step, setStep, credentialId, credentialAuthLabel, credentialDetails, markSuccess, reset: resetResult } =
+    useLoginResult(onSuccess)
   const [session, setSession] = useState<StartKiroSsoLoginResponse | null>(null)
-  const [credentialId, setCredentialId] = useState<number | null>(null)
-  const [credentialAuthLabel, setCredentialAuthLabel] = useState('')
-  const [credentialDetails, setCredentialDetails] = useState<CredentialLoginDetails | null>(null)
   const [starting, setStarting] = useState(false)
   const [submittingCallback, setSubmittingCallback] = useState(false)
   const [callbackUrl, setCallbackUrl] = useState('')
@@ -52,11 +49,8 @@ export function KiroSsoLoginDialog({ open, onOpenChange, onSuccess }: KiroSsoLog
     if (shouldCancel && session?.sessionId) {
       cancelKiroSsoLogin(session.sessionId).catch(() => {})
     }
-    setStep('intro')
+    resetResult()
     setSession(null)
-    setCredentialId(null)
-    setCredentialAuthLabel('')
-    setCredentialDetails(null)
     setStarting(false)
     setSubmittingCallback(false)
     setCallbackUrl('')
@@ -78,16 +72,11 @@ export function KiroSsoLoginDialog({ open, onOpenChange, onSuccess }: KiroSsoLog
         const details = result.details
         if (result.success && result.completed && details) {
           const authLabel = formatCredentialAuthLabel(details.provider, details.authMethod)
-          setCredentialId(details.id)
-          setCredentialAuthLabel(authLabel)
-          setCredentialDetails(details)
-          setStep('done')
-          onSuccess()
-          toast.success(`登录成功，已添加${authLabel ? ` ${authLabel}` : ''} 凭据 #${details.id}`)
+          markSuccess(details.id, authLabel, details)
           return
         }
         toast.error(`登录失败：${result.error ?? '未知错误'}`)
-        setStep('intro')
+        setStep('form')
         setSession(null)
       } catch (error) {
         toast.error(`轮询失败：${extractErrorMessage(error)}`)
@@ -176,7 +165,7 @@ export function KiroSsoLoginDialog({ open, onOpenChange, onSuccess }: KiroSsoLog
           </DialogDescription>
         </DialogHeader>
 
-        {step === 'intro' && (
+        {step === 'form' && (
           <div className="space-y-3 py-2 text-sm text-muted-foreground">
             <p>启动后会生成 {CREDENTIAL_AUTH_LABELS.microsoftEntra} 入口地址，不会自动打开浏览器标签页。</p>
             <p>请复制地址到无痕窗口、隐私窗口或其他浏览器中访问；遇到 localhost 回调无法访问时，将地址栏完整 URL 粘贴回来继续。</p>
@@ -227,19 +216,15 @@ export function KiroSsoLoginDialog({ open, onOpenChange, onSuccess }: KiroSsoLog
         )}
 
         {step === 'done' && (
-          <div className="flex flex-col items-center gap-3 py-4">
-            <CheckCircle className="h-10 w-10 text-green-500" />
-            <p className="text-sm font-medium">登录成功</p>
-            <CredentialLoginSummary
-              credentialId={credentialId}
-              authLabel={credentialAuthLabel}
-              details={credentialDetails}
-            />
-          </div>
+          <LoginSuccessView
+            credentialId={credentialId}
+            authLabel={credentialAuthLabel}
+            details={credentialDetails}
+          />
         )}
 
         <DialogFooter>
-          {step === 'intro' && (
+          {step === 'form' && (
             <Button onClick={handleStart} disabled={starting}>
               {starting && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
               发起登录

@@ -11,9 +11,10 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { CredentialLoginSummary } from '@/components/credential-login-summary'
+import { LoginSuccessView } from '@/components/login-success-view'
+import { useLoginResult } from '@/hooks/use-login-result'
 import { pollBuilderIdLogin, startBuilderIdLogin } from '@/api/credentials'
-import type { CredentialLoginDetails, StartBuilderIdLoginResponse } from '@/types/api'
+import type { StartBuilderIdLoginResponse } from '@/types/api'
 import { extractErrorMessage } from '@/lib/utils'
 import { CREDENTIAL_AUTH_LABELS, formatCredentialAuthLabel } from '@/lib/credential-metadata'
 
@@ -23,16 +24,12 @@ interface BuilderIdLoginDialogProps {
   onSuccess: () => void
 }
 
-type Step = 'form' | 'waiting' | 'done'
-
 export function BuilderIdLoginDialog({ open, onOpenChange, onSuccess }: BuilderIdLoginDialogProps) {
-  const [step, setStep] = useState<Step>('form')
+  const { step, setStep, credentialId, credentialAuthLabel, credentialDetails, markSuccess, reset: resetResult } =
+    useLoginResult(onSuccess)
   const [region, setRegion] = useState('us-east-1')
   const [isStarting, setIsStarting] = useState(false)
   const [session, setSession] = useState<StartBuilderIdLoginResponse | null>(null)
-  const [credentialId, setCredentialId] = useState<number | null>(null)
-  const [credentialAuthLabel, setCredentialAuthLabel] = useState('')
-  const [credentialDetails, setCredentialDetails] = useState<CredentialLoginDetails | null>(null)
   const pollingRef = useRef(false)
 
   useEffect(() => {
@@ -49,12 +46,7 @@ export function BuilderIdLoginDialog({ open, onOpenChange, onSuccess }: BuilderI
             details?.provider ?? result.provider,
             details?.authMethod ?? result.authMethod,
           )
-          setCredentialId(result.credentialId)
-          setCredentialAuthLabel(authLabel)
-          setCredentialDetails(details)
-          setStep('done')
-          onSuccess()
-          toast.success(`登录成功，已添加${authLabel ? ` ${authLabel}` : ''} 凭据 #${result.credentialId}`)
+          markSuccess(result.credentialId, authLabel, details)
         } else if (result.status === 'expired') {
           toast.error(`${CREDENTIAL_AUTH_LABELS.awsBuilderId} 授权已过期，请重新开始`)
           setStep('form')
@@ -81,11 +73,8 @@ export function BuilderIdLoginDialog({ open, onOpenChange, onSuccess }: BuilderI
 
   const handleOpenChange = (nextOpen: boolean) => {
     if (!nextOpen) {
-      setStep('form')
+      resetResult()
       setSession(null)
-      setCredentialId(null)
-      setCredentialAuthLabel('')
-      setCredentialDetails(null)
       setIsStarting(false)
       pollingRef.current = false
     }
@@ -197,7 +186,7 @@ export function BuilderIdLoginDialog({ open, onOpenChange, onSuccess }: BuilderI
                 </p>
               </div>
             </div>
-            <CredentialLoginSummary
+            <LoginSuccessView
               credentialId={credentialId}
               authLabel={credentialAuthLabel}
               details={credentialDetails}

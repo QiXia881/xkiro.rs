@@ -5,6 +5,7 @@ import {
   type CredentialImportMetadataFields,
   CredentialStatusMetadataFields,
   OptionalCredentialMetadataFields,
+  type CredentialIdentityFields,
 } from '@/lib/credential-metadata'
 
 export const REQUEST_LOG_STATUSES = {
@@ -32,21 +33,19 @@ export interface CredentialsStatusResponse {
 }
 
 // 单个凭据状态
-export interface CredentialStatusItem extends CredentialMaterialFlags, CredentialStatusMetadataFields {
+export interface CredentialStatusItem
+  extends CredentialMaterialFlags,
+    CredentialStatusMetadataFields,
+    CredentialIdentityFields {
   id: number
   priority: number
   weight: number
   disabled: boolean
   failureCount: number
   expiresAt: string | null
+  // authMethod 在列表项里可为 null（区别于 CredentialIdentityFields 的 string?），单列；provider 同为认证身份
   authMethod: string | null
   provider?: string
-  userId?: string
-  sourceAccountId?: string
-  label?: string
-  status?: string
-  addedAt?: string
-  nickname?: string
   subscriptionType?: string
   subscriptionTitle?: string
   daysRemaining?: number
@@ -76,7 +75,6 @@ export interface CredentialStatusItem extends CredentialMaterialFlags, Credentia
   lastUsed?: number
   createdAt?: number
   tags?: unknown
-  email?: string
   refreshTokenHash?: string
   apiKeyHash?: string
   maskedApiKey?: string
@@ -471,32 +469,26 @@ export interface ImportCredentialRecordRequest {
 }
 
 // 添加凭据响应
-export interface AddCredentialResponse extends CredentialMaterialFlags, OptionalCredentialMetadataFields {
+export interface AddCredentialResponse
+  extends CredentialMaterialFlags,
+    OptionalCredentialMetadataFields,
+    CredentialIdentityFields {
   success: boolean
   message: string
   credentialId: number
-  email?: string
+  // authMethod/provider 是认证身份，不在 profile 身份字段（CredentialIdentityFields）内
   authMethod?: string
   provider?: string
-  userId?: string
-  sourceAccountId?: string
-  label?: string
-  status?: string
-  addedAt?: string
-  nickname?: string
 }
 
-export interface CredentialLoginDetails extends OptionalCredentialMaterialFlags, OptionalCredentialMetadataFields {
+export interface CredentialLoginDetails
+  extends OptionalCredentialMaterialFlags,
+    OptionalCredentialMetadataFields,
+    CredentialIdentityFields {
   id: number
-  email?: string
+  // authMethod/provider 是认证身份，不在 profile 身份字段（CredentialIdentityFields）内
   authMethod?: string
   provider?: string
-  userId?: string
-  sourceAccountId?: string
-  label?: string
-  status?: string
-  addedAt?: string
-  nickname?: string
 }
 
 export interface CredentialLoginDetailsEnvelope {
@@ -791,15 +783,6 @@ export interface StartIdcLoginRequest {
   proxyUrl?: string
 }
 
-export interface StartIdcLoginResponse {
-  sessionId: string
-  userCode: string
-  verificationUri: string
-  verificationUriComplete?: string
-  expiresAt: string
-  pollInterval: number
-}
-
 export interface StartIamSsoLoginResponse {
   sessionId: string
   authorizeUrl: string
@@ -809,16 +792,6 @@ export interface StartIamSsoLoginResponse {
 export interface CompleteIamSsoLoginResponse extends CredentialLoginDetailsEnvelope {
   success: boolean
 }
-
-export type PollIdcLoginResponse =
-  | { status: 'pending' }
-  | ({
-      status: 'success'
-      credentialId: number
-      authMethod?: string
-      provider?: string
-    } & CredentialLoginDetailsEnvelope)
-  | { status: 'expired' }
 
 export interface StartBuilderIdLoginRequest {
   region?: string

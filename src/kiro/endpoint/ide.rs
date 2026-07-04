@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use super::{
     KiroEndpoint, PreferenceRequestParts, RequestContext, UsageRequestParts,
-    codewhisperer_rest_host_for_region, q_rest_host_for_region,
+    apply_stream_token_type_headers, codewhisperer_rest_host_for_region, q_rest_host_for_region,
 };
 use crate::kiro::model::credentials::KiroCredentials;
 
@@ -33,26 +33,34 @@ impl IdeEndpoint {
         ctx.credentials.effective_kiro_api_region(ctx.config)
     }
 
+    fn management_region(&self, ctx: &RequestContext<'_>) -> String {
+        ctx.credentials
+            .management_profile_arn()
+            .and_then(KiroCredentials::profile_arn_region_from_value)
+            .unwrap_or_else(|| self.api_region(ctx))
+            .to_string()
+    }
+
     fn host(&self, ctx: &RequestContext<'_>) -> String {
         format!("q.{}.amazonaws.com", self.api_region(ctx))
     }
 
     fn rest_host(&self, ctx: &RequestContext<'_>) -> String {
-        codewhisperer_rest_host_for_region(self.api_region(ctx))
+        codewhisperer_rest_host_for_region(&self.management_region(ctx))
     }
 
     fn preference_host(&self, ctx: &RequestContext<'_>) -> String {
-        q_rest_host_for_region(self.api_region(ctx))
+        q_rest_host_for_region(&self.management_region(ctx))
     }
 
-    fn x_amz_user_agent(&self, ctx: &RequestContext<'_>) -> String {
+    pub(crate) fn x_amz_user_agent(&self, ctx: &RequestContext<'_>) -> String {
         format!(
             "aws-sdk-js/1.0.34 KiroIDE-{}-{}",
             ctx.config.kiro_version, ctx.machine_id
         )
     }
 
-    fn user_agent(&self, ctx: &RequestContext<'_>) -> String {
+    pub(crate) fn user_agent(&self, ctx: &RequestContext<'_>) -> String {
         format!(
             "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.34 m/E KiroIDE-{}-{}",
             ctx.config.system_version,
@@ -63,7 +71,7 @@ impl IdeEndpoint {
     }
 
     /// 返回 MCP 请求需要附带的 profileArn header 值，SSO OIDC 凭据返回 None
-    fn mcp_profile_arn_header_value(credentials: &KiroCredentials) -> Option<&str> {
+    pub(crate) fn mcp_profile_arn_header_value(credentials: &KiroCredentials) -> Option<&str> {
         if credentials.is_aws_sso_oidc_credential() {
             return None;
         }
@@ -76,7 +84,7 @@ impl IdeEndpoint {
     /// - 其它凭据有 profile_arn：解析 JSON 并 insert
     /// - 其它凭据无 profile_arn：保留并修剪 body 中已有 profileArn
     /// - 解析失败：返回错误，由 provider 立即终止该次调用
-    fn inject_profile_arn(
+    pub(crate) fn inject_profile_arn(
         request_body: &str,
         credentials: &KiroCredentials,
     ) -> anyhow::Result<String> {
@@ -108,7 +116,7 @@ impl IdeEndpoint {
         };
         if let Some(serde_json::Value::String(profile_arn)) = obj.get_mut("profileArn") {
             let trimmed = profile_arn.trim();
-            if trimmed.is_empty() {
+            if trimmed.is_empty() || !KiroCredentials::is_valid_profile_arn(trimmed) {
                 obj.remove("profileArn");
             } else if trimmed.len() != profile_arn.len() {
                 *profile_arn = trimmed.to_string();
@@ -144,7 +152,7 @@ impl KiroEndpoint for IdeEndpoint {
     }
 
     fn decorate_api(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
-        let mut req = req
+        let req = req
             .header("Accept", "*/*")
             .header("x-amzn-codewhisperer-optout", "true")
             .header("x-amzn-kiro-agent-mode", "vibe")
@@ -155,13 +163,7 @@ impl KiroEndpoint for IdeEndpoint {
             .header("amz-sdk-request", "attempt=1; max=3")
             .header("Authorization", format!("Bearer {}", ctx.token));
 
-        if ctx.credentials.is_api_key_credential() {
-            req = req.header("tokentype", "API_KEY");
-        }
-        if ctx.credentials.is_external_idp_credential() {
-            req = req.header("TokenType", "EXTERNAL_IDP");
-        }
-        req
+        apply_stream_token_type_headers(req, ctx.credentials)
     }
 
     fn decorate_mcp(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
@@ -176,13 +178,7 @@ impl KiroEndpoint for IdeEndpoint {
         if let Some(profile_arn) = Self::mcp_profile_arn_header_value(ctx.credentials) {
             req = req.header("x-amzn-kiro-profile-arn", profile_arn);
         }
-        if ctx.credentials.is_api_key_credential() {
-            req = req.header("tokentype", "API_KEY");
-        }
-        if ctx.credentials.is_external_idp_credential() {
-            req = req.header("TokenType", "EXTERNAL_IDP");
-        }
-        req
+        apply_stream_token_type_headers(req, ctx.credentials)
     }
 
     fn transform_api_body(&self, body: &str, ctx: &RequestContext<'_>) -> anyhow::Result<String> {
@@ -206,7 +202,7 @@ impl KiroEndpoint for IdeEndpoint {
                 host
             )
         };
-        if let Some(profile_arn) = ctx.credentials.profile_arn_trimmed() {
+        if let Some(profile_arn) = ctx.credentials.management_profile_arn() {
             url.push_str(&format!("&profileArn={}", urlencoding::encode(profile_arn)));
         }
 
@@ -257,7 +253,7 @@ impl KiroEndpoint for IdeEndpoint {
         let mut body = serde_json::json!({
             "overageConfiguration": { "overageStatus": overage_status },
         });
-        if let Some(profile_arn) = ctx.credentials.profile_arn_trimmed() {
+        if let Some(profile_arn) = ctx.credentials.management_profile_arn() {
             body["profileArn"] = serde_json::Value::String(profile_arn.to_string());
         }
 
@@ -307,7 +303,7 @@ impl KiroEndpoint for IdeEndpoint {
 mod tests {
     use super::IdeEndpoint;
     use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
-    use crate::kiro::model::credentials::KiroCredentials;
+    use crate::kiro::model::credentials::{KIRO_BUILDER_ID_PROFILE_ARN, KiroCredentials};
     use crate::model::config::Config;
     use serde_json::Value;
 
@@ -453,6 +449,40 @@ mod tests {
     }
 
     #[test]
+    fn ide_usage_uses_builder_id_default_profile_arn_for_management_calls() {
+        let endpoint = IdeEndpoint::new();
+        let mut config = Config::default();
+        config.api_region = Some("eu-central-1".to_string());
+        let credentials = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            provider: Some("BuilderId".to_string()),
+            ..Default::default()
+        };
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: "token",
+            machine_id: "machine-usage",
+            config: &config,
+        };
+
+        let parts = endpoint.usage_request_parts(&ctx, false).unwrap();
+
+        assert!(
+            parts
+                .url
+                .starts_with("https://codewhisperer.us-east-1.amazonaws.com/getUsageLimits?")
+        );
+        assert!(parts.url.contains(&format!(
+            "profileArn={}",
+            urlencoding::encode(KIRO_BUILDER_ID_PROFILE_ARN)
+        )));
+        assert_eq!(
+            header_value(&parts.headers, "host"),
+            Some("codewhisperer.us-east-1.amazonaws.com")
+        );
+    }
+
+    #[test]
     fn ide_set_preference_uses_q_host_and_profile_arn() {
         let endpoint = IdeEndpoint::new();
         let config = Config::default();
@@ -492,6 +522,31 @@ mod tests {
             body["profileArn"],
             "arn:aws:codewhisperer:us-east-1:123:profile/test"
         );
+    }
+
+    #[test]
+    fn ide_set_preference_omits_enterprise_profile_arn() {
+        let endpoint = IdeEndpoint::new();
+        let config = Config::default();
+        let credentials = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            provider: Some("Enterprise".to_string()),
+            profile_arn: Some("arn:aws:codewhisperer:us-east-1:123:profile/ignored".to_string()),
+            ..Default::default()
+        };
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: "token",
+            machine_id: "machine-pref",
+            config: &config,
+        };
+
+        let parts = endpoint
+            .set_preference_request_parts(&ctx, "DISABLED")
+            .unwrap();
+        let body: Value = serde_json::from_str(&parts.body).unwrap();
+
+        assert!(body.get("profileArn").is_none());
     }
 
     #[test]
@@ -624,16 +679,29 @@ mod tests {
     #[test]
     fn test_inject_profile_arn_overwrites_existing() {
         let body = r#"{"conversationState":{},"profileArn":"old-arn"}"#;
-        let cred = cred_with_arn(Some("new-arn"));
+        let cred = cred_with_arn(Some("arn:aws:codewhisperer:us-east-1:123:profile/new"));
         let result = IdeEndpoint::inject_profile_arn(body, &cred).unwrap();
         let json: Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(json["profileArn"], "new-arn");
+        assert_eq!(
+            json["profileArn"],
+            "arn:aws:codewhisperer:us-east-1:123:profile/new"
+        );
+    }
+
+    #[test]
+    fn test_inject_profile_arn_removes_invalid_explicit_payload_arn() {
+        let body =
+            r#"{"conversationState":{},"profileArn":"e3438419-4424-4e57-8990-ef76bd749a44"}"#;
+        let cred = cred_with_arn(None);
+        let result = IdeEndpoint::inject_profile_arn(body, &cred).unwrap();
+        let json: Value = serde_json::from_str(&result).unwrap();
+        assert!(json.get("profileArn").is_none());
     }
 
     #[test]
     fn test_inject_profile_arn_invalid_json() {
         let body = "not-valid-json";
-        let cred = cred_with_arn(Some("arn:test"));
+        let cred = cred_with_arn(Some("arn:aws:codewhisperer:profile/test"));
         // SSO 与非 SSO 路径都要先 parse；非法 JSON 应返 Err
         assert!(IdeEndpoint::inject_profile_arn(body, &cred).is_err());
     }
@@ -674,10 +742,10 @@ mod tests {
 
     #[test]
     fn test_mcp_profile_arn_header_value_normal_returns_arn() {
-        let cred = cred_with_arn(Some(" arn:test "));
+        let cred = cred_with_arn(Some(" arn:aws:codewhisperer:profile/test "));
         assert_eq!(
             IdeEndpoint::mcp_profile_arn_header_value(&cred),
-            Some("arn:test")
+            Some("arn:aws:codewhisperer:profile/test")
         );
     }
 

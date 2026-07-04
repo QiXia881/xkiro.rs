@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use serde_json::json;
 use uuid::Uuid;
 
+use crate::common::text::normalize_chunk;
 use crate::kiro::model::events::{Event, MeteringEvent};
 use crate::token;
 
@@ -368,12 +369,7 @@ impl SseStateManager {
 
 use super::converter::get_context_window_size;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ThinkingStreamSource {
-    Unknown,
-    ReasoningEvent,
-    TagBlock,
-}
+use crate::common::thinking_source::ThinkingSourceArbiter;
 
 /// 流处理上下文
 pub struct StreamContext {
@@ -428,7 +424,7 @@ pub struct StreamContext {
     last_assistant_content: String,
     /// 上一个 reasoningContentEvent 的完整内容（用于 chunk 归一化）
     last_reasoning_content: String,
-    thinking_source: ThinkingStreamSource,
+    thinking_source: ThinkingSourceArbiter,
     drop_tag_thinking: bool,
     /// 工具名 → 生成的 fallback ID
     /// 当上游未提供 tool_use_id 时，同一工具名复用同一个生成的 ID
@@ -490,7 +486,7 @@ impl StreamContext {
             emitted_text: String::new(),
             last_assistant_content: String::new(),
             last_reasoning_content: String::new(),
-            thinking_source: ThinkingStreamSource::Unknown,
+            thinking_source: ThinkingSourceArbiter::Unknown,
             drop_tag_thinking: false,
             generated_tool_ids: HashMap::new(),
             pending_tool_use: None,
@@ -540,24 +536,6 @@ impl StreamContext {
         }
 
         token::estimate_output_tokens(&content)
-    }
-
-    fn allow_reasoning_source(&mut self) -> bool {
-        if self.thinking_source == ThinkingStreamSource::TagBlock {
-            return false;
-        }
-        self.thinking_source = ThinkingStreamSource::ReasoningEvent;
-        true
-    }
-
-    fn allow_tag_source(&mut self) -> bool {
-        if self.thinking_source == ThinkingStreamSource::ReasoningEvent {
-            return false;
-        }
-        if self.thinking_source == ThinkingStreamSource::Unknown {
-            self.thinking_source = ThinkingStreamSource::TagBlock;
-        }
-        self.thinking_source == ThinkingStreamSource::TagBlock
     }
 
     /// 生成 message_start 事件
@@ -708,7 +686,7 @@ impl StreamContext {
         if text.is_empty() {
             return Vec::new();
         }
-        if !self.thinking_enabled || !self.allow_reasoning_source() {
+        if !self.thinking_enabled || !self.thinking_source.allow_reasoning() {
             return Vec::new();
         }
 
@@ -778,7 +756,7 @@ impl StreamContext {
                     // 进入 thinking 块
                     self.in_thinking_block = true;
                     self.strip_thinking_leading_newline = true;
-                    self.drop_tag_thinking = !self.allow_tag_source();
+                    self.drop_tag_thinking = !self.thinking_source.allow_tag();
                     self.thinking_buffer =
                         self.thinking_buffer[start_pos + "<thinking>".len()..].to_string();
 
@@ -976,7 +954,7 @@ impl StreamContext {
     }
 
     fn close_reasoning_thinking_block(&mut self) -> Vec<SseEvent> {
-        if self.thinking_source != ThinkingStreamSource::ReasoningEvent {
+        if !self.thinking_source.is_reasoning() {
             return Vec::new();
         }
         let Some(thinking_index) = self.thinking_block_index else {
@@ -1606,69 +1584,6 @@ impl BufferedStreamContext {
     /// 已收到的 metering（meteringEvent.usage）；用于驱动余额扣减
     pub fn metering(&self) -> Option<&MeteringEvent> {
         self.inner.metering.as_ref()
-    }
-}
-
-/// 将累积文本归一化为增量（差量）
-///
-/// Kiro 上游的 assistantResponseEvent / reasoningContentEvent 发送的是累积文本
-/// （每次包含从头到当前位置的完整内容），而非增量。此函数通过比较当前 chunk
-/// 与上一次的完整内容，计算出真正的增量文本。
-///
-/// 累积文本差量规则：
-/// - chunk == prev → 空增量（无新内容）
-/// - chunk 以 prev 开头 → 返回后缀差量
-/// - prev 以 chunk 开头 → 返回空（回退场景）
-/// - 有重叠 → 返回重叠之后的部分
-/// - 无重叠 → 返回整个 chunk
-pub(crate) fn normalize_chunk(chunk: &str, previous: &mut String) -> String {
-    if chunk.is_empty() {
-        return String::new();
-    }
-
-    let prev = previous.as_str();
-    if prev.is_empty() {
-        *previous = chunk.to_string();
-        return chunk.to_string();
-    }
-
-    if chunk == prev {
-        return String::new();
-    }
-
-    // chunk 以 prev 开头：正常累积，返回后缀差量
-    if let Some(delta) = chunk.strip_prefix(prev) {
-        *previous = chunk.to_string();
-        return delta.to_string();
-    }
-
-    // prev 以 chunk 开头：回退场景，无新内容
-    if prev.starts_with(chunk) {
-        return String::new();
-    }
-
-    // 寻找最大重叠：prev 的后缀与 chunk 的前缀匹配
-    let max_overlap_len = prev.len().min(chunk.len());
-    let mut max_overlap = 0;
-    for i in chunk
-        .char_indices()
-        .map(|(idx, _)| idx)
-        .skip(1)
-        .chain(std::iter::once(chunk.len()))
-    {
-        if i > max_overlap_len {
-            break;
-        }
-        if prev.ends_with(&chunk[..i]) {
-            max_overlap = i;
-        }
-    }
-
-    *previous = chunk.to_string();
-    if max_overlap > 0 {
-        chunk[max_overlap..].to_string()
-    } else {
-        chunk.to_string()
     }
 }
 
@@ -2712,5 +2627,59 @@ mod tests {
             tool_starts.is_empty(),
             "fallback must not fire when a structured tool_use already arrived"
         );
+    }
+
+    // ---- SSE 输出快照（ER-1/ER-3 回归防护网）----
+    //
+    // 固定事件序列驱动 StreamContext，序列化全部 SSE 输出并掩码易变 ID，
+    // 与 golden 逐字比对。流式管道去重后此快照必须保持不变。
+
+    fn transcript(events: &[SseEvent]) -> String {
+        events
+            .iter()
+            .map(|e| e.to_sse_string())
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    fn run_anthropic_sequence(thinking_enabled: bool) -> String {
+        let mut map = HashMap::new();
+        map.insert("short_tool".to_string(), "original_long_tool".to_string());
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-sonnet-4.5", 42, None, thinking_enabled, map);
+
+        let mut all = Vec::new();
+        all.extend(ctx.generate_initial_events());
+        all.extend(ctx.process_kiro_event(&reasoning_event("thinking step one")));
+        all.extend(ctx.process_kiro_event(&assistant_event("Hello")));
+        all.extend(ctx.process_kiro_event(&assistant_event("Hello, world")));
+        all.extend(ctx.process_kiro_event(&Event::ToolUse(
+            crate::kiro::model::events::ToolUseEvent {
+                name: "short_tool".to_string(),
+                tool_use_id: "toolu_fixed_1".to_string(),
+                input: r#"{"path":"/tmp/x"}"#.to_string(),
+                input_is_json_object: false,
+                stop: true,
+            },
+        )));
+        all.extend(ctx.process_kiro_event(&Event::ContextUsage(
+            crate::kiro::model::events::ContextUsageEvent {
+                context_usage_percentage: 25.0,
+            },
+        )));
+        all.extend(ctx.generate_final_events());
+        transcript(&all)
+    }
+
+    #[test]
+    fn snapshot_anthropic_stream_thinking_off() {
+        let out = run_anthropic_sequence(false);
+        crate::common::snapshot::assert_golden("anthropic_stream_thinking_off", &out);
+    }
+
+    #[test]
+    fn snapshot_anthropic_stream_thinking_on() {
+        let out = run_anthropic_sequence(true);
+        crate::common::snapshot::assert_golden("anthropic_stream_thinking_on", &out);
     }
 }

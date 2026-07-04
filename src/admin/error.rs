@@ -58,9 +58,12 @@ impl AdminServiceError {
         }
     }
 
-    /// 转换为 API 错误响应
-    pub fn into_response(self) -> AdminErrorResponse {
-        match &self {
+    /// 转换为 API 错误响应体（不含 HTTP 状态码）
+    ///
+    /// 注意：命名刻意区别于 axum `IntoResponse::into_response`——后者返回完整
+    /// `Response`（含状态码），此方法只产出 JSON body，由 `IntoResponse` impl 组合状态码。
+    pub fn to_error_body(&self) -> AdminErrorResponse {
+        match self {
             AdminServiceError::NotFound { .. } => AdminErrorResponse::not_found(self.to_string()),
             AdminServiceError::ResourceNotFound(_) => {
                 AdminErrorResponse::not_found(self.to_string())
@@ -76,5 +79,16 @@ impl AdminServiceError {
                 AdminErrorResponse::invalid_request(self.to_string())
             }
         }
+    }
+}
+
+impl axum::response::IntoResponse for AdminServiceError {
+    /// 统一把 Admin 错误渲染为 `(status_code, Json(body))`。
+    ///
+    /// 消除 ~64 处 handler 里 `(e.status_code(), Json(e.to_error_body())).into_response()`
+    /// 的重复错误臂，收敛到单一渲染点，避免状态码/body 组合方式漂移。
+    fn into_response(self) -> axum::response::Response {
+        let status = self.status_code();
+        (status, axum::Json(self.to_error_body())).into_response()
     }
 }

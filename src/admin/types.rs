@@ -1252,6 +1252,21 @@ pub struct UpdatePromptFilterConfigRequest {
     pub rules: Option<Vec<PromptFilterRuleDto>>,
 }
 
+/// 用户模型映射规则响应（仅 OpenAI 路径生效）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelMappingsResponse {
+    pub rules: Vec<crate::model::config::ModelMappingRule>,
+}
+
+/// 更新用户模型映射规则请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateModelMappingsRequest {
+    #[serde(default)]
+    pub rules: Vec<crate::model::config::ModelMappingRule>,
+}
+
 #[derive(Debug)]
 pub struct ProxyUrlConfigResponse {
     pub proxy_url: String,

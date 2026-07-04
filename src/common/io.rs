@@ -67,6 +67,30 @@ fn write_internal(
     }
 }
 
+/// 解析路径的真实目标（穿透 symlink）。
+///
+/// 用于原子写入：保证 rename 替换的是 symlink 指向的真实文件，而不是 symlink 本身。
+///
+/// 优先 `canonicalize`（目标存在时最可靠），失败时 fallback 到 `read_link`
+/// 并把相对目标解析到 symlink 所在目录，都失败则返回原路径（保持既有路径语义）。
+pub fn resolve_symlink_target(path: &Path) -> PathBuf {
+    if let Ok(real) = std::fs::canonicalize(path) {
+        return real;
+    }
+
+    if let Ok(target) = std::fs::read_link(path) {
+        if target.is_absolute() {
+            return target;
+        }
+        if let Some(parent) = path.parent() {
+            return parent.join(target);
+        }
+        return target;
+    }
+
+    path.to_path_buf()
+}
+
 fn make_tmp_path(target: &Path) -> PathBuf {
     let pid = std::process::id();
     let nanos = std::time::SystemTime::now()

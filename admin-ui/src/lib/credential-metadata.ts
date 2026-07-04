@@ -21,13 +21,28 @@ export const CREDENTIAL_METADATA_FIELDS = [
 ] as const
 
 export const CREDENTIAL_IDENTITY_FIELDS = [
-  { key: 'email', label: '邮箱' },
-  { key: 'nickname', label: '昵称' },
-  { key: 'label', label: '标签' },
-  { key: 'sourceAccountId', label: '来源 ID' },
-  { key: 'status', label: '来源状态' },
-  { key: 'addedAt', label: '添加时间' },
-  { key: 'userId', label: '用户 ID' },
+  { key: 'email', wireKey: 'email', label: '邮箱' },
+  { key: 'nickname', wireKey: 'nickname', label: '昵称' },
+  { key: 'label', wireKey: 'label', label: '标签' },
+  { key: 'sourceAccountId', wireKey: 'source_account_id', label: '来源 ID' },
+  { key: 'status', wireKey: 'status', label: '来源状态' },
+  { key: 'addedAt', wireKey: 'added_at', label: '添加时间' },
+  { key: 'userId', wireKey: 'user_id', label: '用户 ID' },
+] as const
+
+/** credential-card 展示的 profile 身份行子集（不含 email，email 单独脱敏展示）。 */
+export const CREDENTIAL_CARD_IDENTITY_KEYS = [
+  'nickname',
+  'label',
+  'sourceAccountId',
+  'status',
+  'addedAt',
+] as const
+
+/** credential-login-summary 展示的身份行子集：card 子集 + 前置 email。 */
+export const CREDENTIAL_SUMMARY_IDENTITY_KEYS = [
+  'email',
+  ...CREDENTIAL_CARD_IDENTITY_KEYS,
 ] as const
 
 export const CREDENTIAL_AUTH_LABELS = {

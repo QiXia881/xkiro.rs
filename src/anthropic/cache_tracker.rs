@@ -42,7 +42,10 @@ struct CacheEntry {
 }
 
 struct CachedCheckpointStore {
-    entries_by_credential: HashMap<u64, HashMap<[u8; 32], CacheEntry>>,
+    // C1: 单一全局映射，仅以 prefix fingerprint 为 key。
+    // 同一 prompt+model 在任意账号下产生相同 fingerprint，因此跨账号共享命中，
+    // 使 N 账号池的命中率从 ~(1/N)×rate 提升到 ~rate。
+    entries: HashMap<[u8; 32], CacheEntry>,
     max_cache_read_ratio: f64,
     dirty: bool,
 }
@@ -60,8 +63,8 @@ struct PromptCacheDiskFile {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PromptCacheDiskEntry {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    credential_id: Option<u64>,
+    // C1/C3: credentialId 已从磁盘格式移除。serde 默认忽略未知字段，
+    // 因此仍带 credentialId 的旧文件可无错加载（迁移时该字段被丢弃）。
     fingerprint: [u8; 32],
     expires_at: i64,
     ttl_seconds: i64,
@@ -75,7 +78,7 @@ impl CacheTracker {
     pub fn new_with_max_ratio(_max_supported_ttl: Duration, max_cache_read_ratio: f64) -> Self {
         Self {
             entries: Mutex::new(CachedCheckpointStore {
-                entries_by_credential: HashMap::new(),
+                entries: HashMap::new(),
                 max_cache_read_ratio: normalize_prompt_cache_max_ratio(max_cache_read_ratio),
                 dirty: false,
             }),
@@ -100,9 +103,6 @@ impl CacheTracker {
         let mut loaded = 0usize;
         let mut entries = self.entries.lock();
         for item in disk.entries {
-            let Some(credential_id) = item.credential_id.filter(|id| *id != 0) else {
-                continue;
-            };
             if item.ttl_seconds <= 0 {
                 continue;
             }
@@ -110,18 +110,14 @@ impl CacheTracker {
             let Ok(remaining) = expiry_system.duration_since(now_system) else {
                 continue;
             };
-            entries
-                .entries_by_credential
-                .entry(credential_id)
-                .or_default()
-                .insert(
-                    item.fingerprint,
-                    CacheEntry {
-                        token_count: 0,
-                        ttl: Duration::from_secs(item.ttl_seconds as u64),
-                        expires_at: now_instant + remaining,
-                    },
-                );
+            entries.entries.insert(
+                item.fingerprint,
+                CacheEntry {
+                    token_count: 0,
+                    ttl: Duration::from_secs(item.ttl_seconds as u64),
+                    expires_at: now_instant + remaining,
+                },
+            );
             loaded += 1;
         }
         entries.dirty = false;
@@ -136,28 +132,21 @@ impl CacheTracker {
             return Ok(0);
         }
 
-        prune_expired(&mut entries.entries_by_credential, now_instant);
-        let entry_count: usize = entries
-            .entries_by_credential
-            .values()
-            .map(HashMap::len)
-            .sum();
+        prune_expired(&mut entries.entries, now_instant);
+        let entry_count = entries.entries.len();
         let mut disk_entries = Vec::with_capacity(entry_count);
-        for (credential_id, credential_entries) in &entries.entries_by_credential {
-            for (fingerprint, entry) in credential_entries {
-                let remaining = entry.expires_at.saturating_duration_since(now_instant);
-                let expires_at = now_system
-                    .checked_add(remaining)
-                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                    .map(|duration| duration.as_secs() as i64)
-                    .unwrap_or(0);
-                disk_entries.push(PromptCacheDiskEntry {
-                    credential_id: Some(*credential_id),
-                    fingerprint: *fingerprint,
-                    expires_at,
-                    ttl_seconds: entry.ttl.as_secs() as i64,
-                });
-            }
+        for (fingerprint, entry) in &entries.entries {
+            let remaining = entry.expires_at.saturating_duration_since(now_instant);
+            let expires_at = now_system
+                .checked_add(remaining)
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_secs() as i64)
+                .unwrap_or(0);
+            disk_entries.push(PromptCacheDiskEntry {
+                fingerprint: *fingerprint,
+                expires_at,
+                ttl_seconds: entry.ttl.as_secs() as i64,
+            });
         }
         entries.dirty = false;
         drop(entries);
@@ -229,26 +218,11 @@ impl CacheTracker {
 
         let now = Instant::now();
         let mut entries = self.entries.lock();
-        prune_expired(&mut entries.entries_by_credential, now);
+        prune_expired(&mut entries.entries, now);
         let max_cache_read_ratio = entries.max_cache_read_ratio;
 
-        let Some(credential_entries) = entries.entries_by_credential.get_mut(&credential_id) else {
-            tracing::debug!(credential_id, "首次请求，无缓存条目");
-            let effective_creation = if last_breakpoint_tokens < profile.min_cacheable_tokens {
-                0
-            } else {
-                last_breakpoint_tokens
-            };
-            let (cache_5m, cache_1h) = compute_ttl_breakdown(profile, 0);
-            return CacheResult {
-                cache_read_input_tokens: 0,
-                cache_creation_input_tokens: effective_creation,
-                cache_creation_5m_input_tokens: cache_5m,
-                cache_creation_1h_input_tokens: cache_1h,
-            };
-        };
-
-        if credential_entries.is_empty() {
+        // C1: 单一全局映射，命中不再受 credential_id 约束。
+        if entries.entries.is_empty() {
             tracing::debug!(credential_id, "首次请求，无缓存条目");
             let effective_creation = if last_breakpoint_tokens < profile.min_cacheable_tokens {
                 0
@@ -266,7 +240,7 @@ impl CacheTracker {
 
         tracing::debug!(
             credential_id,
-            entry_count = credential_entries.len(),
+            entry_count = entries.entries.len(),
             "查找缓存匹配"
         );
 
@@ -281,7 +255,7 @@ impl CacheTracker {
             if breakpoint.cumulative_tokens < profile.min_cacheable_tokens {
                 continue;
             }
-            if let Some(entry) = credential_entries.get_mut(&breakpoint.prefix_fingerprint) {
+            if let Some(entry) = entries.entries.get_mut(&breakpoint.prefix_fingerprint) {
                 if entry.expires_at <= now {
                     continue;
                 }
@@ -320,18 +294,14 @@ impl CacheTracker {
         }
         let now = Instant::now();
         let mut entries = self.entries.lock();
-        prune_expired(&mut entries.entries_by_credential, now);
-        let credential_entries = entries
-            .entries_by_credential
-            .entry(credential_id)
-            .or_default();
+        prune_expired(&mut entries.entries, now);
 
         let mut inserted = false;
         for breakpoint in &profile.breakpoints {
             if breakpoint.cumulative_tokens < profile.min_cacheable_tokens {
                 continue;
             }
-            credential_entries.insert(
+            entries.entries.insert(
                 breakpoint.prefix_fingerprint,
                 CacheEntry {
                     token_count: breakpoint.cumulative_tokens,
@@ -724,39 +694,9 @@ fn write_hash_chunk(hasher: &mut Sha256, chunk: &str) {
     hasher.update([0]);
 }
 
+/// cache_tracker 用 i32 计数，复用 `token::estimate_approx_tokens`（u64）避免重复实现。
 fn estimate_approx_tokens(text: &str) -> i32 {
-    if text.is_empty() {
-        return 0;
-    }
-
-    let length = text.chars().count();
-    if length == 0 {
-        return 0;
-    }
-    if length < 5 {
-        return ((length as f64) / 3.0).ceil().max(1.0) as i32;
-    }
-
-    let mut regular_ascii = 0usize;
-    let mut digits = 0usize;
-    let mut symbols = 0usize;
-    let mut non_ascii = 0usize;
-
-    for ch in text.chars() {
-        match ch {
-            '\u{80}'.. => non_ascii += 1,
-            '0'..='9' => digits += 1,
-            '!'..='/' | ':'..='@' | '['..='`' | '{'..='~' => symbols += 1,
-            _ => regular_ascii += 1,
-        }
-    }
-
-    ((regular_ascii as f64) / 4.5
-        + (digits as f64) / 2.0
-        + (symbols as f64) / 1.5
-        + (non_ascii as f64) / 1.5)
-        .ceil()
-        .max(1.0) as i32
+    crate::token::estimate_approx_tokens(text) as i32
 }
 
 fn minimum_cacheable_tokens_for_model(model: &str) -> i32 {
@@ -788,14 +728,8 @@ fn is_anthropic_billing_header_block(value: &serde_json::Value) -> bool {
         .starts_with("x-anthropic-billing-header:")
 }
 
-fn prune_expired(
-    entries_by_credential: &mut HashMap<u64, HashMap<[u8; 32], CacheEntry>>,
-    now: Instant,
-) {
-    entries_by_credential.retain(|_, entries| {
-        entries.retain(|_, entry| entry.expires_at > now);
-        !entries.is_empty()
-    });
+fn prune_expired(entries: &mut HashMap<[u8; 32], CacheEntry>, now: Instant) {
+    entries.retain(|_, entry| entry.expires_at > now);
 }
 
 #[cfg(test)]
@@ -1206,20 +1140,31 @@ mod tests {
     }
 
     #[test]
-    fn same_prompt_hits_only_same_credential() {
+    fn same_prompt_hits_across_credentials() {
+        // C1: 缓存记账全局共享。相同 prompt+model → 相同 fingerprint → 命中，
+        // 与哪个账号提供服务无关。首个账号为 cache_creation，后续任意账号为 cache_read。
         let tracker = CacheTracker::new(Duration::from_secs(3600));
         let req = build_request(vec![msg("user", cache_text(&long_cacheable_text()))]);
         let total = estimate_input_tokens(&req);
         let profile = tracker.build_profile(&req, total);
 
+        // 账号 1 首次请求：创建缓存前缀，无命中。
         let first = tracker.compute(1, &profile);
+        assert_eq!(first.cache_read_input_tokens, 0);
         assert!(first.cache_creation_input_tokens > 0);
         tracker.update(1, &profile);
 
+        // 账号 2 相同 prompt：跨账号命中，读取而非再次创建。
+        let expected_read = profile
+            .last_cacheable_breakpoint()
+            .map(|bp| bp.cumulative_tokens.min(cache_read_cap_tokens(&profile)))
+            .unwrap_or(0);
         let other_credential = tracker.compute(2, &profile);
-        assert_eq!(other_credential.cache_read_input_tokens, 0);
-        assert!(other_credential.cache_creation_input_tokens > 0);
+        assert!(other_credential.cache_read_input_tokens > 0);
+        assert_eq!(other_credential.cache_read_input_tokens, expected_read);
+        assert_eq!(other_credential.cache_creation_input_tokens, 0);
 
+        // 账号 1 再次请求：同样命中。
         let same_credential = tracker.compute(1, &profile);
         assert!(same_credential.cache_read_input_tokens > 0);
         assert_eq!(same_credential.cache_creation_input_tokens, 0);
@@ -1269,11 +1214,75 @@ mod tests {
         let reloaded = CacheTracker::new(Duration::from_secs(300));
         let loaded = reloaded.load_from_path(&path);
         assert_eq!(loaded, persisted);
+        // C1: 重载后全局共享，任意账号都能命中。
         let other_credential = reloaded.compute(2, &profile);
-        assert_eq!(other_credential.cache_read_input_tokens, 0);
+        assert!(other_credential.cache_read_input_tokens > 0);
 
         let usage = reloaded.compute(1, &profile);
         assert!(usage.cache_read_input_tokens > 0);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn old_disk_format_with_credential_id_still_loads() {
+        // C1/C3 迁移：旧文件仍带 credentialId 字段，serde 默认忽略未知字段，
+        // 应能无错加载且不影响命中。
+        let path = temp_cache_path("old-format");
+        let req = build_request(vec![msg("user", cache_text(&long_cacheable_text()))]);
+        let total = estimate_input_tokens(&req);
+        let tracker = CacheTracker::new(Duration::from_secs(300));
+        let profile = tracker.build_profile(&req, total);
+        let fingerprint = profile
+            .breakpoints
+            .iter()
+            .rev()
+            .find(|bp| bp.cumulative_tokens >= profile.min_cacheable_tokens)
+            .map(|bp| bp.prefix_fingerprint)
+            .expect("expected a cacheable breakpoint");
+
+        // 未来 1 小时过期的旧格式条目（带 credentialId）。
+        let future = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            + 3600;
+        let old_json = serde_json::json!({
+            "version": 1,
+            "entries": [{
+                "credentialId": 42,
+                "fingerprint": fingerprint,
+                "expiresAt": future,
+                "ttlSeconds": 300
+            }]
+        });
+        std::fs::write(&path, serde_json::to_vec(&old_json).unwrap()).unwrap();
+
+        assert_eq!(tracker.load_from_path(&path), 1);
+        // credentialId 被丢弃，命中不受账号约束。
+        let result = tracker.compute(7, &profile);
+        assert!(result.cache_read_input_tokens > 0);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn disk_round_trip_preserves_global_entries() {
+        // 保存全局条目 → 重载 → 相同条目仍可命中。
+        let path = temp_cache_path("round-trip");
+        let req = build_request(vec![msg("user", cache_text(&long_cacheable_text()))]);
+        let total = estimate_input_tokens(&req);
+        let saver = CacheTracker::new(Duration::from_secs(300));
+        let profile = saver.build_profile(&req, total);
+
+        saver.update(1, &profile);
+        let persisted = saver.flush_to_path(&path).expect("flush should work");
+        assert!(persisted > 0);
+
+        let loader = CacheTracker::new(Duration::from_secs(300));
+        assert_eq!(loader.load_from_path(&path), persisted);
+        // 任意账号命中，证明跨账号全局条目被正确 round-trip。
+        assert!(loader.compute(999, &profile).cache_read_input_tokens > 0);
 
         let _ = std::fs::remove_file(path);
     }
@@ -1284,7 +1293,6 @@ mod tests {
         let disk = PromptCacheDiskFile {
             version: 1,
             entries: vec![PromptCacheDiskEntry {
-                credential_id: Some(1),
                 fingerprint: [7u8; 32],
                 expires_at: 1,
                 ttl_seconds: 300,

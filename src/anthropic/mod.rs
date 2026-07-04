@@ -35,5 +35,8 @@ pub mod thinking_parser;
 pub mod types;
 pub mod websearch;
 
-pub(crate) use handlers::{override_thinking_from_model_name, truncate_payload_to_body_limit};
+pub(crate) use handlers::{
+    BodyFitError, ProviderErrorClass, classify_provider_error, override_thinking_from_model_name,
+    serialize_and_fit_body, settle_stream_permits, truncate_payload_to_body_limit,
+};
 pub use router::create_router_with_provider;

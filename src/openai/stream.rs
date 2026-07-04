@@ -17,6 +17,8 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::anthropic::converter::get_context_window_size;
+use crate::common::text::normalize_chunk;
+use crate::common::thinking_source::ThinkingSourceArbiter;
 use crate::kiro::model::events::{Event, MeteringEvent, ToolUseEvent};
 use crate::token;
 
@@ -79,51 +81,6 @@ fn sse_chunk_json(chunk: serde_json::Value) -> Bytes {
     s.push_str(&body);
     s.push_str("\n\n");
     Bytes::from(s)
-}
-
-/// 将累积文本归一化为增量（差量）
-///
-/// Kiro 上游发送累积文本而非增量，这里只输出新增差量。
-fn normalize_chunk(chunk: &str, previous: &mut String) -> String {
-    if chunk.is_empty() {
-        return String::new();
-    }
-    let prev = previous.as_str();
-    if prev.is_empty() {
-        *previous = chunk.to_string();
-        return chunk.to_string();
-    }
-    if chunk == prev {
-        return String::new();
-    }
-    if let Some(delta) = chunk.strip_prefix(prev) {
-        *previous = chunk.to_string();
-        return delta.to_string();
-    }
-    if prev.starts_with(chunk) {
-        return String::new();
-    }
-    let max_overlap_len = prev.len().min(chunk.len());
-    let mut max_overlap = 0;
-    for i in chunk
-        .char_indices()
-        .map(|(idx, _)| idx)
-        .skip(1)
-        .chain(std::iter::once(chunk.len()))
-    {
-        if i > max_overlap_len {
-            break;
-        }
-        if prev.ends_with(&chunk[..i]) {
-            max_overlap = i;
-        }
-    }
-    *previous = chunk.to_string();
-    if max_overlap > 0 {
-        chunk[max_overlap..].to_string()
-    } else {
-        chunk.to_string()
-    }
 }
 
 fn find_char_boundary(s: &str, target: usize) -> usize {
@@ -215,13 +172,6 @@ struct ChatToolAccumulator {
     started: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum OpenAIThinkingSource {
-    Unknown,
-    ReasoningEvent,
-    TagBlock,
-}
-
 #[derive(Clone, Copy)]
 enum OpenAIThinkingPhase {
     Start,
@@ -262,7 +212,7 @@ pub struct OpenAIChatStream {
     text_buffer: String,
     in_thinking_block: bool,
     drop_tag_thinking: bool,
-    thinking_source: OpenAIThinkingSource,
+    thinking_source: ThinkingSourceArbiter,
     reasoning_open: bool,
 }
 
@@ -316,7 +266,7 @@ impl OpenAIChatStream {
             text_buffer: String::new(),
             in_thinking_block: false,
             drop_tag_thinking: false,
-            thinking_source: OpenAIThinkingSource::Unknown,
+            thinking_source: ThinkingSourceArbiter::Unknown,
             reasoning_open: false,
         }
     }
@@ -365,24 +315,6 @@ impl OpenAIChatStream {
             usage: None,
         };
         sse_chunk(&chunk)
-    }
-
-    fn allow_reasoning_source(&mut self) -> bool {
-        if self.thinking_source == OpenAIThinkingSource::TagBlock {
-            return false;
-        }
-        self.thinking_source = OpenAIThinkingSource::ReasoningEvent;
-        true
-    }
-
-    fn allow_tag_source(&mut self) -> bool {
-        if self.thinking_source == OpenAIThinkingSource::ReasoningEvent {
-            return false;
-        }
-        if self.thinking_source == OpenAIThinkingSource::Unknown {
-            self.thinking_source = OpenAIThinkingSource::TagBlock;
-        }
-        self.thinking_source == OpenAIThinkingSource::TagBlock
     }
 
     fn content_chunk(&mut self, content: &str) -> Option<Bytes> {
@@ -535,7 +467,7 @@ impl OpenAIChatStream {
                     }
                     self.text_buffer = self.text_buffer[start + "<thinking>".len()..].to_string();
                     self.in_thinking_block = true;
-                    self.drop_tag_thinking = !self.allow_tag_source();
+                    self.drop_tag_thinking = !self.thinking_source.allow_tag();
                 } else if force_flush || self.text_buffer.chars().count() > 50 {
                     let safe_len = if force_flush {
                         self.text_buffer.len()
@@ -719,7 +651,7 @@ impl OpenAIChatStream {
                 if delta.is_empty() {
                     return Vec::new();
                 }
-                if !self.allow_reasoning_source() {
+                if !self.thinking_source.allow_reasoning() {
                     return Vec::new();
                 }
                 self.reasoning_delta(&delta)
@@ -2266,5 +2198,95 @@ mod tests {
         let completed = sse_text(&stream.finish_events());
 
         assert!(completed.contains("\"instructions\":\"be terse\""));
+    }
+
+    // ===== SSE 输出快照（ER-1/ER-3 回归防护网）=====
+    //
+    // 固定事件序列喂入 chat / responses stream，序列化全部 SSE 输出后写 golden。
+    // 掩码易变 ID/时间戳。重构流式管道后输出必须逐字不变。
+
+    fn chat_transcript(thinking_format: &str) -> String {
+        let mut stream =
+            OpenAIChatStream::new("claude-sonnet-4.5", 12, HashMap::new(), thinking_format);
+        let mut out: Vec<bytes::Bytes> = Vec::new();
+
+        let assistant: AssistantResponseEvent =
+            serde_json::from_value(serde_json::json!({ "content": "Hello world" })).unwrap();
+        out.extend(stream.process_event(&Event::AssistantResponse(assistant)));
+
+        let mut reasoning = ReasoningContentEvent::default();
+        reasoning.text = "let me think".to_string();
+        out.extend(stream.process_event(&Event::ReasoningContent(reasoning)));
+
+        out.extend(stream.process_event(&Event::ToolUse(ToolUseEvent {
+            name: "exec_command".to_string(),
+            tool_use_id: "call_snap".to_string(),
+            input: "{\"cmd\":\"ls\"}".to_string(),
+            input_is_json_object: false,
+            stop: true,
+        })));
+
+        out.extend(
+            stream.process_event(&Event::ContextUsage(ContextUsageEvent {
+                context_usage_percentage: 25.0,
+            })),
+        );
+
+        out.extend(stream.finish_events());
+        sse_text(&out)
+    }
+
+    fn responses_transcript() -> String {
+        let mut stream = OpenAIResponsesStream::new(
+            "claude-sonnet-4.5",
+            12,
+            HashMap::new(),
+            None,
+            None,
+            "thinking",
+        );
+        let mut out: Vec<bytes::Bytes> = Vec::new();
+
+        let assistant: AssistantResponseEvent =
+            serde_json::from_value(serde_json::json!({ "content": "Hello world" })).unwrap();
+        out.extend(stream.process_event(&Event::AssistantResponse(assistant)));
+
+        out.extend(stream.process_event(&Event::ToolUse(ToolUseEvent {
+            name: "exec_command".to_string(),
+            tool_use_id: "call_snap".to_string(),
+            input: "{\"cmd\":\"ls\"}".to_string(),
+            input_is_json_object: false,
+            stop: true,
+        })));
+
+        out.extend(
+            stream.process_event(&Event::ContextUsage(ContextUsageEvent {
+                context_usage_percentage: 25.0,
+            })),
+        );
+
+        out.extend(stream.finish_events());
+        sse_text(&out)
+    }
+
+    #[test]
+    fn snapshot_openai_chat_reasoning_content() {
+        crate::common::snapshot::assert_golden(
+            "openai_chat_reasoning_content",
+            &chat_transcript("reasoning_content"),
+        );
+    }
+
+    #[test]
+    fn snapshot_openai_chat_think_tag() {
+        crate::common::snapshot::assert_golden(
+            "openai_chat_think_tag",
+            &chat_transcript("<think>"),
+        );
+    }
+
+    #[test]
+    fn snapshot_openai_responses() {
+        crate::common::snapshot::assert_golden("openai_responses", &responses_transcript());
     }
 }

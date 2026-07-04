@@ -1,5 +1,5 @@
 use anyhow::Context;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::auth::social;
@@ -53,6 +53,38 @@ fn oidc_endpoint(region: &str) -> String {
     format!("https://oidc.{}.amazonaws.com", region)
 }
 
+/// 共享的 OIDC POST 脚手架：`content-type` + `host` 头、JSON 请求体、成功检查、反序列化。
+/// 仅供请求形态完全一致的调用点使用（错误前缀由调用点提供以保持原有报错字符串不变）。
+async fn oidc_post_json<B: Serialize, T: DeserializeOwned>(
+    url: &str,
+    region: &str,
+    body: &B,
+    proxy: Option<&ProxyConfig>,
+    config: &Config,
+    err_send: &'static str,
+    err_status_prefix: &str,
+    err_parse: &'static str,
+) -> anyhow::Result<T> {
+    let client = build_client(proxy, 30, config.tls_backend)?;
+
+    let resp = client
+        .post(url)
+        .header("content-type", "application/json")
+        .header("host", format!("oidc.{}.amazonaws.com", region))
+        .json(body)
+        .send()
+        .await
+        .context(err_send)?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body_text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("{} {}: {}", err_status_prefix, status, body_text);
+    }
+
+    resp.json::<T>().await.context(err_parse)
+}
+
 fn build_device_register_request(start_url: &str) -> RegisterClientRequest {
     RegisterClientRequest {
         client_name: "Kiro".to_string(),
@@ -92,28 +124,19 @@ pub async fn register_client(
     proxy: Option<&ProxyConfig>,
 ) -> anyhow::Result<RegisterClientResponse> {
     let url = format!("{}/client/register", oidc_endpoint(region));
-    let client = build_client(proxy, 30, config.tls_backend)?;
-
     let body = build_device_register_request(start_url);
 
-    let resp = client
-        .post(&url)
-        .header("content-type", "application/json")
-        .header("host", format!("oidc.{}.amazonaws.com", region))
-        .json(&body)
-        .send()
-        .await
-        .context("注册 OIDC 客户端请求失败")?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        let body_text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("注册 OIDC 客户端失败 {}: {}", status, body_text);
-    }
-
-    resp.json::<RegisterClientResponse>()
-        .await
-        .context("解析注册响应失败")
+    oidc_post_json(
+        &url,
+        region,
+        &body,
+        proxy,
+        config,
+        "注册 OIDC 客户端请求失败",
+        "注册 OIDC 客户端失败",
+        "解析注册响应失败",
+    )
+    .await
 }
 
 async fn register_sso_token_client(
@@ -123,27 +146,19 @@ async fn register_sso_token_client(
     proxy: Option<&ProxyConfig>,
 ) -> anyhow::Result<RegisterClientResponse> {
     let url = format!("{}/client/register", oidc_endpoint(region));
-    let client = build_client(proxy, 30, config.tls_backend)?;
     let body = build_sso_token_register_request(start_url);
 
-    let resp = client
-        .post(&url)
-        .header("content-type", "application/json")
-        .header("host", format!("oidc.{}.amazonaws.com", region))
-        .json(&body)
-        .send()
-        .await
-        .context("注册 SSO 令牌 OIDC 客户端请求失败")?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        let body_text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("注册 SSO 令牌 OIDC 客户端失败 {}: {}", status, body_text);
-    }
-
-    resp.json::<RegisterClientResponse>()
-        .await
-        .context("解析 SSO 令牌注册响应失败")
+    oidc_post_json(
+        &url,
+        region,
+        &body,
+        proxy,
+        config,
+        "注册 SSO 令牌 OIDC 客户端请求失败",
+        "注册 SSO 令牌 OIDC 客户端失败",
+        "解析 SSO 令牌注册响应失败",
+    )
+    .await
 }
 
 fn build_iam_sso_authorize_url(
@@ -166,7 +181,7 @@ fn build_iam_sso_authorize_url(
 
 fn build_iam_sso_register_request(start_url: &str) -> serde_json::Value {
     serde_json::json!({
-        "clientName": "Kiro",
+        "clientName": "Kiro IDE",
         "clientType": "public",
         "scopes": IAM_SSO_CODE_SCOPES,
         "grantTypes": ["authorization_code", "refresh_token"],
@@ -241,7 +256,6 @@ pub async fn exchange_iam_sso_code(
     proxy: Option<&ProxyConfig>,
 ) -> anyhow::Result<CreateTokenResponse> {
     let url = format!("{}/token", oidc_endpoint(region));
-    let client = build_client(proxy, 30, config.tls_backend)?;
     let body = serde_json::json!({
         "clientId": client_id,
         "clientSecret": client_secret,
@@ -251,24 +265,17 @@ pub async fn exchange_iam_sso_code(
         "codeVerifier": code_verifier,
     });
 
-    let resp = client
-        .post(&url)
-        .header("content-type", "application/json")
-        .header("host", format!("oidc.{}.amazonaws.com", region))
-        .json(&body)
-        .send()
-        .await
-        .context("IAM SSO 授权码换令牌请求失败")?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        let body_text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("IAM SSO 授权码换令牌失败 {}: {}", status, body_text);
-    }
-
-    resp.json::<CreateTokenResponse>()
-        .await
-        .context("解析 IAM SSO 令牌响应失败")
+    oidc_post_json(
+        &url,
+        region,
+        &body,
+        proxy,
+        config,
+        "IAM SSO 授权码换令牌请求失败",
+        "IAM SSO 授权码换令牌失败",
+        "解析 IAM SSO 令牌响应失败",
+    )
+    .await
 }
 
 pub async fn start_device_authorization(
@@ -280,7 +287,6 @@ pub async fn start_device_authorization(
     proxy: Option<&ProxyConfig>,
 ) -> anyhow::Result<StartDeviceAuthorizationResponse> {
     let url = format!("{}/device_authorization", oidc_endpoint(region));
-    let client = build_client(proxy, 30, config.tls_backend)?;
 
     let body = StartDeviceAuthorizationRequest {
         client_id: client_id.to_string(),
@@ -288,24 +294,17 @@ pub async fn start_device_authorization(
         start_url: start_url.to_string(),
     };
 
-    let resp = client
-        .post(&url)
-        .header("content-type", "application/json")
-        .header("host", format!("oidc.{}.amazonaws.com", region))
-        .json(&body)
-        .send()
-        .await
-        .context("发起设备授权请求失败")?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        let body_text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("发起设备授权失败 {}: {}", status, body_text);
-    }
-
-    resp.json::<StartDeviceAuthorizationResponse>()
-        .await
-        .context("解析设备授权响应失败")
+    oidc_post_json(
+        &url,
+        region,
+        &body,
+        proxy,
+        config,
+        "发起设备授权请求失败",
+        "发起设备授权失败",
+        "解析设备授权响应失败",
+    )
+    .await
 }
 
 pub async fn poll_token(
@@ -644,7 +643,7 @@ mod tests {
     fn iam_sso_register_request_uses_builder_id_code_shape() {
         let value = build_iam_sso_register_request(BUILDER_ID_START_URL);
 
-        assert_eq!(value["clientName"], "Kiro");
+        assert_eq!(value["clientName"], "Kiro IDE");
         assert_eq!(value["clientType"], "public");
         assert_eq!(value["issuerUrl"], BUILDER_ID_START_URL);
         assert_eq!(

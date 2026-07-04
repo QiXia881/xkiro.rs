@@ -185,9 +185,12 @@ impl KiroProvider {
     }
 
     /// 根据凭据选择 endpoint 实现
+    ///
+    /// endpoint 名称解析统一走 `effective_endpoint_name`（凭据级 > default > 兜底 "ide"，
+    /// 且过滤空串/空白），与刷新阶段保持一致，避免同凭据在不同阶段走不同端点。
     fn endpoint_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
         let default = self.default_endpoint.read();
-        let name = credentials.endpoint.as_deref().unwrap_or(default.as_str());
+        let name = credentials.effective_endpoint_name(Some(default.as_str()));
         self.endpoints
             .get(name)
             .cloned()
@@ -198,9 +201,8 @@ impl KiroProvider {
     fn endpoint_name_for(&self, credentials: &KiroCredentials) -> String {
         let default = self.default_endpoint.read();
         credentials
-            .endpoint
-            .clone()
-            .unwrap_or_else(|| default.clone())
+            .effective_endpoint_name(Some(default.as_str()))
+            .to_string()
     }
 
     /// 获取备选 endpoint 列表（排除当前 endpoint，按固定顺序）

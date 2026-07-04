@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { CheckCircle, Copy, Loader2 } from 'lucide-react'
+import { Copy, Loader2 } from 'lucide-react'
 import { toast } from 'sonner'
 import { completeSocialLoginCallback, startSocialLogin, pollSocialLogin } from '@/api/credentials'
 import { Button } from '@/components/ui/button'
@@ -12,8 +12,9 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
-import { CredentialLoginSummary } from '@/components/credential-login-summary'
-import type { CredentialLoginDetails, StartSocialLoginResponse } from '@/types/api'
+import { LoginSuccessView } from '@/components/login-success-view'
+import { useLoginResult } from '@/hooks/use-login-result'
+import type { StartSocialLoginResponse } from '@/types/api'
 import { extractErrorMessage } from '@/lib/utils'
 import { CREDENTIAL_AUTH_LABELS, formatCredentialAuthLabel } from '@/lib/credential-metadata'
 import { storage } from '@/lib/storage'
@@ -24,14 +25,14 @@ interface SocialLoginDialogProps {
   onSuccess: () => void
 }
 
-type Step = 'form' | 'waiting' | 'done'
 type SocialProvider = 'GitHub' | 'Google'
 
 const POLL_INTERVAL_MS = 2000
 const SOCIAL_PROVIDER_LABEL = `${CREDENTIAL_AUTH_LABELS.google} / ${CREDENTIAL_AUTH_LABELS.github}`
 
 export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLoginDialogProps) {
-  const [step, setStep] = useState<Step>('form')
+  const { step, setStep, credentialId, credentialAuthLabel, credentialDetails, markSuccess, reset: resetResult } =
+    useLoginResult(onSuccess)
   const [provider, setProvider] = useState<SocialProvider>('GitHub')
   const [priority, setPriority] = useState('0')
   const [email, setEmail] = useState('')
@@ -39,9 +40,6 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
   const [isSubmittingCallback, setIsSubmittingCallback] = useState(false)
   const [callbackUrl, setCallbackUrl] = useState('')
   const [session, setSession] = useState<StartSocialLoginResponse | null>(null)
-  const [credentialId, setCredentialId] = useState<number | null>(null)
-  const [credentialAuthLabel, setCredentialAuthLabel] = useState('')
-  const [credentialDetails, setCredentialDetails] = useState<CredentialLoginDetails | null>(null)
   const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const activePollSessionRef = useRef<string | null>(null)
 
@@ -66,7 +64,7 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
   const handleOpenChange = (nextOpen: boolean) => {
     if (!nextOpen) {
       stopPolling()
-      setStep('form')
+      resetResult()
       setProvider('GitHub')
       setPriority('0')
       setEmail('')
@@ -74,9 +72,6 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
       setIsSubmittingCallback(false)
       setCallbackUrl('')
       setSession(null)
-      setCredentialId(null)
-      setCredentialAuthLabel('')
-      setCredentialDetails(null)
     }
     onOpenChange(nextOpen)
   }
@@ -98,12 +93,7 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
             details?.authMethod ?? result.authMethod,
           )
           stopPolling()
-          setCredentialId(result.credentialId)
-          setCredentialAuthLabel(authLabel)
-          setCredentialDetails(details)
-          setStep('done')
-          onSuccess()
-          toast.success(`登录成功，已添加${authLabel ? ` ${authLabel}` : ''} 凭据 #${result.credentialId}`)
+          markSuccess(result.credentialId, authLabel, details)
           return
         }
         if (result.status === 'error') {
@@ -189,13 +179,8 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
           details?.provider ?? result.provider,
           details?.authMethod ?? result.authMethod,
         )
-        setCredentialId(result.credentialId)
-        setCredentialAuthLabel(authLabel)
-        setCredentialDetails(details)
-        setStep('done')
         setCallbackUrl('')
-        onSuccess()
-        toast.success(`登录成功，已添加${authLabel ? ` ${authLabel}` : ''} 凭据 #${result.credentialId}`)
+        markSuccess(result.credentialId, authLabel, details)
         return
       }
       if (result.status === 'error') {
@@ -364,15 +349,11 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
         )}
 
         {step === 'done' && (
-          <div className="flex flex-col items-center gap-3 py-4">
-            <CheckCircle className="h-10 w-10 text-green-500" />
-            <p className="text-sm font-medium">登录成功</p>
-            <CredentialLoginSummary
-              credentialId={credentialId}
-              authLabel={credentialAuthLabel}
-              details={credentialDetails}
-            />
-          </div>
+          <LoginSuccessView
+            credentialId={credentialId}
+            authLabel={credentialAuthLabel}
+            details={credentialDetails}
+          />
         )}
 
         <DialogFooter>

@@ -1,0 +1,12 @@
+data: {"choices":[{"delta":{"reasoning_content":"let me think"},"finish_reason":null,"index":0}],"created":<TS>,"id":"chatcmpl-<ID>","model":"claude-sonnet-4.5","object":"chat.completion.chunk"}
+
+data: {"id":"chatcmpl-<ID>","object":"chat.completion.chunk","created":<TS>,"model":"claude-sonnet-4.5","choices":[{"index":0,"delta":{"content":"Hello world"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-<ID>","object":"chat.completion.chunk","created":<TS>,"model":"claude-sonnet-4.5","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_snap","type":"function","function":{"name":"exec_command","arguments":""}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-<ID>","object":"chat.completion.chunk","created":<TS>,"model":"claude-sonnet-4.5","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"cmd\":\"ls\"}"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-<ID>","object":"chat.completion.chunk","created":<TS>,"model":"claude-sonnet-4.5","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":50000,"completion_tokens":<N>,"total_tokens":<N>}}
+
+data: [DONE]
+

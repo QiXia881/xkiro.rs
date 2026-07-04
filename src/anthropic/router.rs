@@ -13,7 +13,7 @@ use parking_lot::RwLock;
 
 use crate::kiro::provider::KiroProvider;
 use crate::model::config::{CompressionConfig, PromptFilterConfig};
-use crate::model::runtime::SharedPromptConfig;
+use crate::model::runtime::{SharedModelMappingConfig, SharedPromptConfig};
 
 use super::{
     handlers::{count_tokens, get_models, get_public_stats, post_messages, post_messages_cc},
@@ -61,6 +61,7 @@ pub fn create_router_with_provider(
     extract_thinking: bool,
     compression: Arc<RwLock<CompressionConfig>>,
     prompt_filter: Arc<RwLock<PromptFilterConfig>>,
+    model_mapping: SharedModelMappingConfig,
     prompt_runtime: SharedPromptConfig,
     prompt_cache_runtime: Arc<RwLock<super::middleware::PromptCacheRuntime>>,
     thinking_config: Arc<RwLock<ThinkingRuntimeConfig>>,
@@ -81,6 +82,7 @@ pub fn create_router_with_provider(
     .with_thinking_config(thinking_config)
     .with_compression_config(compression)
     .with_prompt_filter_config(prompt_filter)
+    .with_model_mapping_config(model_mapping)
     .with_prompt_runtime(prompt_runtime);
     if let Some(path) = api_keys_store_path {
         state = state.with_api_keys_path(path);
@@ -173,6 +175,7 @@ mod tests {
             false,
             Arc::new(RwLock::new(CompressionConfig::default())),
             Arc::new(RwLock::new(PromptFilterConfig::default())),
+            crate::model::runtime::model_mapping_from_config(&config),
             crate::model::runtime::shared_from_config(&config),
             Arc::new(RwLock::new(PromptCacheRuntime::new(
                 config.prompt_cache_ttl_seconds,
