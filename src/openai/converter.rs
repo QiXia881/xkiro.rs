@@ -2188,9 +2188,9 @@ mod tests {
         }))
         .expect("responses request should parse without model");
 
-        assert_eq!(req.model, "claude-sonnet-4.5");
+        assert_eq!(req.model, "claude-sonnet-4-5");
         let messages_req = responses_to_messages_request(&req).expect("conversion should succeed");
-        assert_eq!(messages_req.model, "claude-sonnet-4.5");
+        assert_eq!(messages_req.model, "claude-sonnet-4-5");
     }
 
     #[test]
@@ -2201,8 +2201,8 @@ mod tests {
         }))
         .expect("responses request should parse with blank model");
 
-        assert_eq!(req.model, "claude-sonnet-4.5");
+        assert_eq!(req.model, "claude-sonnet-4-5");
         let messages_req = responses_to_messages_request(&req).expect("conversion should succeed");
-        assert_eq!(messages_req.model, "claude-sonnet-4.5");
+        assert_eq!(messages_req.model, "claude-sonnet-4-5");
     }
 }

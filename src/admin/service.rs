@@ -83,8 +83,6 @@ const CREDENTIAL_BACKUP_SCHEMA: &str = "native-credential-bundle";
 const SOURCE_FORMAT_CREDENTIAL_SNAPSHOT: &str = "external.account-export";
 const SOURCE_FORMAT_CACHED_CREDENTIAL: &str = "compatible.cache-record";
 const SOURCE_FORMAT_FLAT_CREDENTIAL: &str = "flat.credentials";
-const KIRO_SOCIAL_PROFILE_ARN: &str =
-    "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK";
 const KIRO_BUILDER_ID_CLIENT_ID_HASH: &str = "e909a0580879b06ece1202964fbe9dda95ea4ce3";
 
 struct ParsedCredentialImport {
@@ -5079,13 +5077,8 @@ impl CreditUsageObserver for AdminService {
 impl AdminService {
     // ── 社交 OAuth 登录 ────────────────────────────────────────────────────
 
-    fn social_profile_arn_or_default(profile_arn: Option<String>) -> String {
-        profile_arn
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| KIRO_SOCIAL_PROFILE_ARN.to_string())
+    fn clean_social_profile_arn(profile_arn: Option<String>) -> Option<String> {
+        KiroCredentials::clean_profile_arn(profile_arn)
     }
 
     async fn enrich_social_login_credential(
@@ -5378,7 +5371,7 @@ impl AdminService {
         }
         new_cred.access_token = Some(token_resp.access_token);
         new_cred.refresh_token = token_resp.refresh_token;
-        new_cred.profile_arn = Some(Self::social_profile_arn_or_default(token_resp.profile_arn));
+        new_cred.profile_arn = Self::clean_social_profile_arn(token_resp.profile_arn);
 
         if let Some(expires_at) = token_resp.expires_at {
             new_cred.expires_at = Some(expires_at);
@@ -5434,7 +5427,7 @@ impl AdminService {
         let mut new_cred = cred_template;
         new_cred.access_token = Some(req.access_token);
         new_cred.refresh_token = req.refresh_token;
-        new_cred.profile_arn = Some(Self::social_profile_arn_or_default(req.profile_arn));
+        new_cred.profile_arn = Self::clean_social_profile_arn(req.profile_arn);
         if req.machine_id.is_some() {
             new_cred.machine_id = req.machine_id;
         }
@@ -6979,7 +6972,7 @@ impl AdminService {
                 let email = kiro_sso::extract_email_from_jwt(&token.access_token);
                 new_cred.access_token = Some(token.access_token);
                 new_cred.refresh_token = token.refresh_token;
-                new_cred.profile_arn = token.profile_arn;
+                new_cred.profile_arn = KiroCredentials::clean_profile_arn(token.profile_arn);
                 new_cred.auth_method = Some("social".to_string());
                 new_cred.provider =
                     Some(Self::kiro_sso_provider(kiro_sso::KiroSsoCaptureKind::Social).to_string());
@@ -9030,7 +9023,7 @@ mod settings_tests {
         cred.region = Some("us-east-1".to_string());
         cred.expires_at = Some("2026-06-29T00:00:00Z".to_string());
         cred.machine_id = Some("machine-1".to_string());
-        cred.profile_arn = Some("profile-arn".to_string());
+        cred.profile_arn = Some("arn:aws:codewhisperer:us-east-1:123:profile/test".to_string());
         cred.proxy_url = Some("http://proxy.local:8080".to_string());
         cred.weight = 5;
         cred.meta.request_count = Some(7);
@@ -9069,7 +9062,7 @@ mod settings_tests {
         assert_eq!(credential_export.machine_id.as_deref(), Some("machine-1"));
         assert_eq!(
             credential_export.profile_arn.as_deref(),
-            Some("profile-arn")
+            Some("arn:aws:codewhisperer:us-east-1:123:profile/test")
         );
         assert_eq!(
             credential_export.proxy_url.as_deref(),
@@ -9115,8 +9108,8 @@ mod settings_tests {
         assert_eq!(
             response.models,
             vec![
-                "claude-haiku-4.5".to_string(),
-                "claude-sonnet-4.5".to_string()
+                "claude-haiku-4-5".to_string(),
+                "claude-sonnet-4-5".to_string()
             ]
         );
 
@@ -9654,7 +9647,7 @@ mod settings_tests {
         cred.auth_method = Some("social".to_string());
         cred.provider = Some("GitHub".to_string());
         cred.user_id = Some("user-1".to_string());
-        cred.profile_arn = Some("profile-arn".to_string());
+        cred.profile_arn = Some("arn:aws:codewhisperer:us-east-1:123:profile/backup".to_string());
         cred.machine_id = Some("machine-1".to_string());
         cred.region = Some("us-east-1".to_string());
         cred.auth_region = Some("us-west-2".to_string());
@@ -9987,7 +9980,7 @@ mod settings_tests {
                     "authMethod": "social",
                     "provider": "GitHub",
                     "email": "dev@github.local",
-                    "profileArn": "profile-social",
+                    "profileArn": "arn:aws:codewhisperer:us-east-1:123:profile/social",
                     "machineId": "machine-social",
                     "region": "us-east-1",
                     "apiRegion": "us-east-2",
@@ -10300,7 +10293,7 @@ mod settings_tests {
             "idToken": "id-token-source",
             "region": "eu-west-1",
             "startUrl": "https://view.awsapps.com/start",
-            "profileArn": "profile-source",
+            "profileArn": "arn:aws:codewhisperer:eu-west-1:123:profile/source",
             "machineId": "machine-source",
             "enabled": false,
             "proxyConfig": {
@@ -10402,7 +10395,10 @@ mod settings_tests {
         field!("region", "us-west-2");
         field!("expiresAt", 1_893_456_000_i64);
         field!("machineId", "machine-config");
-        field!("profileArn", "profile-config");
+        field!(
+            "profileArn",
+            "arn:aws:codewhisperer:us-west-2:123:profile/config"
+        );
         field!("proxyURL", "direct");
         field!("weight", 4);
         field!("overageStatus", "ENABLED");

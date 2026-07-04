@@ -37,6 +37,7 @@ use super::types::{
     ModelsResponse, OutputConfig, SystemMessage, Thinking,
 };
 use super::websearch;
+use crate::model::claude::native_claude_model_id;
 use crate::model::config::SystemPromptPosition;
 use crate::model::runtime::SharedPromptConfig;
 
@@ -1043,13 +1044,14 @@ fn alias_models() -> [Model; 3] {
 
 fn fallback_anthropic_models(thinking_suffix: &str) -> Vec<Model> {
     [
-        "claude-sonnet-4.6",
-        "claude-opus-4.6",
-        "claude-opus-4.7",
-        "claude-sonnet-4.5",
+        "claude-sonnet-4-6",
+        "claude-opus-4-6",
+        "claude-opus-4-8",
+        "claude-opus-4-7",
+        "claude-sonnet-4-5",
         "claude-sonnet-4",
-        "claude-haiku-4.5",
-        "claude-opus-4.5",
+        "claude-haiku-4-5",
+        "claude-opus-4-5",
     ]
     .into_iter()
     .flat_map(|id| {
@@ -1070,10 +1072,11 @@ fn build_anthropic_models_response(cached: &[AvailableModel], thinking_suffix: &
         .iter()
         .flat_map(|model| {
             let supports_image = model_supports_image(&model.supported_input_types);
+            let model_id = native_claude_model_id(&model.model_id);
             [
-                build_model_info(&model.model_id, "anthropic", supports_image),
+                build_model_info(&model_id, "anthropic", supports_image),
                 build_model_info(
-                    format!("{}{}", model.model_id, thinking_suffix),
+                    format!("{}{}", model_id, thinking_suffix),
                     "anthropic",
                     supports_image,
                 ),
@@ -3166,10 +3169,12 @@ mod tests {
         let models = default_models_response("-thinking");
         let ids: std::collections::HashSet<_> = models.iter().map(|m| m.id.as_str()).collect();
 
-        assert!(ids.contains("claude-sonnet-4.6"));
-        assert!(ids.contains("claude-sonnet-4.6-thinking"));
-        assert!(ids.contains("claude-opus-4.7"));
-        assert!(ids.contains("claude-opus-4.7-thinking"));
+        assert!(ids.contains("claude-sonnet-4-6"));
+        assert!(ids.contains("claude-sonnet-4-6-thinking"));
+        assert!(ids.contains("claude-opus-4-8"));
+        assert!(ids.contains("claude-opus-4-8-thinking"));
+        assert!(ids.contains("claude-opus-4-7"));
+        assert!(ids.contains("claude-opus-4-7-thinking"));
         assert!(ids.contains("auto"));
         assert!(ids.contains("gpt-4o"));
         assert!(ids.contains("gpt-4"));

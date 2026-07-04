@@ -5,9 +5,7 @@
 //! - MCP: `https://q.{api_region}.amazonaws.com/mcp`
 //! - Usage: `https://codewhisperer.us-east-1.amazonaws.com/getUsageLimits` 或非 us-east-1 的 `https://q.{api_region}.amazonaws.com/getUsageLimits`
 //!
-//! 请求头使用 aws-sdk-js User-Agent 标识。请求体会在根对象上注入 `profileArn`，
-//! 但 AWS SSO OIDC（Builder ID / IAM Identity Center）凭据不携带 profileArn，
-//! 此时反而需要从 body / header 移除该字段。
+//! 请求头使用 aws-sdk-js User-Agent 标识。请求体会在根对象上注入已解析的 `profileArn`。
 
 use reqwest::RequestBuilder;
 use uuid::Uuid;
@@ -70,17 +68,13 @@ impl IdeEndpoint {
         )
     }
 
-    /// 返回 MCP 请求需要附带的 profileArn header 值，SSO OIDC 凭据返回 None
+    /// 返回 MCP 请求需要附带的 profileArn header 值
     pub(crate) fn mcp_profile_arn_header_value(credentials: &KiroCredentials) -> Option<&str> {
-        if credentials.is_aws_sso_oidc_credential() {
-            return None;
-        }
         credentials.profile_arn_trimmed()
     }
 
     /// 将 profileArn 注入或从请求体根对象移除
     ///
-    /// - SSO OIDC 凭据：解析 JSON 并 remove `profileArn`
     /// - 其它凭据有 profile_arn：解析 JSON 并 insert
     /// - 其它凭据无 profile_arn：保留并修剪 body 中已有 profileArn
     /// - 解析失败：返回错误，由 provider 立即终止该次调用
@@ -88,14 +82,6 @@ impl IdeEndpoint {
         request_body: &str,
         credentials: &KiroCredentials,
     ) -> anyhow::Result<String> {
-        if credentials.is_aws_sso_oidc_credential() {
-            let mut request: serde_json::Value = serde_json::from_str(request_body)?;
-            if let Some(obj) = request.as_object_mut() {
-                obj.remove("profileArn");
-            }
-            return Ok(serde_json::to_string(&request)?);
-        }
-
         if let Some(profile_arn) = Self::mcp_profile_arn_header_value(credentials) {
             let mut request: serde_json::Value = serde_json::from_str(request_body)?;
             let obj = request
@@ -303,7 +289,7 @@ impl KiroEndpoint for IdeEndpoint {
 mod tests {
     use super::IdeEndpoint;
     use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
-    use crate::kiro::model::credentials::{KIRO_BUILDER_ID_PROFILE_ARN, KiroCredentials};
+    use crate::kiro::model::credentials::KiroCredentials;
     use crate::model::config::Config;
     use serde_json::Value;
 
@@ -316,7 +302,7 @@ mod tests {
     fn cred_sso(auth_method: &str) -> KiroCredentials {
         let mut c = KiroCredentials::default();
         c.auth_method = Some(auth_method.to_string());
-        c.profile_arn = Some("ignored-arn".to_string());
+        c.profile_arn = Some("arn:aws:codewhisperer:profile/sso".to_string());
         c
     }
 
@@ -324,7 +310,7 @@ mod tests {
         let mut c = KiroCredentials::default();
         c.client_id = Some("cid".to_string());
         c.client_secret = Some("csec".to_string());
-        c.profile_arn = Some("ignored-arn".to_string());
+        c.profile_arn = Some("arn:aws:codewhisperer:profile/sso".to_string());
         c
     }
 
@@ -449,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn ide_usage_uses_builder_id_default_profile_arn_for_management_calls() {
+    fn ide_usage_omits_profile_arn_when_builder_id_has_no_cached_arn() {
         let endpoint = IdeEndpoint::new();
         let mut config = Config::default();
         config.api_region = Some("eu-central-1".to_string());
@@ -470,15 +456,12 @@ mod tests {
         assert!(
             parts
                 .url
-                .starts_with("https://codewhisperer.us-east-1.amazonaws.com/getUsageLimits?")
+                .starts_with("https://q.eu-central-1.amazonaws.com/getUsageLimits?")
         );
-        assert!(parts.url.contains(&format!(
-            "profileArn={}",
-            urlencoding::encode(KIRO_BUILDER_ID_PROFILE_ARN)
-        )));
+        assert!(!parts.url.contains("profileArn="));
         assert_eq!(
             header_value(&parts.headers, "host"),
-            Some("codewhisperer.us-east-1.amazonaws.com")
+            Some("q.eu-central-1.amazonaws.com")
         );
     }
 
@@ -525,7 +508,7 @@ mod tests {
     }
 
     #[test]
-    fn ide_set_preference_omits_enterprise_profile_arn() {
+    fn ide_set_preference_keeps_enterprise_cached_profile_arn() {
         let endpoint = IdeEndpoint::new();
         let config = Config::default();
         let credentials = KiroCredentials {
@@ -546,7 +529,10 @@ mod tests {
             .unwrap();
         let body: Value = serde_json::from_str(&parts.body).unwrap();
 
-        assert!(body.get("profileArn").is_none());
+        assert_eq!(
+            body["profileArn"],
+            "arn:aws:codewhisperer:us-east-1:123:profile/ignored"
+        );
     }
 
     #[test]
@@ -702,42 +688,44 @@ mod tests {
     fn test_inject_profile_arn_invalid_json() {
         let body = "not-valid-json";
         let cred = cred_with_arn(Some("arn:aws:codewhisperer:profile/test"));
-        // SSO 与非 SSO 路径都要先 parse；非法 JSON 应返 Err
         assert!(IdeEndpoint::inject_profile_arn(body, &cred).is_err());
     }
 
     #[test]
-    fn test_sso_builder_id_strips_profile_arn() {
+    fn test_sso_builder_id_uses_cached_profile_arn() {
         let body = r#"{"profileArn":"old","other":1}"#;
         let cred = cred_sso("builder-id");
         let result = IdeEndpoint::inject_profile_arn(body, &cred).unwrap();
         let json: Value = serde_json::from_str(&result).unwrap();
-        assert!(json.get("profileArn").is_none());
+        assert_eq!(json["profileArn"], "arn:aws:codewhisperer:profile/sso");
         assert_eq!(json["other"], 1);
     }
 
     #[test]
-    fn test_sso_idc_strips_profile_arn() {
+    fn test_sso_idc_uses_cached_profile_arn() {
         let body = r#"{"profileArn":"old"}"#;
         let cred = cred_sso("idc");
         let result = IdeEndpoint::inject_profile_arn(body, &cred).unwrap();
         let json: Value = serde_json::from_str(&result).unwrap();
-        assert!(json.get("profileArn").is_none());
+        assert_eq!(json["profileArn"], "arn:aws:codewhisperer:profile/sso");
     }
 
     #[test]
-    fn test_sso_oauth_strips_profile_arn() {
+    fn test_sso_oauth_uses_cached_profile_arn() {
         let body = r#"{"profileArn":"old"}"#;
         let cred = cred_sso_oauth();
         let result = IdeEndpoint::inject_profile_arn(body, &cred).unwrap();
         let json: Value = serde_json::from_str(&result).unwrap();
-        assert!(json.get("profileArn").is_none());
+        assert_eq!(json["profileArn"], "arn:aws:codewhisperer:profile/sso");
     }
 
     #[test]
-    fn test_mcp_profile_arn_header_value_sso_returns_none() {
+    fn test_mcp_profile_arn_header_value_sso_returns_cached_arn() {
         let cred = cred_sso("builder-id");
-        assert!(IdeEndpoint::mcp_profile_arn_header_value(&cred).is_none());
+        assert_eq!(
+            IdeEndpoint::mcp_profile_arn_header_value(&cred),
+            Some("arn:aws:codewhisperer:profile/sso")
+        );
     }
 
     #[test]

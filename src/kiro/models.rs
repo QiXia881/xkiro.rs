@@ -92,22 +92,22 @@ fn build_list_models_url(
         let mut pairs = url.query_pairs_mut();
         pairs.append_pair("origin", "AI_EDITOR");
         pairs.append_pair("maxResults", "50");
-        if let Some(arn) = profile_arn.filter(|v| !v.trim().is_empty()) {
+        if let Some(arn) = profile_arn
+            .map(str::trim)
+            .filter(|v| KiroCredentials::is_valid_profile_arn(v))
+        {
             pairs.append_pair("profileArn", arn);
         }
-        if let Some(provider) = model_provider.filter(|v| !v.trim().is_empty()) {
+        if let Some(provider) = model_provider.map(str::trim).filter(|v| !v.is_empty()) {
             pairs.append_pair("modelProvider", provider);
         }
-        if let Some(nt) = next_token.filter(|v| !v.trim().is_empty()) {
+        if let Some(nt) = next_token.map(str::trim).filter(|v| !v.is_empty()) {
             pairs.append_pair("nextToken", nt);
         }
     }
     Ok(url.into())
 }
-/// 提取仅 ListAvailableModels 需要的 host + headers
-///
-/// 复用 endpoint 的 `usage_request_parts` 拿 host / user-agent 风格，
-/// 避免重复维护 IDE / CLI 两套 UA 字符串。
+
 fn list_models_request_parts(
     endpoint: &dyn KiroEndpoint,
     ctx: &RequestContext<'_>,
@@ -147,6 +147,19 @@ fn list_profiles_request_parts(
     Ok(parts)
 }
 
+fn remove_api_key_token_type_header(headers: &mut Vec<(&'static str, String)>) {
+    headers.retain(|(k, _)| *k != "tokentype");
+}
+
+fn refresh_invocation_id(headers: &mut [(&'static str, String)]) {
+    if let Some(slot) = headers
+        .iter_mut()
+        .find(|(k, _)| k.eq_ignore_ascii_case("amz-sdk-invocation-id"))
+    {
+        slot.1 = Uuid::new_v4().to_string();
+    }
+}
+
 async fn fetch_page(
     credentials: &KiroCredentials,
     config: &Config,
@@ -180,18 +193,8 @@ async fn fetch_page(
     )
     .map_err(|e| e.to_string())?;
 
-    // ListAvailableModels 不要 tokentype header
-    parts
-        .headers
-        .retain(|(k, _)| !k.eq_ignore_ascii_case("tokentype"));
-    // 替换 invocation-id 为新值（避免页间重复）
-    if let Some(slot) = parts
-        .headers
-        .iter_mut()
-        .find(|(k, _)| k.eq_ignore_ascii_case("amz-sdk-invocation-id"))
-    {
-        slot.1 = Uuid::new_v4().to_string();
-    }
+    remove_api_key_token_type_header(&mut parts.headers);
+    refresh_invocation_id(&mut parts.headers);
 
     let client = build_client(proxy, 60, config.tls_backend).map_err(|e| e.to_string())?;
     let mut req = client.get(&parts.url).header("accept", "application/json");
@@ -443,7 +446,7 @@ async fn list_available_profiles_with_retry_in_region(
 fn profile_region_candidates(credentials: &KiroCredentials, config: &Config) -> Vec<String> {
     let mut out = Vec::new();
 
-    push_unique_region(&mut out, credentials.effective_kiro_api_region(config));
+    push_unique_region(&mut out, profile_lookup_region(credentials, config));
     if !should_probe_fallback_regions(credentials) {
         return out;
     }
@@ -459,6 +462,29 @@ fn profile_region_candidates(credentials: &KiroCredentials, config: &Config) -> 
         push_unique_region(&mut out, region);
     }
     out
+}
+
+fn profile_lookup_region<'a>(credentials: &'a KiroCredentials, config: &'a Config) -> &'a str {
+    if let Some(region) = credentials.profile_arn_region() {
+        return region;
+    }
+    if let Some(region) = credentials
+        .api_region
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return region;
+    }
+    if let Some(region) = credentials
+        .region
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return region;
+    }
+    config.effective_api_region()
 }
 
 fn push_unique_region(out: &mut Vec<String>, region: &str) {
@@ -517,12 +543,14 @@ mod tests {
         let url = build_list_models_url(
             "q.us-east-1.amazonaws.com",
             credentials.profile_arn_trimmed(),
-            None,
-            None,
+            Some(" anthropic "),
+            Some(" next "),
         )
         .unwrap();
 
         assert!(url.contains("profileArn=arn%3Aaws%3Acodewhisperer%3Aprofile%2Ftest"));
+        assert!(url.contains("modelProvider=anthropic"));
+        assert!(url.contains("nextToken=next"));
         assert!(!url.contains("+arn"));
         assert!(!url.contains("test+"));
     }
@@ -544,43 +572,51 @@ mod tests {
     }
 
     #[test]
-    fn external_idp_profile_candidates_include_default_fallback_regions() {
+    fn list_models_url_omits_microsoft_uuid_profile_id() {
+        let url = build_list_models_url(
+            "q.us-east-1.amazonaws.com",
+            Some("e3438419-4424-4e57-8990-ef76bd749a44"),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(!url.contains("profileArn="));
+        assert!(!url.contains("e3438419-4424-4e57-8990-ef76bd749a44"));
+    }
+
+    #[test]
+    fn list_models_request_uses_kiro_go_rest_shape() {
+        let endpoint = IdeEndpoint::new();
         let config = Config::default();
-        let mut credentials = KiroCredentials::default();
-        credentials.auth_method = Some("external_idp".to_string());
+        let credentials = KiroCredentials::default();
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: "token",
+            machine_id: "machine",
+            config: &config,
+        };
+
+        let parts = list_models_request_parts(&endpoint, &ctx).unwrap();
 
         assert_eq!(
-            profile_region_candidates(&credentials, &config),
-            vec!["us-east-1".to_string(), "eu-central-1".to_string()]
+            parts.url,
+            "https://codewhisperer.us-east-1.amazonaws.com/ListAvailableModels?origin=AI_EDITOR&maxResults=50"
         );
-    }
-
-    #[test]
-    fn profile_candidates_prefer_profile_arn_region() {
-        let mut config = Config::default();
-        config.api_region = Some("us-east-1".to_string());
-        let mut credentials = KiroCredentials::default();
-        credentials.auth_method = Some("external_idp".to_string());
-        credentials.api_region = Some("us-west-2".to_string());
-        credentials.profile_arn =
-            Some("arn:aws:codewhisperer:eu-central-1:123:profile/test".to_string());
-
         assert_eq!(
-            profile_region_candidates(&credentials, &config),
-            vec!["eu-central-1".to_string(), "us-east-1".to_string()]
+            header_value(&parts.headers, "host"),
+            Some("codewhisperer.us-east-1.amazonaws.com")
         );
-    }
-
-    #[test]
-    fn list_models_build_endpoint_accepts_all_registered_upstream_endpoints() {
-        let mut config = Config::default();
-        for endpoint_name in ["ide", "codewhisperer", "amazonq", "cli"] {
-            config.default_endpoint = endpoint_name.to_string();
-            let credentials = KiroCredentials::default();
-            let endpoint = build_endpoint(&credentials, &config).unwrap();
-
-            assert_eq!(endpoint.name(), endpoint_name);
-        }
+        assert!(
+            header_value(&parts.headers, "user-agent")
+                .is_some_and(|value| value.contains("api/codewhispererruntime#1.0.0"))
+        );
+        assert!(
+            !parts
+                .headers
+                .iter()
+                .any(|(key, _)| key.eq_ignore_ascii_case("X-Amz-Target"))
+        );
     }
 
     #[test]
@@ -629,20 +665,30 @@ mod tests {
     }
 
     #[test]
+    fn external_idp_profile_candidates_include_default_fallback_regions() {
+        let config = Config::default();
+        let mut credentials = KiroCredentials::default();
+        credentials.auth_method = Some("external_idp".to_string());
+
+        assert_eq!(
+            profile_region_candidates(&credentials, &config),
+            vec!["us-east-1".to_string(), "eu-central-1".to_string()]
+        );
+    }
+
+    #[test]
     fn list_profiles_request_prefers_profile_arn_region() {
-        let endpoint = IdeEndpoint::new();
-        let mut config = Config::default();
-        config.api_region = Some("us-east-1".to_string());
+        let config = Config::default();
         let mut credentials = KiroCredentials::default();
         credentials.profile_arn =
             Some("arn:aws:codewhisperer:eu-central-1:123:profile/test".to_string());
+        let endpoint = IdeEndpoint::new();
         let ctx = RequestContext {
             credentials: &credentials,
             token: "token",
             machine_id: "machine",
             config: &config,
         };
-
         let parts = list_profiles_request_parts(&endpoint, &ctx).unwrap();
 
         assert_eq!(
@@ -652,6 +698,63 @@ mod tests {
         assert_eq!(
             header_value(&parts.headers, "host"),
             Some("q.eu-central-1.amazonaws.com")
+        );
+    }
+
+    #[test]
+    fn external_idp_requests_include_token_type() {
+        let endpoint = IdeEndpoint::new();
+        let config = Config::default();
+        let credentials = KiroCredentials {
+            auth_method: Some("external_idp".to_string()),
+            provider: Some("AzureAD".to_string()),
+            ..Default::default()
+        };
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: "token",
+            machine_id: "machine",
+            config: &config,
+        };
+        let models = list_models_request_parts(&endpoint, &ctx).unwrap();
+        let profiles = list_profiles_request_parts(&endpoint, &ctx).unwrap();
+
+        assert_eq!(
+            header_value(&models.headers, "TokenType"),
+            Some("EXTERNAL_IDP")
+        );
+        assert_eq!(
+            header_value(&profiles.headers, "TokenType"),
+            Some("EXTERNAL_IDP")
+        );
+    }
+
+    #[test]
+    fn list_models_removes_api_key_tokentype_without_removing_external_idp_token_type() {
+        let mut headers = vec![
+            ("tokentype", "API_KEY".to_string()),
+            ("TokenType", "EXTERNAL_IDP".to_string()),
+        ];
+
+        remove_api_key_token_type_header(&mut headers);
+
+        assert!(!headers.iter().any(|(key, _)| *key == "tokentype"));
+        assert_eq!(header_value(&headers, "TokenType"), Some("EXTERNAL_IDP"));
+    }
+
+    #[test]
+    fn profile_candidates_prefer_profile_arn_region() {
+        let mut config = Config::default();
+        config.api_region = Some("us-east-1".to_string());
+        let mut credentials = KiroCredentials::default();
+        credentials.auth_method = Some("external_idp".to_string());
+        credentials.api_region = Some("us-west-2".to_string());
+        credentials.profile_arn =
+            Some("arn:aws:codewhisperer:eu-central-1:123:profile/test".to_string());
+
+        assert_eq!(
+            profile_region_candidates(&credentials, &config),
+            vec!["eu-central-1".to_string(), "us-east-1".to_string()]
         );
     }
 
@@ -677,7 +780,7 @@ mod tests {
 
         assert_eq!(
             profile_region_candidates(&credentials, &config),
-            vec!["us-east-1".to_string()]
+            vec!["ap-southeast-1".to_string()]
         );
     }
 }

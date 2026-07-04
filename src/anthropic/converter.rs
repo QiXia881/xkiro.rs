@@ -17,6 +17,7 @@ use crate::kiro::model::requests::conversation::{
 use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
 };
+use crate::model::claude::kiro_upstream_claude_model_id;
 use crate::model::config::{CompressionConfig, PromptFilterConfig};
 
 use super::prompt_filter::apply_prompt_filters;
@@ -134,8 +135,6 @@ pub fn map_model(model: &str) -> String {
 }
 
 pub fn map_model_with_thinking_suffix(model: &str, thinking_suffix: &str) -> String {
-    static CLAUDE_VERSION_PATTERN: OnceLock<Regex> = OnceLock::new();
-
     let mut model = model.to_string();
     let model_lower = model.to_lowercase();
     let mut lower = model_lower.as_str();
@@ -163,15 +162,7 @@ pub fn map_model_with_thinking_suffix(model: &str, thinking_suffix: &str) -> Str
         }
     }
 
-    let version_re = CLAUDE_VERSION_PATTERN
-        .get_or_init(|| Regex::new(r"claude-(opus|sonnet|haiku)-(\d+)-(\d{1,2})\b").unwrap());
-    if version_re.is_match(lower) {
-        return version_re
-            .replace_all(lower, "claude-$1-$2.$3")
-            .into_owned();
-    }
-
-    model
+    kiro_upstream_claude_model_id(&model)
 }
 
 pub fn get_context_window_size(model: &str) -> i32 {

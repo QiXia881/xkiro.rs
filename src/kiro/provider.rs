@@ -823,6 +823,8 @@ impl KiroProvider {
         api_type: &str,
         client_kind: ClientKind,
     ) -> Result<ApiCallResult, EndpointError> {
+        self.ensure_runtime_profile_arn(ctx, request_body).await;
+
         let rctx = RequestContext {
             credentials: &ctx.credentials,
             token: &ctx.token,
@@ -1017,6 +1019,53 @@ impl KiroProvider {
         } else {
             CredentialFailureAction::Generic
         }
+    }
+
+    async fn ensure_runtime_profile_arn(
+        &self,
+        ctx: &mut crate::kiro::token_manager::CallContext,
+        request_body: &str,
+    ) {
+        if ctx.credentials.profile_arn_trimmed().is_some() {
+            return;
+        }
+        if let Some(profile_arn) = Self::extract_payload_profile_arn(request_body) {
+            ctx.credentials.profile_arn = Some(profile_arn);
+            return;
+        }
+        if !Self::should_resolve_runtime_profile_arn(&ctx.credentials) {
+            return;
+        }
+
+        match self.token_manager.resolve_profile_arn_for(ctx.id).await {
+            Ok(profile_arn) => {
+                ctx.credentials.profile_arn = Some(profile_arn);
+            }
+            Err(error) if MultiTokenManager::is_profile_arn_resolution_soft_error(&error) => {
+                tracing::debug!(
+                    credential_id = ctx.id,
+                    "运行时 profileArn 解析软失败，继续请求: {}",
+                    error
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    credential_id = ctx.id,
+                    "运行时 profileArn 解析失败，继续请求: {}",
+                    error
+                );
+            }
+        }
+    }
+
+    fn should_resolve_runtime_profile_arn(credentials: &KiroCredentials) -> bool {
+        !credentials.is_api_key_credential() && credentials.canonical_auth_method().is_some()
+    }
+
+    fn extract_payload_profile_arn(request_body: &str) -> Option<String> {
+        let value = serde_json::from_str::<serde_json::Value>(request_body).ok()?;
+        let profile_arn = value.get("profileArn")?.as_str()?;
+        KiroCredentials::clean_profile_arn(Some(profile_arn.to_string()))
     }
 
     /// 从请求体中提取模型信息
@@ -1325,6 +1374,43 @@ mod tests {
             KiroProvider::credential_failure_action(&anyhow::anyhow!("HTTP 401: unauthorized")),
             super::CredentialFailureAction::AuthenticationFailed
         );
+    }
+
+    #[test]
+    fn extract_payload_profile_arn_trims_valid_arn_and_rejects_uuid() {
+        assert_eq!(
+            KiroProvider::extract_payload_profile_arn(
+                r#"{"profileArn":" arn:aws:codewhisperer:eu-central-1:123:profile/test "}"#
+            )
+            .as_deref(),
+            Some("arn:aws:codewhisperer:eu-central-1:123:profile/test")
+        );
+        assert_eq!(
+            KiroProvider::extract_payload_profile_arn(
+                r#"{"profileArn":"e3438419-4424-4e57-8990-ef76bd749a44"}"#
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn runtime_profile_resolution_requires_known_non_api_auth_method() {
+        assert!(!KiroProvider::should_resolve_runtime_profile_arn(
+            &KiroCredentials::default()
+        ));
+
+        let social = KiroCredentials {
+            auth_method: Some("social".to_string()),
+            ..Default::default()
+        };
+        assert!(KiroProvider::should_resolve_runtime_profile_arn(&social));
+
+        let api_key = KiroCredentials {
+            auth_method: Some("api_key".to_string()),
+            api_key: Some("ak".to_string()),
+            ..Default::default()
+        };
+        assert!(!KiroProvider::should_resolve_runtime_profile_arn(&api_key));
     }
 
     #[tokio::test]

@@ -85,8 +85,7 @@ pub trait KiroEndpoint: Send + Sync {
 
     /// 构造 `setUserPreference` 请求所需的 URL + headers + body
     ///
-    /// 用于切换 overage 开关；body 形如 `{"overageConfiguration":{"overageStatus":"ENABLED|DISABLED"},"profileArn":"..."}`，
-    /// SSO OIDC 凭据需省略 profileArn。
+    /// 用于切换 overage 开关；body 形如 `{"overageConfiguration":{"overageStatus":"ENABLED|DISABLED"},"profileArn":"..."}`。
     fn set_preference_request_parts(
         &self,
         ctx: &RequestContext<'_>,

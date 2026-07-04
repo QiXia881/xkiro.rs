@@ -10,10 +10,6 @@ use std::path::Path;
 use crate::http_client::ProxyConfig;
 use crate::model::config::Config;
 
-pub const KIRO_BUILDER_ID_PROFILE_ARN: &str =
-    "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX";
-pub const KIRO_SOCIAL_PROFILE_ARN: &str =
-    "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK";
 pub const KIRO_BUILDER_ID_START_URL: &str = "https://view.awsapps.com/start";
 
 /// Kiro OAuth 凭据
@@ -549,7 +545,11 @@ impl KiroCredentials {
 
     pub fn is_valid_profile_arn(value: &str) -> bool {
         let value = value.trim();
-        value.starts_with("arn:") && value.contains(":profile/")
+        let parts: Vec<&str> = value.splitn(4, ':').collect();
+        parts.len() >= 3
+            && parts[0] == "arn"
+            && parts[2] == "codewhisperer"
+            && value.contains(":profile/")
     }
 
     pub fn clean_profile_arn(value: Option<String>) -> Option<String> {
@@ -558,6 +558,14 @@ impl KiroCredentials {
             .map(str::trim)
             .filter(|arn| Self::is_valid_profile_arn(arn))
             .map(str::to_string)
+    }
+
+    pub fn normalize_profile_arn(&mut self) -> bool {
+        let original = self.profile_arn.take();
+        let cleaned = Self::clean_profile_arn(original.clone());
+        let changed = original != cleaned;
+        self.profile_arn = cleaned;
+        changed
     }
 
     pub fn profile_arn_region_from_value(value: &str) -> Option<&str> {
@@ -597,51 +605,7 @@ impl KiroCredentials {
     }
 
     pub fn management_profile_arn(&self) -> Option<&str> {
-        if self.is_enterprise_idc_credential() {
-            return None;
-        }
-
         self.profile_arn_trimmed()
-            .or_else(|| self.default_management_profile_arn())
-    }
-
-    fn default_management_profile_arn(&self) -> Option<&'static str> {
-        let provider = self.provider.as_deref().map(str::trim);
-        if provider.is_some_and(|value| value.eq_ignore_ascii_case("Enterprise")) {
-            return None;
-        }
-        if provider.is_some_and(|value| value.eq_ignore_ascii_case("BuilderId")) {
-            return Some(KIRO_BUILDER_ID_PROFILE_ARN);
-        }
-        if provider.is_some_and(|value| {
-            value.eq_ignore_ascii_case("Google")
-                || value.eq_ignore_ascii_case("Github")
-                || value.eq_ignore_ascii_case("GitHub")
-        }) {
-            return Some(KIRO_SOCIAL_PROFILE_ARN);
-        }
-
-        match self.canonical_auth_method() {
-            Some("social") => Some(KIRO_SOCIAL_PROFILE_ARN),
-            Some("idc")
-                if self
-                    .start_url
-                    .as_deref()
-                    .map(str::trim)
-                    .is_some_and(|value| {
-                        value.trim_end_matches('/') == KIRO_BUILDER_ID_START_URL
-                    })
-                    || self.auth_method.as_deref().is_some_and(|value| {
-                        matches!(
-                            value.trim().to_ascii_lowercase().as_str(),
-                            "builderid" | "builder-id" | "builder_id" | "builder id"
-                        )
-                    }) =>
-            {
-                Some(KIRO_BUILDER_ID_PROFILE_ARN)
-            }
-            _ => None,
-        }
     }
 
     /// 获取 Kiro/Q data-plane region。
@@ -1256,19 +1220,33 @@ mod tests {
             )),
             None
         );
+        assert_eq!(
+            KiroCredentials::clean_profile_arn(Some(
+                "arn:aws:iam::123:profile/not-kiro".to_string()
+            )),
+            None
+        );
     }
 
     #[test]
-    fn test_management_profile_arn_uses_kam_defaults_for_builder_and_social() {
+    fn test_normalize_profile_arn_removes_microsoft_uuid_profile_id() {
+        let mut creds = KiroCredentials {
+            profile_arn: Some("e3438419-4424-4e57-8990-ef76bd749a44".to_string()),
+            ..Default::default()
+        };
+
+        assert!(creds.normalize_profile_arn());
+        assert_eq!(creds.profile_arn, None);
+    }
+
+    #[test]
+    fn test_management_profile_arn_only_uses_cached_valid_arn() {
         let mut builder = KiroCredentials {
             auth_method: Some("idc".to_string()),
             provider: Some("BuilderId".to_string()),
             ..Default::default()
         };
-        assert_eq!(
-            builder.management_profile_arn(),
-            Some(KIRO_BUILDER_ID_PROFILE_ARN)
-        );
+        assert_eq!(builder.management_profile_arn(), None);
 
         builder.profile_arn =
             Some("arn:aws:codewhisperer:eu-central-1:123:profile/custom".to_string());
@@ -1282,14 +1260,11 @@ mod tests {
             provider: Some("GitHub".to_string()),
             ..Default::default()
         };
-        assert_eq!(
-            social.management_profile_arn(),
-            Some(KIRO_SOCIAL_PROFILE_ARN)
-        );
+        assert_eq!(social.management_profile_arn(), None);
     }
 
     #[test]
-    fn test_management_profile_arn_omits_enterprise_even_with_cached_arn() {
+    fn test_management_profile_arn_keeps_enterprise_cached_arn() {
         let enterprise = KiroCredentials {
             auth_method: Some("idc".to_string()),
             provider: Some("Enterprise".to_string()),
@@ -1297,7 +1272,10 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(enterprise.management_profile_arn(), None);
+        assert_eq!(
+            enterprise.management_profile_arn(),
+            Some("arn:aws:codewhisperer:us-east-1:123:profile/ignored")
+        );
     }
 
     #[test]

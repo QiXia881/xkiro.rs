@@ -26,6 +26,6 @@ COPY --from=builder /app/target/release/xkiro-rs /app/xkiro-rs
 
 VOLUME ["/app/config"]
 
-EXPOSE 8990
+EXPOSE 8990 3128
 
 CMD ["./xkiro-rs", "-c", "/app/config/config.json", "--credentials", "/app/config/credentials.json"]

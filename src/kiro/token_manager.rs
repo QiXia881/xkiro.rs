@@ -37,6 +37,7 @@ use crate::kiro::model::token_refresh::{
     RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
+use crate::model::claude::claude_model_match_key;
 use crate::model::config::Config;
 
 /// 检查令牌是否在指定时间内过期
@@ -69,12 +70,7 @@ fn sha256_hex(input: &str) -> String {
 }
 
 fn normalize_model_id(model: &str) -> Option<String> {
-    let model = model.trim();
-    if model.is_empty() {
-        None
-    } else {
-        Some(model.to_lowercase())
-    }
+    claude_model_match_key(model)
 }
 
 fn effective_weight(weight: u32) -> usize {
@@ -1197,10 +1193,14 @@ impl MultiTokenManager {
         let mut has_new_ids = false;
         let mut has_new_machine_ids = false;
         let mut has_allow_overage_import_migrations = false;
+        let mut has_profile_arn_migrations = false;
         let entries: Vec<CredentialEntry> = credentials
             .into_iter()
             .map(|mut cred| {
                 cred.canonicalize_auth_method();
+                if cred.normalize_profile_arn() {
+                    has_profile_arn_migrations = true;
+                }
                 if cred.apply_allow_overage_import_hint() {
                     has_allow_overage_import_migrations = true;
                 }
@@ -1333,7 +1333,11 @@ impl MultiTokenManager {
         };
 
         // 如果有新分配的 ID、新生成的 machineId 或 allowOverage 导入提示归一，立即持久化到配置文件
-        if has_new_ids || has_new_machine_ids || has_allow_overage_import_migrations {
+        if has_new_ids
+            || has_new_machine_ids
+            || has_allow_overage_import_migrations
+            || has_profile_arn_migrations
+        {
             if let Err(e) = manager.persist_credentials() {
                 tracing::warn!("补全凭据 ID/machineId 后持久化失败: {}", e);
             } else {
@@ -3764,8 +3768,7 @@ impl MultiTokenManager {
     }
 
     fn credential_for_persistence(mut credentials: KiroCredentials) -> KiroCredentials {
-        credentials.profile_arn =
-            KiroCredentials::clean_profile_arn(credentials.profile_arn.take());
+        credentials.normalize_profile_arn();
         if credentials.proxy_id.is_some() {
             credentials.proxy_url = None;
             credentials.proxy_username = None;
@@ -4376,7 +4379,7 @@ impl MultiTokenManager {
             && message.contains("AWS Builder ID is not supported for this operation")
     }
 
-    fn is_profile_arn_resolution_soft_error(error: &anyhow::Error) -> bool {
+    pub(crate) fn is_profile_arn_resolution_soft_error(error: &anyhow::Error) -> bool {
         let message = error.to_string();
         message.contains("Builder ID 凭据不支持 profile ARN")
             || message.contains("profile ARN resolution skipped")
@@ -4513,7 +4516,7 @@ impl MultiTokenManager {
         self.backfill_pool_proxy(&mut credentials);
 
         if !credentials.is_api_key_credential() {
-            self.ensure_rest_profile_arn_for(id).await?;
+            self.resolve_profile_arn_for(id).await?;
         }
 
         let mut credentials = {
@@ -4783,6 +4786,7 @@ impl MultiTokenManager {
         validated_cred.api_key = new_cred.api_key;
         validated_cred.concurrency = new_cred.concurrency;
         validated_cred.canonicalize_auth_method();
+        validated_cred.normalize_profile_arn();
         if validated_cred.proxy_id.is_some() {
             validated_cred.proxy_url = None;
             validated_cred.proxy_username = None;
@@ -4903,6 +4907,7 @@ impl MultiTokenManager {
 
         credential.id = Some(new_id);
         credential.canonicalize_auth_method();
+        credential.normalize_profile_arn();
         machine_id::ensure_credential_machine_id(&mut credential);
         let disabled = credential.disabled;
 
@@ -5008,6 +5013,7 @@ impl MultiTokenManager {
     ) -> anyhow::Result<KiroCredentials> {
         credential.id = Some(id);
         credential.canonicalize_auth_method();
+        credential.normalize_profile_arn();
         Self::validate_imported_credential_material(&credential)?;
         machine_id::ensure_credential_machine_id(&mut credential);
         Ok(credential)
@@ -5413,6 +5419,7 @@ impl MultiTokenManager {
             .to_string();
         let user_id = non_empty_trimmed(credential.user_id.as_deref()).map(str::to_string);
         credential.canonicalize_auth_method();
+        credential.normalize_profile_arn();
 
         enum Upsert {
             Updated {
@@ -6391,6 +6398,22 @@ mod tests {
     }
 
     #[test]
+    fn test_social_login_upsert_drops_uuid_profile_id() {
+        let manager = MultiTokenManager::new(Config::default(), vec![], None, None, false).unwrap();
+        let mut incoming =
+            social_login_credential("Google", &"g".repeat(150), Some("user-uuid"), "machine-new");
+        incoming.profile_arn = Some("e3438419-4424-4e57-8990-ef76bd749a44".to_string());
+
+        let id = manager
+            .upsert_prevalidated_social_credential(incoming)
+            .unwrap();
+
+        let exported = manager.export_credentials_with_state_by_ids(&[id]);
+        assert_eq!(exported[0].0.profile_arn, None);
+        assert_eq!(exported[0].0.management_profile_arn(), None);
+    }
+
+    #[test]
     fn test_social_login_upsert_does_not_update_idc_with_same_user_id() {
         let mut idc = KiroCredentials {
             auth_method: Some("idc".to_string()),
@@ -6665,6 +6688,24 @@ mod tests {
     }
 
     #[test]
+    fn test_multi_token_manager_new_drops_microsoft_uuid_profile_id() {
+        let mut cred = KiroCredentials {
+            id: Some(1),
+            profile_arn: Some("e3438419-4424-4e57-8990-ef76bd749a44".to_string()),
+            auth_method: Some("external_idp".to_string()),
+            provider: Some("Microsoft".to_string()),
+            ..Default::default()
+        };
+        cred.refresh_token = Some("r".repeat(150));
+
+        let manager = MultiTokenManager::new(Config::default(), vec![cred], None, None, false)
+            .expect("manager should build");
+
+        let exported = manager.export_credentials_by_ids(&[1]);
+        assert_eq!(exported[0].profile_arn, None);
+    }
+
+    #[test]
     fn test_multi_token_manager_empty_credentials() {
         let config = Config::default();
         let result = MultiTokenManager::new(config, vec![], None, None, false);
@@ -6673,6 +6714,76 @@ mod tests {
         let manager = result.unwrap();
         assert_eq!(manager.total_count(), 0);
         assert_eq!(manager.available_count(), 0);
+    }
+
+    #[test]
+    fn test_add_prevalidated_credential_drops_microsoft_uuid_profile_id() {
+        let manager = MultiTokenManager::new(Config::default(), vec![], None, None, false).unwrap();
+        let credential = KiroCredentials {
+            access_token: Some("access".to_string()),
+            refresh_token: Some("r".repeat(150)),
+            profile_arn: Some("e3438419-4424-4e57-8990-ef76bd749a44".to_string()),
+            auth_method: Some("external_idp".to_string()),
+            provider: Some("Microsoft".to_string()),
+            ..Default::default()
+        };
+
+        let id = manager.add_prevalidated_credential(credential).unwrap();
+
+        let exported = manager.export_credentials_by_ids(&[id]);
+        assert_eq!(exported[0].profile_arn, None);
+    }
+
+    #[test]
+    fn test_add_imported_credential_drops_microsoft_uuid_profile_id() {
+        let manager = MultiTokenManager::new(Config::default(), vec![], None, None, false).unwrap();
+        let credential = KiroCredentials {
+            access_token: Some("access".to_string()),
+            refresh_token: Some("r".repeat(150)),
+            profile_arn: Some("e3438419-4424-4e57-8990-ef76bd749a44".to_string()),
+            auth_method: Some("external_idp".to_string()),
+            provider: Some("Microsoft".to_string()),
+            client_id: Some("client".to_string()),
+            token_endpoint: Some(
+                "https://login.microsoftonline.com/t/oauth2/v2.0/token".to_string(),
+            ),
+            ..Default::default()
+        };
+
+        let id = manager.add_imported_credential(credential).unwrap();
+
+        let exported = manager.export_credentials_by_ids(&[id]);
+        assert_eq!(exported[0].profile_arn, None);
+    }
+
+    #[test]
+    fn test_merge_imported_credential_drops_microsoft_uuid_profile_id() {
+        let manager = MultiTokenManager::new(Config::default(), vec![], None, None, false).unwrap();
+        let existing = KiroCredentials {
+            access_token: Some("access".to_string()),
+            refresh_token: Some("r".repeat(150)),
+            auth_method: Some("external_idp".to_string()),
+            provider: Some("Microsoft".to_string()),
+            client_id: Some("client".to_string()),
+            token_endpoint: Some(
+                "https://login.microsoftonline.com/t/oauth2/v2.0/token".to_string(),
+            ),
+            ..Default::default()
+        };
+        let id = manager.add_imported_credential(existing).unwrap();
+        let incoming = KiroCredentials {
+            profile_arn: Some("e3438419-4424-4e57-8990-ef76bd749a44".to_string()),
+            auth_method: Some("external_idp".to_string()),
+            refresh_token: Some("s".repeat(150)),
+            ..Default::default()
+        };
+
+        manager
+            .merge_imported_credential_missing(id, incoming)
+            .unwrap();
+
+        let exported = manager.export_credentials_by_ids(&[id]);
+        assert_eq!(exported[0].profile_arn, None);
     }
 
     #[test]
@@ -6918,7 +7029,7 @@ mod tests {
         manager.set_model_list(2, [" Claude-Sonnet-4.5 ".to_string()]);
 
         let ctx = manager
-            .acquire_context(Some("claude-sonnet-4.5"))
+            .acquire_context(Some("claude-sonnet-4-5"))
             .await
             .unwrap();
 

@@ -86,9 +86,13 @@ Admin UI 开发模式要求 `target/debug/config.json` 中配置了 `adminApiKey
 ```bash
 docker run --rm -it \
   -p 8990:8990 \
+  -p 127.0.0.1:3128:3128 \
+  -e KIRO_SSO_CALLBACK_BIND=0.0.0.0 \
   -v "$PWD/config:/app/config" \
   ghcr.io/qixia881/xkiro-rs:latest
 ```
+
+`3128` 是 Kiro SSO 的本机回调端口。Docker 内需要设置 `KIRO_SSO_CALLBACK_BIND=0.0.0.0`，宿主机建议只绑定到 `127.0.0.1`；远程管理时仍可在面板手动粘贴回调 URL。
 
 Docker 场景建议 `config.json` 使用：
 

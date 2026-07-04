@@ -344,7 +344,7 @@ where
 }
 
 fn default_responses_model() -> String {
-    "claude-sonnet-4.5".to_string()
+    "claude-sonnet-4-5".to_string()
 }
 
 fn deserialize_responses_model<'de, D>(deserializer: D) -> Result<String, D::Error>
