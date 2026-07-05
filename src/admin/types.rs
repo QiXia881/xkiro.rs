@@ -1913,6 +1913,12 @@ pub struct RuntimeStatsItem {
     /// 余额快照（来自 5min disk cache + 后台周期刷新）；缓存未命中时为 None
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance: Option<RuntimeBalanceSnapshot>,
+    /// 最近一次失败分类标签（运行时；前端映射为可读文案）；无失败时为 None
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error_code: Option<String>,
+    /// 最近一次失败发生时刻（RFC3339）；无失败时为 None
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error_at: Option<String>,
 }
 
 /// runtime-stats 内嵌的余额快照

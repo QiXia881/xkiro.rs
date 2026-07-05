@@ -1989,6 +1989,8 @@ impl AdminService {
                     max_permits: entry.max_permits,
                     disabled: entry.disabled,
                     balance,
+                    last_error_code: entry.last_error_code.clone(),
+                    last_error_at: entry.last_error_at.clone(),
                 }
             })
             .collect();

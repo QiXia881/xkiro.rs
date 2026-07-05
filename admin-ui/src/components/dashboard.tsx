@@ -21,6 +21,7 @@ import { useCredentialSelection } from '@/hooks/use-credential-selection'
 import { useBalanceMap } from '@/hooks/use-balance-map'
 import { getCredentialBalance, refreshBatch, refreshBalancesBatch, exportCredentialBackup } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
+import { errorCodeLabel } from '@/lib/credential-error'
 import type { CredentialStatusItem } from '@/types/api'
 
 const EMPTY_CREDENTIALS: CredentialStatusItem[] = []
@@ -50,6 +51,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [batchQueryingBalance, setBatchQueryingBalance] = useState(false)
   const [batchQueryBalanceProgress, setBatchQueryBalanceProgress] = useState({ current: 0, total: 0 })
   const cancelVerifyRef = useRef(false)
+  const lastErrorSeenRef = useRef<Map<number, string>>(new Map())
+  const errorBaselineReadyRef = useRef(false)
   const [currentPage, setCurrentPage] = useState(1)
   const itemsPerPage = 12
   const [darkMode, setDarkMode] = useState(() => {
@@ -84,6 +87,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
       availablePermits: runtime.availablePermits,
       maxPermits: runtime.maxPermits,
       disabled: runtime.disabled,
+      lastErrorCode: runtime.lastErrorCode,
+      lastErrorAt: runtime.lastErrorAt,
     }
   })
   const disabledCredentialCount = credentials.filter(credential => credential.disabled).length
@@ -96,6 +101,25 @@ export function Dashboard({ onLogout }: DashboardProps) {
   useEffect(() => {
     setCurrentPage(1)
   }, [credentials.length])
+
+  useEffect(() => {
+    if (!runtimeMap) return
+    const seen = lastErrorSeenRef.current
+    const ready = errorBaselineReadyRef.current
+    for (const [id, runtime] of runtimeMap) {
+      const at = runtime.lastErrorAt ?? ''
+      const before = seen.get(id) ?? ''
+      seen.set(id, at)
+      if (!ready) continue
+      if (at && at !== before) {
+        const cred = credentials.find(c => c.id === id)
+        const label = cred?.nickname || cred?.email || `凭据 #${id}`
+        const reason = errorCodeLabel(runtime.lastErrorCode)
+        toast.error(`${label}：${reason}`)
+      }
+    }
+    errorBaselineReadyRef.current = true
+  }, [runtimeMap, credentials])
 
   // 初始化时应用主题
   useEffect(() => {

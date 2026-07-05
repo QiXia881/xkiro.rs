@@ -27,6 +27,7 @@ import {
 } from '@/hooks/use-credentials'
 import { useProxies, useSetCredentialProxyByRegion } from '@/hooks/use-proxies'
 import { getCredentialBalance } from '@/api/credentials'
+import { errorCodeLabel } from '@/lib/credential-error'
 import { usePrivacyMode } from '@/hooks/use-privacy-mode'
 import { BalanceBlock } from '@/components/credential-balance-block'
 import { getCredentialMaterialRows } from '@/lib/credential-material'
@@ -497,6 +498,18 @@ export function CredentialCard({
               )}
             </span>
           </div>
+
+          {credential.lastErrorCode && (
+            <div className="col-span-2 flex items-center justify-between gap-2">
+              <span className="text-muted-foreground">最近失败</span>
+              <span className="truncate text-2xs font-medium text-destructive" title={credential.lastErrorAt ?? undefined}>
+                {errorCodeLabel(credential.lastErrorCode)}
+                {credential.lastErrorAt && (
+                  <span className="ml-1 text-muted-foreground">{formatLastUsed(credential.lastErrorAt)}</span>
+                )}
+              </span>
+            </div>
+          )}
 
           {/* 最后调用 / API 密钥 */}
           <div className="col-span-2 flex items-center justify-between gap-2 pt-1.5 border-t border-border/50">

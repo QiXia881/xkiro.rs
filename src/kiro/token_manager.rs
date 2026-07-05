@@ -634,6 +634,21 @@ fn persistent_disabled_reason(reason: Option<DisabledReason>) -> Option<&'static
     }
 }
 
+fn error_code_for_reason(reason: DisabledReason) -> &'static str {
+    match reason {
+        DisabledReason::Manual => "manual",
+        DisabledReason::TooManyFailures => "too_many_failures",
+        DisabledReason::TooManyRefreshFailures => "too_many_refresh_failures",
+        DisabledReason::QuotaExceeded => "quota_exceeded",
+        DisabledReason::InvalidRefreshToken => "invalid_refresh_token",
+        DisabledReason::InvalidConfig => "invalid_config",
+        DisabledReason::AuthenticationFailed => "authentication_failed",
+        DisabledReason::CredentialSuspended => "credential_suspended",
+        DisabledReason::InsufficientBalance => "insufficient_balance",
+        DisabledReason::ModelUnavailable => "model_unavailable",
+    }
+}
+
 fn non_empty_trimmed(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|s| !s.is_empty())
 }
@@ -1002,6 +1017,12 @@ pub struct CredentialEntrySnapshot {
     pub max_permits: usize,
     /// 凭据级并发配置（None=回退全局 per_credential_concurrency）
     pub concurrency: Option<u32>,
+    /// 最近一次失败的分类标签（运行时字段，成功/恢复后为 None）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error_code: Option<String>,
+    /// 最近一次失败的发生时刻（RFC3339，运行时字段）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error_at: Option<String>,
 }
 
 /// 凭据管理器状态快照
@@ -2109,6 +2130,7 @@ impl MultiTokenManager {
                             e.disabled = false;
                             e.disabled_reason = None;
                             e.failure_count = 0;
+                            e.clear_error();
                         }
                     }
                     drop(entries);
@@ -2262,10 +2284,12 @@ impl MultiTokenManager {
         let mut entries = self.entries.lock();
         let mut recovery_time = self.global_recovery_time.lock();
 
+        let code = error_code_for_reason(reason);
         for entry in entries.iter_mut() {
             if !entry.disabled {
                 entry.disabled = true;
                 entry.disabled_reason = Some(reason);
+                entry.record_error(code);
             }
         }
 
@@ -2306,6 +2330,7 @@ impl MultiTokenManager {
                 entry.disabled = false;
                 entry.disabled_reason = None;
                 entry.failure_count = 0;
+                entry.clear_error();
                 recovered_count += 1;
             }
         }
@@ -2334,6 +2359,7 @@ impl MultiTokenManager {
                 let now = Utc::now();
                 entry.disabled = true;
                 entry.disabled_reason = Some(reason);
+                entry.record_error(error_code_for_reason(reason));
                 entry.last_used_at = Some(now.to_rfc3339());
                 entry.credentials.disabled = true;
                 entry.credentials.meta.disabled_reason =
@@ -2387,6 +2413,7 @@ impl MultiTokenManager {
         if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::InsufficientBalance);
+            entry.record_error("insufficient_balance");
             tracing::warn!("凭据 #{} 已标记为余额不足", id);
             return true;
         }
@@ -2955,6 +2982,7 @@ impl MultiTokenManager {
                 entry.refresh_failure_count = 0;
                 entry.success_count += 1;
                 entry.last_used_at = Some(Utc::now().to_rfc3339());
+                entry.clear_error();
                 tracing::debug!(
                     "凭据 #{} API 调用成功（累计 {} 次）",
                     id,
@@ -2970,7 +2998,11 @@ impl MultiTokenManager {
             .lock()
             .insert(id, Instant::now() + RATE_LIMIT_COOLDOWN);
         self.remove_affinity_by_credential(id);
-        self.entries.lock().iter().any(|e| !e.disabled)
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            entry.record_error("rate_limited");
+        }
+        entries.iter().any(|e| !e.disabled)
     }
 
     fn sync_usage_snapshot_from_limits(&self, id: u64, usage_limits: &UsageLimitsResponse) {
@@ -3117,6 +3149,7 @@ impl MultiTokenManager {
 
             entry.failure_count += 1;
             entry.last_used_at = Some(Utc::now().to_rfc3339());
+            entry.record_error("call_failed");
             let failure_count = entry.failure_count;
 
             tracing::warn!(
@@ -3129,6 +3162,7 @@ impl MultiTokenManager {
             if failure_count >= MAX_FAILURES_PER_CREDENTIAL {
                 entry.disabled = true;
                 entry.disabled_reason = Some(DisabledReason::TooManyFailures);
+                entry.record_error("too_many_failures");
                 tracing::error!("凭据 #{} 已连续失败 {} 次，已被禁用", id, failure_count);
 
                 if !entries.iter().any(|e| !e.disabled) {
@@ -3172,6 +3206,7 @@ impl MultiTokenManager {
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::QuotaExceeded);
             entry.last_used_at = Some(Utc::now().to_rfc3339());
+            entry.record_error("quota_exceeded");
             // 设为阈值，便于在管理面板中直观看到该凭据已不可用
             entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
 
@@ -3206,6 +3241,7 @@ impl MultiTokenManager {
 
             entry.last_used_at = Some(Utc::now().to_rfc3339());
             entry.refresh_failure_count += 1;
+            entry.record_error("refresh_failed");
             let refresh_failure_count = entry.refresh_failure_count;
 
             tracing::warn!(
@@ -3221,6 +3257,7 @@ impl MultiTokenManager {
 
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::TooManyRefreshFailures);
+            entry.record_error("too_many_refresh_failures");
             // A4：登记首次自愈重探（level 1 → 1min）。
             entry.recovery_backoff_level = 1;
             entry.reprobe_next = Some(Utc::now() + backoff_duration(1));
@@ -3264,6 +3301,7 @@ impl MultiTokenManager {
             entry.last_used_at = Some(Utc::now().to_rfc3339());
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::InvalidRefreshToken);
+            entry.record_error("invalid_refresh_token");
             // A4：登记首次自愈重探（level 1 → 1min）。
             entry.recovery_backoff_level = 1;
             entry.reprobe_next = Some(Utc::now() + backoff_duration(1));
@@ -3428,6 +3466,8 @@ impl MultiTokenManager {
                         .map(|v| (v as usize).max(1))
                         .unwrap_or(global_per_cred),
                     concurrency: e.credentials.concurrency,
+                    last_error_code: e.last_error.as_ref().map(|le| le.code.to_string()),
+                    last_error_at: e.last_error.as_ref().map(|le| le.at.to_rfc3339()),
                 })
                 .collect(),
             total: entries.len(),
@@ -3477,6 +3517,7 @@ impl MultiTokenManager {
             entry.failure_count = 0;
             entry.refresh_failure_count = 0;
             entry.disabled_reason = None;
+            entry.clear_error();
         } else {
             entry.disabled_reason = Some(DisabledReason::Manual);
         }
@@ -3584,6 +3625,7 @@ impl MultiTokenManager {
                 entry.failure_count = 0;
                 entry.refresh_failure_count = 0;
                 entry.disabled_reason = None;
+                entry.clear_error();
             } else {
                 entry.disabled_reason = Some(DisabledReason::Manual);
             }
@@ -3910,6 +3952,7 @@ impl MultiTokenManager {
             entry.refresh_failure_count = 0;
             entry.disabled = false;
             entry.disabled_reason = None;
+            entry.clear_error();
         }
         // 持久化更改
         self.persist_credentials()?;
@@ -5815,6 +5858,7 @@ impl MultiTokenManager {
                 entry.refresh_failure_count = 0;
                 entry.reprobe_next = None;
                 entry.recovery_backoff_level = 0;
+                entry.clear_error();
                 entry.credentials.disabled = false;
                 entry.credentials.meta.disabled_reason = None;
                 entry.credentials.meta.ban_status = None;
@@ -7407,6 +7451,47 @@ mod tests {
             err
         );
         assert_eq!(manager.available_count(), 0);
+    }
+
+    #[test]
+    fn test_last_error_recorded_on_failure_and_cleared_on_success() {
+        let config = Config::default();
+        let manager =
+            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
+
+        let before = manager.snapshot();
+        assert_eq!(before.entries[0].last_error_code, None);
+        assert_eq!(before.entries[0].last_error_at, None);
+
+        manager.report_failure(1);
+        let after_fail = manager.snapshot();
+        assert_eq!(
+            after_fail.entries[0].last_error_code.as_deref(),
+            Some("call_failed")
+        );
+        assert!(after_fail.entries[0].last_error_at.is_some());
+
+        manager.report_success(1);
+        let after_ok = manager.snapshot();
+        assert_eq!(after_ok.entries[0].last_error_code, None);
+        assert_eq!(after_ok.entries[0].last_error_at, None);
+    }
+
+    #[test]
+    fn test_last_error_code_reflects_disable_reason() {
+        let config = Config::default();
+        let manager =
+            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
+
+        manager.report_quota_exhausted(1);
+        let snap = manager.snapshot();
+        assert_eq!(
+            snap.entries[0].last_error_code.as_deref(),
+            Some("quota_exceeded")
+        );
+        assert!(snap.entries[0].last_error_at.is_some());
     }
 
     // ============ 凭据级区域优先级测试 ============

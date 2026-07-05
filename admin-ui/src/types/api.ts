@@ -92,6 +92,10 @@ export interface CredentialStatusItem
   maxPermits: number
   /** 该凭据自定义并发上限（null = 跟随全局 perCredentialConcurrency） */
   concurrency: number | null
+  /** 最近一次失败分类 code（运行时字段，来自 runtime-stats）*/
+  lastErrorCode?: string
+  /** 最近一次失败发生时刻（RFC3339，运行时字段）*/
+  lastErrorAt?: string
 }
 
 // 全局配置响应
@@ -506,6 +510,10 @@ export interface RuntimeStatsItem {
   disabled: boolean
   /** 余额快照（来自 disk cache + 后台周期刷新）；未命中则 undefined */
   balance?: RuntimeBalanceSnapshot
+  /** 最近一次失败分类标签（运行时字段，成功/恢复后清空）；无失败则 undefined */
+  lastErrorCode?: string
+  /** 最近一次失败发生时刻（RFC3339）；无失败则 undefined */
+  lastErrorAt?: string
 }
 
 /** runtime-stats 内嵌的余额快照（字段子集对齐 BalanceResponse） */
