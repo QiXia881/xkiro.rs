@@ -1072,16 +1072,35 @@ impl KiroProvider {
     ///
     /// 尝试解析 JSON 请求体，提取 conversationState.currentMessage.userInputMessage.modelId
     fn extract_model_from_request(request_body: &str) -> Option<String> {
-        use serde_json::Value;
+        // 部分反序列化：只捕获目标路径，其余字段由 serde 以 IgnoredAny 跳过，
+        // 不构建整棵 Value DOM，避免大历史请求体的整树分配。
+        #[derive(serde::Deserialize)]
+        struct Probe {
+            #[serde(rename = "conversationState")]
+            conversation_state: Option<ConversationStateProbe>,
+        }
+        #[derive(serde::Deserialize)]
+        struct ConversationStateProbe {
+            #[serde(rename = "currentMessage")]
+            current_message: Option<CurrentMessageProbe>,
+        }
+        #[derive(serde::Deserialize)]
+        struct CurrentMessageProbe {
+            #[serde(rename = "userInputMessage")]
+            user_input_message: Option<UserInputMessageProbe>,
+        }
+        #[derive(serde::Deserialize)]
+        struct UserInputMessageProbe {
+            #[serde(rename = "modelId")]
+            model_id: Option<String>,
+        }
 
-        let json: Value = serde_json::from_str(request_body).ok()?;
-
-        json.get("conversationState")?
-            .get("currentMessage")?
-            .get("userInputMessage")?
-            .get("modelId")?
-            .as_str()
-            .map(|s| s.to_string())
+        let probe: Probe = serde_json::from_str(request_body).ok()?;
+        probe
+            .conversation_state?
+            .current_message?
+            .user_input_message?
+            .model_id
     }
 
     /// 检测响应体是否表示「模型暂时不可用」

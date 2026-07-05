@@ -7,6 +7,7 @@ use std::sync::OnceLock;
 
 use base64::{Engine, engine::general_purpose};
 use regex::Regex;
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -631,7 +632,7 @@ fn process_message_content(
                     continue;
                 }
 
-                if let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) {
+                if let Ok(block) = ContentBlock::deserialize(item) {
                     match block.block_type.as_str() {
                         "text" | "input_text" => {
                             if let Some(text) = block.text {
@@ -1672,7 +1673,7 @@ fn convert_assistant_message(
         }
         serde_json::Value::Array(arr) => {
             for item in arr {
-                if let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) {
+                if let Ok(block) = ContentBlock::deserialize(item) {
                     match block.block_type.as_str() {
                         "thinking" => {
                             if let Some(thinking) = block.thinking {

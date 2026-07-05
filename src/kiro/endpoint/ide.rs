@@ -94,6 +94,12 @@ impl IdeEndpoint {
             return Ok(serde_json::to_string(&request)?);
         }
 
+        // body 不含 profileArn 键的子串时，必然无该键可修剪，跳过整 body 解析。
+        // 子串若仅出现在字符串值中会漏判为需解析（保守，回退慢路径），不会误短路。
+        if !request_body.contains("\"profileArn\"") {
+            return Ok(request_body.to_string());
+        }
+
         let Ok(mut request) = serde_json::from_str::<serde_json::Value>(request_body) else {
             return Ok(request_body.to_string());
         };

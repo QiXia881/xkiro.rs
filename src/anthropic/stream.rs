@@ -501,7 +501,12 @@ impl StreamContext {
     }
 
     pub fn final_input_tokens(&self) -> i32 {
-        self.context_input_tokens.unwrap_or(self.input_tokens)
+        // 上游 contextUsageEvent 的百分比换算可能因窗口基准不一致而偏小，
+        // 用本地全量估算作地板，保证 input_tokens 随真实上下文单调、不塌陷。
+        match self.context_input_tokens {
+            Some(context) => context.max(self.input_tokens),
+            None => self.input_tokens,
+        }
     }
 
     pub fn final_output_tokens(&self) -> i32 {
@@ -757,8 +762,8 @@ impl StreamContext {
                     self.in_thinking_block = true;
                     self.strip_thinking_leading_newline = true;
                     self.drop_tag_thinking = !self.thinking_source.allow_tag();
-                    self.thinking_buffer =
-                        self.thinking_buffer[start_pos + "<thinking>".len()..].to_string();
+                    self.thinking_buffer
+                        .drain(..start_pos + "<thinking>".len());
 
                     if !self.drop_tag_thinking {
                         // 创建 thinking 块的 content_block_start 事件
@@ -795,7 +800,7 @@ impl StreamContext {
                         // 导致 text 块先于 thinking 块出现的问题。
                         if !safe_content.is_empty() && !safe_content.trim().is_empty() {
                             events.extend(self.create_text_delta_events(&safe_content));
-                            self.thinking_buffer = self.thinking_buffer[safe_len..].to_string();
+                            self.thinking_buffer.drain(..safe_len);
                         }
                     }
                     break;
@@ -804,7 +809,7 @@ impl StreamContext {
                 // 剥离 <thinking> 标签后紧跟的换行符（可能跨 chunk）
                 if self.strip_thinking_leading_newline {
                     if self.thinking_buffer.starts_with('\n') {
-                        self.thinking_buffer = self.thinking_buffer[1..].to_string();
+                        self.thinking_buffer.drain(..1);
                         self.strip_thinking_leading_newline = false;
                     } else if !self.thinking_buffer.is_empty() {
                         // buffer 非空但不以 \n 开头，不再需要剥离
@@ -847,8 +852,8 @@ impl StreamContext {
                     self.drop_tag_thinking = false;
 
                     // 剥离 `</thinking>\n\n`（find_real_thinking_end_tag 已确认 \n\n 存在）
-                    self.thinking_buffer =
-                        self.thinking_buffer[end_pos + "</thinking>\n\n".len()..].to_string();
+                    self.thinking_buffer
+                        .drain(..end_pos + "</thinking>\n\n".len());
                 } else {
                     // 没有找到结束标签，发送当前缓冲区内容作为 thinking_delta。
                     // 保留末尾可能是部分 `</thinking>\n\n` 的内容：
@@ -870,7 +875,7 @@ impl StreamContext {
                                 );
                             }
                         }
-                        self.thinking_buffer = self.thinking_buffer[safe_len..].to_string();
+                        self.thinking_buffer.drain(..safe_len);
                     }
                     break;
                 }
@@ -1553,11 +1558,11 @@ impl BufferedStreamContext {
         let final_events = self.inner.generate_final_events();
         self.event_buffer.extend(final_events);
 
-        // 获取正确的 input_tokens
-        let final_input_tokens = self
-            .inner
-            .context_input_tokens
-            .unwrap_or(self.estimated_input_tokens);
+        // 获取正确的 input_tokens：本地全量估算作地板，避免上游百分比换算偏小时塌陷
+        let final_input_tokens = match self.inner.context_input_tokens {
+            Some(context) => context.max(self.estimated_input_tokens),
+            None => self.estimated_input_tokens,
+        };
 
         // 更正 message_start 事件中的 input_tokens
         for event in &mut self.event_buffer {
@@ -1647,6 +1652,20 @@ mod tests {
         assert_eq!(events[0].data["error"]["type"], "api_error");
         assert_eq!(events[0].data["error"]["message"], "upstream closed");
         assert!(ctx.generate_final_events().is_empty());
+    }
+
+    #[test]
+    fn final_input_tokens_floors_at_local_estimate() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 5000, None, false, HashMap::new());
+        // 未收到 contextUsageEvent：直接用本地估算
+        assert_eq!(ctx.final_input_tokens(), 5000);
+        // 收到脱钩的偏小百分比换算值：本地估算作地板，不被压小
+        ctx.context_input_tokens = Some(800);
+        assert_eq!(ctx.final_input_tokens(), 5000);
+        // 换算值高于本地估算时采用较大值，保证单调
+        ctx.context_input_tokens = Some(42000);
+        assert_eq!(ctx.final_input_tokens(), 42000);
     }
 
     #[test]

@@ -358,10 +358,10 @@ pub struct Config {
 
     /// 是否启用 tiktoken cl100k_base 精确 token 计数
     ///
-    /// 默认关闭，使用启发式 (字符比例 + 分段校准) — 与 Claude 真实计数偏差较小
-    /// 且零成本。开启后用 OpenAI BPE，CJK 文本结果会显著高于启发式；适合
-    /// 接英文为主的 OpenAI-flavored 客户端，或对 token 上限要严格 lower bound。
-    #[serde(default)]
+    /// 默认开启：让上报的 input_tokens 量级接近真实，使 Claude Code 的
+    /// auto-compact 能按上下文占比正常触发（启发式估算会系统性低估，导致
+    /// 不触发压缩）。代价是每请求多一次全量分词。CJK 文本结果会高于启发式。
+    #[serde(default = "default_true")]
     pub precise_token_counting: bool,
 
     /// 周期余额刷新间隔（秒，默认 300，最小 180）
@@ -540,7 +540,7 @@ impl Default for Config {
             balance_refresh_concurrency: default_balance_refresh_concurrency(),
             session_affinity_enabled: false,
             privacy_mode: true,
-            precise_token_counting: false,
+            precise_token_counting: true,
             config_path: None,
         }
     }

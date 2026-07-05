@@ -11,7 +11,25 @@
 //! `regex` 整体替换 / `lines-containing` 行级过滤。
 
 use crate::model::config::{PromptFilterConfig, PromptFilterRule};
+use parking_lot::Mutex;
 use regex::Regex;
+use std::collections::HashMap;
+use std::sync::LazyLock;
+
+/// 用户过滤规则的正则按 pattern 缓存，避免每请求重编译（Regex 内部 Arc，clone 廉价）。
+/// pattern 来自有限的配置规则，键集不会无界增长。None 表示该 pattern 编译失败。
+static FILTER_REGEX_CACHE: LazyLock<Mutex<HashMap<String, Option<Regex>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn cached_filter_regex(pattern: &str) -> Option<Regex> {
+    let mut cache = FILTER_REGEX_CACHE.lock();
+    if let Some(cached) = cache.get(pattern) {
+        return cached.clone();
+    }
+    let compiled = Regex::new(pattern).ok();
+    cache.insert(pattern.to_string(), compiled.clone());
+    compiled
+}
 
 /// Claude Code 检测命中后的替换提示（精简版）
 const CLAUDE_CODE_BACKEND_PROMPT: &str = "You are serving as the model backend for Claude Code CLI.\n\
@@ -130,9 +148,9 @@ fn strip_env_noise_lines(prompt: &str) -> String {
 /// 应用单条自定义过滤规则
 fn apply_filter_rule(prompt: &str, rule: &PromptFilterRule) -> String {
     match rule.rule_type.as_str() {
-        "regex" => match Regex::new(&rule.match_pattern) {
-            Ok(re) => re.replace_all(prompt, rule.replace.as_str()).to_string(),
-            Err(_) => prompt.to_string(),
+        "regex" => match cached_filter_regex(&rule.match_pattern) {
+            Some(re) => re.replace_all(prompt, rule.replace.as_str()).to_string(),
+            None => prompt.to_string(),
         },
         "lines-containing" | "contains" => {
             let lower_match = rule.match_pattern.to_lowercase();
@@ -266,6 +284,16 @@ Recent commits: abc\n\
             replace: "X".into(),
         });
         assert_eq!(apply_prompt_filters(&cfg, "hello"), "hello");
+    }
+
+    #[test]
+    fn cached_regex_reuse_is_consistent() {
+        let re1 = cached_filter_regex(r"\bfoo-\d+").expect("应编译成功");
+        let re2 = cached_filter_regex(r"\bfoo-\d+").expect("缓存命中仍应返回");
+        assert_eq!(re1.replace_all("foo-1 foo-2", "X"), re2.replace_all("foo-1 foo-2", "X"));
+        assert_eq!(re1.replace_all("foo-42", "X"), "X");
+        assert!(cached_filter_regex("(unclosed").is_none());
+        assert!(cached_filter_regex("(unclosed").is_none());
     }
 
     #[test]

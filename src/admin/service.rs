@@ -551,13 +551,7 @@ impl AdminService {
                     .clamp(1, crate::model::config::MAX_BALANCE_REFRESH_CONCURRENCY);
                 drop(cfg);
 
-                let snapshot = self.token_manager.snapshot();
-                let active_ids: Vec<u64> = snapshot
-                    .entries
-                    .iter()
-                    .filter(|e| !e.disabled)
-                    .map(|e| e.id)
-                    .collect();
+                let active_ids: Vec<u64> = self.token_manager.active_credential_ids();
                 if active_ids.is_empty() {
                     tracing::debug!("余额定时刷新：无活跃凭据");
                     continue;
@@ -1962,10 +1956,9 @@ impl AdminService {
     /// - `available_permits` / `max_permits`：用于渲染 K/N 并发占用
     /// - `disabled`：手动禁用标记
     pub fn get_runtime_stats(&self) -> RuntimeStatsResponse {
-        let snapshot = self.token_manager.snapshot();
+        let entries = self.token_manager.runtime_snapshot();
         let disk_cache = self.balance_cache.lock();
-        let credentials = snapshot
-            .entries
+        let credentials = entries
             .into_iter()
             .map(|entry| {
                 let balance = disk_cache
@@ -1989,7 +1982,7 @@ impl AdminService {
                     max_permits: entry.max_permits,
                     disabled: entry.disabled,
                     balance,
-                    last_error_code: entry.last_error_code.clone(),
+                    last_error_code: entry.last_error_code.map(str::to_string),
                     last_error_at: entry.last_error_at.clone(),
                 }
             })

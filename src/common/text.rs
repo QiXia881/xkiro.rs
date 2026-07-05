@@ -17,20 +17,23 @@ pub(crate) fn normalize_chunk(chunk: &str, previous: &mut String) -> String {
         return String::new();
     }
 
-    let prev = previous.as_str();
-    if prev.is_empty() {
-        *previous = chunk.to_string();
+    if previous.is_empty() {
+        previous.push_str(chunk);
         return chunk.to_string();
     }
+
+    let prev = previous.as_str();
 
     if chunk == prev {
         return String::new();
     }
 
-    // chunk 以 prev 开头：正常累积，返回后缀差量
+    // chunk 以 prev 开头：正常累积。上游按累积全文推送，此分支最常见；
+    // 只把新增后缀 push 进 previous（复用已有分配），避免每帧重拷贝整段累积文本（O(L²)→O(L)）。
     if let Some(delta) = chunk.strip_prefix(prev) {
-        *previous = chunk.to_string();
-        return delta.to_string();
+        let delta_owned = delta.to_string();
+        previous.push_str(delta);
+        return delta_owned;
     }
 
     // prev 以 chunk 开头：回退场景，无新内容
@@ -55,12 +58,13 @@ pub(crate) fn normalize_chunk(chunk: &str, previous: &mut String) -> String {
         }
     }
 
-    *previous = chunk.to_string();
-    if max_overlap > 0 {
+    let result = if max_overlap > 0 {
         chunk[max_overlap..].to_string()
     } else {
         chunk.to_string()
-    }
+    };
+    *previous = chunk.to_string();
+    result
 }
 
 #[cfg(test)]
@@ -105,5 +109,23 @@ mod tests {
         let delta = normalize_chunk("世界🙂继续", &mut previous);
         assert_eq!(delta, "🙂继续");
         assert_eq!(previous, "世界🙂继续");
+    }
+
+    #[test]
+    fn many_cumulative_frames_accumulate_correctly() {
+        let full = "The quick brown fox jumps over the lazy dog 你好🙂";
+        let mut previous = String::new();
+        let mut reassembled = String::new();
+        let mut end = 0;
+        for (idx, _) in full.char_indices().skip(1).chain(std::iter::once((full.len(), ' '))) {
+            if idx <= end {
+                continue;
+            }
+            end = idx;
+            let cumulative = &full[..end];
+            reassembled.push_str(&normalize_chunk(cumulative, &mut previous));
+        }
+        assert_eq!(reassembled, full);
+        assert_eq!(previous, full);
     }
 }

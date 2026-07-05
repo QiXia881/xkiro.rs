@@ -1037,6 +1037,20 @@ pub struct ManagerSnapshot {
     pub available: usize,
 }
 
+/// 高频轮询用的轻量运行时快照条目。
+///
+/// 只采集 `get_runtime_stats` 实际消费的字段，锁内不做 SHA-256、
+/// 不 clone JSON、不 clone 信号量 map，避免整表深克隆开销。
+pub struct RuntimeEntrySnapshot {
+    pub id: u64,
+    pub disabled: bool,
+    pub last_used_at: Option<String>,
+    pub available_permits: usize,
+    pub max_permits: usize,
+    pub last_error_code: Option<&'static str>,
+    pub last_error_at: Option<String>,
+}
+
 /// 缓存余额信息（用于 Admin API）
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -3473,6 +3487,49 @@ impl MultiTokenManager {
             total: entries.len(),
             available,
         }
+    }
+
+    /// 高频轮询用的轻量快照：只采集运行时字段，不做 SHA-256 / JSON 深克隆。
+    ///
+    /// 与 `snapshot()` 的区别是产出结构极小，供秒级轮询的 `get_runtime_stats` 使用。
+    pub fn runtime_snapshot(&self) -> Vec<RuntimeEntrySnapshot> {
+        let entries = self.entries.lock();
+        // Arc 克隆廉价，沿用 snapshot() 的锁顺序（entries → sema map）规避锁序风险。
+        let sema_snapshot: std::collections::HashMap<u64, std::sync::Arc<tokio::sync::Semaphore>> =
+            self.credential_semaphores.lock().clone();
+        let global_per_cred = self.config.read().per_credential_concurrency.max(1);
+
+        entries
+            .iter()
+            .map(|e| RuntimeEntrySnapshot {
+                id: e.id,
+                disabled: e.disabled,
+                last_used_at: e.last_used_at.clone(),
+                available_permits: sema_snapshot
+                    .get(&e.id)
+                    .map(|s| s.available_permits())
+                    .unwrap_or(0),
+                max_permits: e
+                    .credentials
+                    .concurrency
+                    .map(|v| (v as usize).max(1))
+                    .unwrap_or(global_per_cred),
+                last_error_code: e.last_error.as_ref().map(|le| le.code),
+                last_error_at: e.last_error.as_ref().map(|le| le.at.to_rfc3339()),
+            })
+            .collect()
+    }
+
+    /// 采集当前未禁用凭据的 ID 列表（纯内存读取）。
+    ///
+    /// 供余额刷新、批量刷新等只需 ID 的路径使用，避免走 `snapshot()` 的整表深克隆。
+    pub fn active_credential_ids(&self) -> Vec<u64> {
+        self.entries
+            .lock()
+            .iter()
+            .filter(|e| !e.disabled)
+            .map(|e| e.id)
+            .collect()
     }
 
     /// 设置凭据禁用状态（Admin API）
