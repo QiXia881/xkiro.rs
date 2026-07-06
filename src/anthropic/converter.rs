@@ -169,7 +169,7 @@ pub fn map_model_with_thinking_suffix(model: &str, thinking_suffix: &str) -> Str
 
 /// 上下文窗口覆盖值（0 = 未设置，用模型默认 1M/200K）
 static CONTEXT_WINDOW_OVERRIDE: AtomicI32 = AtomicI32::new(0);
-/// 上下文占比→tokens 换算的窗口放大系数（千分比存储，1000 = 1.0x）
+/// 最终上报 input_tokens 的放大系数（千分比存储，1000 = 1.0x）
 static CONTEXT_USAGE_MULTIPLIER_MILLI: AtomicI32 = AtomicI32::new(1000);
 
 /// 设置上下文窗口覆盖值；`<= 0` 表示清除覆盖，回落模型默认
@@ -177,36 +177,51 @@ pub fn set_context_window_override(value: i32) {
     CONTEXT_WINDOW_OVERRIDE.store(value.max(0), Ordering::Relaxed);
 }
 
-/// 设置上下文占比换算的窗口放大系数；clamp 到 `0.1..=10.0`
+/// 设置最终上报 input_tokens 的放大系数；clamp 到 `0.1..=10.0`
 pub fn set_context_usage_multiplier(value: f64) {
     let clamped = value.clamp(0.1, 10.0);
     CONTEXT_USAGE_MULTIPLIER_MILLI.store((clamped * 1000.0).round() as i32, Ordering::Relaxed);
 }
 
-/// 返回用于「上下文占比→tokens」换算的有效窗口大小。
+/// 返回用于「上下文占比→tokens」换算的基准窗口大小。
 ///
-/// 默认与上游一致（大窗口模型 1M，其余 200K）。可经 admin 配置覆盖基准窗口
-/// 或叠加放大系数，用于提前/推迟 Claude Code 客户端的 auto-compact 触发：
-/// 窗口越大，同一占比换算出的 input_tokens 越大，客户端越早压缩。
-/// 默认值（override=0, multiplier=1.0）下返回与硬编码完全一致。
+/// 默认与上游一致（大窗口模型 1M，其余 200K），可经 admin 配置 override 覆盖。
+/// 注意：放大系数不在此处叠加——它作用于最终上报值（见
+/// [`apply_context_usage_multiplier`]），以覆盖 pct 换算 / 上游 raw 帧 / 本地估算
+/// 三条来源，避免上游 raw token 帧旁路系数。
 pub fn get_context_window_size(model: &str) -> i32 {
-    let base = {
-        let ov = CONTEXT_WINDOW_OVERRIDE.load(Ordering::Relaxed);
-        if ov > 0 {
-            ov
-        } else if is_large_context_model(model) {
-            1_000_000
-        } else {
-            200_000
-        }
-    };
-
-    let milli = CONTEXT_USAGE_MULTIPLIER_MILLI.load(Ordering::Relaxed);
-    if milli == 1000 {
-        return base;
+    let ov = CONTEXT_WINDOW_OVERRIDE.load(Ordering::Relaxed);
+    if ov > 0 {
+        ov
+    } else if is_large_context_model(model) {
+        1_000_000
+    } else {
+        200_000
     }
-    ((base as i64 * milli as i64) / 1000).clamp(1, i32::MAX as i64) as i32
 }
+
+/// 对最终上报的 input_tokens 施加放大系数。
+///
+/// 与 `get_context_window_size` 的 override 正交：override 决定「上游占比→tokens」的
+/// 基准窗口，本函数对三条来源（pct 换算 / 上游 raw 帧 / 本地估算）汇合后的最终值统一放大，
+/// 使上游 raw token 帧无法旁路系数。对 pct 换算路径而言，`pct*base*mult` 与
+/// `(pct*base)*mult` 算术等价，行为不漂移。默认 multiplier=1.0 时原值返回。
+pub fn apply_context_usage_multiplier(tokens: i32) -> i32 {
+    apply_multiplier_milli(tokens, CONTEXT_USAGE_MULTIPLIER_MILLI.load(Ordering::Relaxed))
+}
+
+/// 纯算术核：千分比系数应用。抽出以便无需触碰进程级全局即可单测。
+fn apply_multiplier_milli(tokens: i32, milli: i32) -> i32 {
+    if milli == 1000 {
+        return tokens;
+    }
+    ((i64::from(tokens) * i64::from(milli)) / 1000).clamp(1, i64::from(i32::MAX)) as i32
+}
+
+/// 共享测试守卫：串行化对 `CONTEXT_USAGE_MULTIPLIER_MILLI` 等进程级 atomic 的读写测试，
+/// 避免跨模块并行测试互相污染。跨模块读取者（stream/handlers 的 usage 测试）需持同一锁。
+#[cfg(test)]
+pub(crate) static CONTEXT_GLOBAL_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn is_large_context_model(model: &str) -> bool {
     static CLAUDE_VERSION_EXTRACTOR: OnceLock<Regex> = OnceLock::new();
@@ -2435,6 +2450,36 @@ mod tests {
         assert!(content.contains("<thinking_mode>enabled</thinking_mode>"));
         assert!(content.contains("<execution_discipline>keep this</execution_discipline>"));
         assert!(content.contains("[Context: Current time is 2026-06-27]"));
+    }
+
+    #[test]
+    fn apply_multiplier_milli_pure_arithmetic() {
+        // 默认 1.0（1000‰）：原值返回，无漂移
+        assert_eq!(apply_multiplier_milli(250_000, 1000), 250_000);
+        // 放大：250K * 4.0 = 1M（把 opus-4-8 的 ~250K 有效上下文抬到 CC 的 1M 基准）
+        assert_eq!(apply_multiplier_milli(250_000, 4000), 1_000_000);
+        // 缩小
+        assert_eq!(apply_multiplier_milli(200_000, 500), 100_000);
+        // clamp 下限：不产生 0/负
+        assert_eq!(apply_multiplier_milli(1, 100), 1);
+        // 溢出安全：i64 中间量 + clamp 到 i32::MAX
+        assert_eq!(apply_multiplier_milli(i32::MAX, 10_000), i32::MAX);
+    }
+
+    #[test]
+    fn multiplier_applies_to_all_three_sources_including_raw_frame() {
+        let _g = CONTEXT_GLOBAL_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_context_usage_multiplier(4.0);
+
+        // 三条来源分别驱动 apply_context_usage_multiplier：pct 换算 / 上游 raw 帧 / 本地估算
+        // 都汇合到同一个整数值上，系数统一放大，raw 帧不再旁路。
+        assert_eq!(apply_context_usage_multiplier(250_000), 1_000_000);
+        assert_eq!(apply_context_usage_multiplier(50_000), 200_000);
+
+        // 复位，避免污染其他串行测试
+        set_context_usage_multiplier(1.0);
     }
 
     #[test]

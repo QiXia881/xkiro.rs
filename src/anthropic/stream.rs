@@ -503,10 +503,13 @@ impl StreamContext {
     pub fn final_input_tokens(&self) -> i32 {
         // 上游 contextUsageEvent 的百分比换算可能因窗口基准不一致而偏小，
         // 用本地全量估算作地板，保证 input_tokens 随真实上下文单调、不塌陷。
-        match self.context_input_tokens {
+        let base = match self.context_input_tokens {
             Some(context) => context.max(self.input_tokens),
             None => self.input_tokens,
-        }
+        };
+        // 放大系数作用于三条来源汇合后的最终值，覆盖上游 raw 帧路径，
+        // 使 Claude Code 客户端 auto-compact 触发点可服务端调校。
+        super::converter::apply_context_usage_multiplier(base)
     }
 
     pub fn final_output_tokens(&self) -> i32 {
@@ -1559,9 +1562,12 @@ impl BufferedStreamContext {
         self.event_buffer.extend(final_events);
 
         // 获取正确的 input_tokens：本地全量估算作地板，避免上游百分比换算偏小时塌陷
-        let final_input_tokens = match self.inner.context_input_tokens {
-            Some(context) => context.max(self.estimated_input_tokens),
-            None => self.estimated_input_tokens,
+        let final_input_tokens = {
+            let base = match self.inner.context_input_tokens {
+                Some(context) => context.max(self.estimated_input_tokens),
+                None => self.estimated_input_tokens,
+            };
+            super::converter::apply_context_usage_multiplier(base)
         };
 
         // 更正 message_start 事件中的 input_tokens
@@ -1656,6 +1662,9 @@ mod tests {
 
     #[test]
     fn final_input_tokens_floors_at_local_estimate() {
+        let _g = crate::anthropic::converter::CONTEXT_GLOBAL_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut ctx =
             StreamContext::new_with_thinking("test-model", 5000, None, false, HashMap::new());
         // 未收到 contextUsageEvent：直接用本地估算

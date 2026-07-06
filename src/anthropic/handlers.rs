@@ -2160,9 +2160,12 @@ async fn handle_non_stream_request(
     // 优先使用上游 real input tokens，与本地估算取 max 作地板，无上游值时回落估算。
     // 与流式 StreamContext::final_input_tokens 语义一致，避免上游占比换算塌陷导致
     // 上报偏低、Claude Code auto-compact 不触发。
-    let final_input_tokens = match context_input_tokens {
-        Some(context_tokens) => context_tokens.max(context.input_tokens),
-        None => context.input_tokens,
+    let final_input_tokens = {
+        let base = match context_input_tokens {
+            Some(context_tokens) => context_tokens.max(context.input_tokens),
+            None => context.input_tokens,
+        };
+        super::converter::apply_context_usage_multiplier(base)
     };
     // billed = final - cache_creation - cache_read（用 saturating_sub 防负）。
     let billed_input_tokens = final_cache_context
