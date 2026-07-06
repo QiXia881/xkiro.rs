@@ -12,6 +12,7 @@ import type {
   EndpointConfig,
   PromptFilterConfig,
   ProxyConfig,
+  ModelMappingsConfig,
   UpdateProxyConfigRequest,
   OperationSuccessResponse,
   MessageResponse,
@@ -140,5 +141,15 @@ export async function getPromptFilterConfig(): Promise<PromptFilterConfig> {
 
 export async function updatePromptFilterConfig(req: PromptFilterConfig): Promise<OperationSuccessResponse> {
   const { data } = await api.post(ADMIN_API_ROUTES.config.promptFilter, req)
+  return data
+}
+
+export async function getModelMappings(): Promise<ModelMappingsConfig> {
+  const { data } = await api.get<ModelMappingsConfig>(ADMIN_API_ROUTES.config.modelMappings)
+  return data
+}
+
+export async function updateModelMappings(req: ModelMappingsConfig): Promise<ModelMappingsConfig> {
+  const { data } = await api.post<ModelMappingsConfig>(ADMIN_API_ROUTES.config.modelMappings, req)
   return data
 }

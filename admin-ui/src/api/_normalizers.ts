@@ -45,6 +45,7 @@ export const ADMIN_API_ROUTES = {
     thinking: '/config/thinking',
     endpoint: '/config/endpoint',
     promptFilter: '/config/prompt-filter',
+    modelMappings: '/config/model-mappings',
     systemPrompt: '/config/system-prompt',
     userPresets: '/config/user-presets',
     userPreset: (id: string) => `/config/user-presets/${encodeURIComponent(id)}`,

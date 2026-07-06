@@ -17,12 +17,16 @@ import {
   getAccessSettings,
   getPromptFilterConfig,
   getThinkingConfig,
+  getModelMappings,
+  getGlobalConfig,
   updateCommonConfig,
   updateEndpointConfig,
   updateProxyConfig,
   updateAccessSettings,
   updatePromptFilterConfig,
   updateThinkingConfig,
+  updateModelMappings,
+  updateGlobalConfig,
 } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type {
@@ -32,6 +36,7 @@ import type {
   PromptFilterConfig,
   PromptFilterRule,
   ThinkingConfig,
+  ModelMappingRule,
 } from '@/types/api'
 
 interface SettingsDialogProps {
@@ -39,7 +44,7 @@ interface SettingsDialogProps {
   onOpenChange: (open: boolean) => void
 }
 
-type SettingsTab = 'common' | 'access' | 'thinking' | 'endpoint' | 'proxy' | 'prompt-filter'
+type SettingsTab = 'common' | 'access' | 'thinking' | 'endpoint' | 'proxy' | 'prompt-filter' | 'model-mappings' | 'context'
 
 const TABS: { id: SettingsTab; label: string }[] = [
   { id: 'common', label: '常用' },
@@ -48,6 +53,8 @@ const TABS: { id: SettingsTab; label: string }[] = [
   { id: 'endpoint', label: '端点' },
   { id: 'proxy', label: '代理' },
   { id: 'prompt-filter', label: 'Prompt Filter' },
+  { id: 'model-mappings', label: '模型映射' },
+  { id: 'context', label: '上下文/压缩触发' },
 ]
 
 const DEFAULT_THINKING: ThinkingConfig = {
@@ -82,6 +89,9 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
     filterStripBoundaries: false,
     rules: [],
   })
+  const [modelMappings, setModelMappings] = useState<ModelMappingRule[]>([])
+  const [contextWindowOverride, setContextWindowOverride] = useState('0')
+  const [contextUsageMultiplier, setContextUsageMultiplier] = useState('1')
 
   useEffect(() => {
     if (open) loadSettings()
@@ -90,7 +100,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
   const loadSettings = async () => {
     setLoading(true)
     try {
-      const [nextSettings, nextCommon, nextThinking, nextEndpoint, nextProxy, nextPromptFilter] =
+      const [nextSettings, nextCommon, nextThinking, nextEndpoint, nextProxy, nextPromptFilter, nextModelMappings, nextGlobal] =
         await Promise.all([
           getAccessSettings(),
           getCommonConfig(),
@@ -98,12 +108,17 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
           getEndpointConfig(),
           getProxyConfig(),
           getPromptFilterConfig(),
+          getModelMappings(),
+          getGlobalConfig(),
         ])
       setSettings(nextSettings)
       setCommon(nextCommon)
       setThinking(nextThinking)
       setEndpoint(nextEndpoint)
       setPromptFilter(nextPromptFilter)
+      setModelMappings(nextModelMappings.rules ?? [])
+      setContextWindowOverride(String(nextGlobal.contextWindowOverride ?? 0))
+      setContextUsageMultiplier(String(nextGlobal.contextUsageMultiplier ?? 1))
       parseProxyURL(nextProxy.proxyUrl || '')
     } catch (error) {
       toast.error(`加载设置失败: ${extractErrorMessage(error)}`)
@@ -114,6 +129,18 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 
   const handleSave = async () => {
     if (!settings) return
+
+    const overrideNum = Number(contextWindowOverride.trim() || '0')
+    if (!Number.isFinite(overrideNum) || overrideNum < 0) {
+      toast.error('上下文窗口覆盖值必须是 >= 0 的整数（0 表示用模型默认）')
+      return
+    }
+    const multiplierNum = Number(contextUsageMultiplier.trim() || '1')
+    if (!Number.isFinite(multiplierNum) || multiplierNum < 0.1 || multiplierNum > 10) {
+      toast.error('上下文放大系数必须在 0.1 到 10.0 之间')
+      return
+    }
+
     setSaving(true)
     try {
       await Promise.all([
@@ -138,6 +165,11 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
           proxyPassword: null,
         }),
         updatePromptFilterConfig(promptFilter),
+        updateModelMappings({ rules: modelMappings }),
+        updateGlobalConfig({
+          contextWindowOverride: Math.trunc(overrideNum),
+          contextUsageMultiplier: multiplierNum,
+        }),
       ])
       setNewPassword('')
       toast.success('设置已保存')
@@ -216,6 +248,30 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
       ...prev,
       rules: prev.rules.filter(rule => rule.id !== id),
     }))
+  }
+
+  const updateMapping = (id: string, patch: Partial<ModelMappingRule>) => {
+    setModelMappings(prev => prev.map(rule => rule.id === id ? { ...rule, ...patch } : rule))
+  }
+
+  const addMapping = () => {
+    const id = globalThis.crypto?.randomUUID?.() || `mapping-${Date.now()}`
+    setModelMappings(prev => [
+      ...prev,
+      {
+        id,
+        name: '模型映射',
+        enabled: true,
+        ruleType: 'replace',
+        sourceModel: '',
+        targetModels: [''],
+        weights: [],
+      },
+    ])
+  }
+
+  const removeMapping = (id: string) => {
+    setModelMappings(prev => prev.filter(rule => rule.id !== id))
   }
 
   return (
@@ -460,6 +516,103 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                           ))}
                         </div>
                       )}
+                    </Section>
+                  )}
+
+                  {activeTab === 'model-mappings' && (
+                    <Section
+                      title="模型映射"
+                      desc="命中 sourceModel 时把请求模型改写为 targetModels 之一，作为归一化前的覆盖层。仅作用于 OpenAI / OpenAI Responses 路径，不影响 Anthropic Messages。"
+                    >
+                      <div className="flex items-center justify-between border-b pb-4">
+                        <div>
+                          <div className="text-sm font-medium">映射规则</div>
+                          <p className="text-xs text-muted-foreground">replace/alias 取第一个目标；loadbalance 按权重随机（权重为空则轮询）。</p>
+                        </div>
+                        <Button type="button" size="sm" variant="outline" onClick={addMapping}>
+                          <Plus className="mr-1 h-4 w-4" />
+                          添加规则
+                        </Button>
+                      </div>
+                      {modelMappings.length === 0 ? (
+                        <p className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">暂无映射规则。</p>
+                      ) : (
+                        <div className="space-y-3">
+                          {modelMappings.map(rule => (
+                            <div key={rule.id} className="rounded-xl border bg-card p-4 shadow-sm">
+                              <div className="mb-3 flex items-center justify-between gap-3">
+                                <Input
+                                  value={rule.name}
+                                  onChange={event => updateMapping(rule.id, { name: event.target.value })}
+                                  className="h-8 max-w-xs"
+                                />
+                                <div className="flex items-center gap-2">
+                                  <Switch checked={rule.enabled} onCheckedChange={value => updateMapping(rule.id, { enabled: value })} />
+                                  <Button type="button" size="icon" variant="outline" onClick={() => removeMapping(rule.id)}>
+                                    <Trash2 className="h-4 w-4" />
+                                  </Button>
+                                </div>
+                              </div>
+                              <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                                <SelectRow
+                                  label="类型"
+                                  value={rule.ruleType}
+                                  options={[
+                                    { value: 'replace', label: 'replace' },
+                                    { value: 'alias', label: 'alias' },
+                                    { value: 'loadbalance', label: 'loadbalance' },
+                                  ]}
+                                  onChange={value => updateMapping(rule.id, { ruleType: value as ModelMappingRule['ruleType'] })}
+                                />
+                                <Field label="源模型 sourceModel">
+                                  <Input value={rule.sourceModel} onChange={event => updateMapping(rule.id, { sourceModel: event.target.value })} placeholder="gpt-4.1" />
+                                </Field>
+                              </div>
+                              <Field label="目标模型 targetModels（每行一个）">
+                                <textarea
+                                  value={rule.targetModels.join('\n')}
+                                  onChange={event => updateMapping(rule.id, { targetModels: event.target.value.split('\n').map(s => s.trim()).filter(Boolean) })}
+                                  className="min-h-20 w-full rounded-md border border-input bg-background px-3 py-2 text-sm shadow-sm outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                                  placeholder="claude-sonnet-4-20250514"
+                                />
+                              </Field>
+                              {rule.ruleType === 'loadbalance' && (
+                                <Field label="权重 weights（逗号分隔，可留空=轮询）">
+                                  <Input
+                                    value={rule.weights.join(',')}
+                                    onChange={event => updateMapping(rule.id, { weights: event.target.value.split(',').map(s => Number(s.trim())).filter(n => Number.isFinite(n) && n > 0) })}
+                                    placeholder="1,1"
+                                  />
+                                </Field>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </Section>
+                  )}
+
+                  {activeTab === 'context' && (
+                    <Section
+                      title="Auto-compact 调参"
+                      desc="调整上报给客户端的上下文用量，从而提前或推迟 Claude Code 的自动压缩。真正的触发阈值在客户端，这里只改变换算基准，默认值下行为与不配置完全一致。"
+                    >
+                      <Field label="上下文窗口覆盖值" desc="0 表示用模型默认（大窗口模型 1M，其余 200K）。设更大的值会让同一占比换算出更多 token，客户端更早压缩。">
+                        <Input
+                          value={contextWindowOverride}
+                          onChange={event => setContextWindowOverride(event.target.value)}
+                          placeholder="0"
+                          inputMode="numeric"
+                        />
+                      </Field>
+                      <Field label="上下文放大系数" desc="范围 0.1 ~ 10.0，默认 1.0。>1 提前触发压缩，<1 推迟。与窗口覆盖值叠加相乘。">
+                        <Input
+                          value={contextUsageMultiplier}
+                          onChange={event => setContextUsageMultiplier(event.target.value)}
+                          placeholder="1.0"
+                          inputMode="decimal"
+                        />
+                      </Field>
                     </Section>
                   )}
                 </div>

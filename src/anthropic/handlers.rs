@@ -1896,6 +1896,22 @@ fn create_sse_stream(
                             // 上游正常结束 → 立即释放 permit
                             settle_stream_permits(&tm, credential_id, cred_permit, glb_permit, proxy_permit, ctx.metering.as_ref().map(|m| m.usage));
                             let final_events = ctx.generate_final_events();
+                            // 截断诊断埋点：上游无完成帧，仅靠 body EOF 收尾，无法区分"正常说完"与"边界对齐截断"。
+                            // 记录 metering 是否出现 + 最终 stop_reason，供真实流量坐实 metering 能否作为完成 sentinel。
+                            if ctx.metering.is_none() {
+                                let eof_stop_reason = final_events
+                                    .iter()
+                                    .find(|e| e.event == "message_delta")
+                                    .and_then(|e| e.data["delta"]["stop_reason"].as_str())
+                                    .unwrap_or("<none>")
+                                    .to_string();
+                                tracing::warn!(
+                                    stop_reason = %eof_stop_reason,
+                                    input_tokens = ctx.final_input_tokens(),
+                                    output_tokens = ctx.final_output_tokens(),
+                                    "EOF finalize 诊断：body EOF 收尾但未收到 meteringEvent（疑似截断误判为完成）"
+                                );
+                            }
                             let credits = ctx.metering.as_ref().map(|m| m.usage).unwrap_or(0.0);
                             let tokens = i64::from(ctx.final_input_tokens())
                                 + i64::from(ctx.final_output_tokens());
@@ -2141,8 +2157,13 @@ async fn handle_non_stream_request(
     // 估算输出 tokens
     let output_tokens = token::estimate_output_tokens(&content);
 
-    // 优先使用上游 real input tokens，无则回落请求侧估算。
-    let final_input_tokens = context_input_tokens.unwrap_or(context.input_tokens);
+    // 优先使用上游 real input tokens，与本地估算取 max 作地板，无上游值时回落估算。
+    // 与流式 StreamContext::final_input_tokens 语义一致，避免上游占比换算塌陷导致
+    // 上报偏低、Claude Code auto-compact 不触发。
+    let final_input_tokens = match context_input_tokens {
+        Some(context_tokens) => context_tokens.max(context.input_tokens),
+        None => context.input_tokens,
+    };
     // billed = final - cache_creation - cache_read（用 saturating_sub 防负）。
     let billed_input_tokens = final_cache_context
         .map(|ctx| {
@@ -2760,6 +2781,21 @@ fn create_buffered_sse_stream(
                                     tm.apply_credit_usage(credential_id, m.usage);
                                 }
                                 let all_events = ctx.finish_and_get_all_events();
+                                // 截断诊断埋点（缓冲路径）：仅在未收到 meteringEvent（疑似截断）时打日志，避免正常完成刷屏。
+                                if ctx.metering().is_none() {
+                                    let eof_stop_reason = all_events
+                                        .iter()
+                                        .find(|e| e.event == "message_delta")
+                                        .and_then(|e| e.data["delta"]["stop_reason"].as_str())
+                                        .unwrap_or("<none>")
+                                        .to_string();
+                                    tracing::info!(
+                                        stop_reason = %eof_stop_reason,
+                                        input_tokens = ctx.final_input_tokens(),
+                                        output_tokens = ctx.final_output_tokens(),
+                                        "EOF finalize 诊断（缓冲）：body EOF 收尾但未收到 meteringEvent（疑似截断误判为完成）"
+                                    );
+                                }
                                 let credits = ctx.metering().map(|m| m.usage).unwrap_or(0.0);
                                 let tokens = i64::from(ctx.final_input_tokens())
                                     + i64::from(ctx.final_output_tokens());

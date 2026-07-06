@@ -120,32 +120,113 @@ Docker 场景建议 `config.json` 使用：
 }
 ```
 
-常用字段：
+所有字段均为 camelCase。字段大多可在 Admin UI 设置页热更新，无需重启。
 
-| 字段 | 说明 |
-|------|------|
-| `host` / `port` | 后端监听地址和端口 |
-| `apiKey` | 下游客户端访问 `/v1/messages` 等接口的 Bearer Token |
-| `adminApiKey` | 开启 Admin API 和 `/admin` UI；留空则不启用管理面板 |
-| `requireApiKey` | 是否强制校验下游客户端 API Key |
-| `region` / `authRegion` / `apiRegion` | 默认区域、认证区域和 API 区域 |
-| `machineId` | 本机 machineId，初始化时生成 |
-| `credentialMachineIdStrategy` | 新凭据缺少 machineId 时使用 `random` 或 `local` |
-| `tlsBackend` | `rustls` 或 `native-tls`；代理或证书异常时可切换 |
-| `proxyUrl` / `proxyUsername` / `proxyPassword` | 全局 HTTP/SOCKS 代理 |
-| `defaultEndpoint` | 默认端点，默认 `ide` |
-| `preferredEndpoint` | 首选端点策略，默认 `auto` |
-| `endpointFallback` | 端点瞬态失败时是否尝试其它端点 |
-| `allowOverUsage` | 全局 overage 允许开关 |
-| `perCredentialConcurrency` | 单凭据默认并发上限 |
-| `globalConcurrency` | 全局并发上限，`0` 表示不限 |
-| `acquireWaitTimeoutSecs` | 等待并发 permit 的超时时间 |
-| `balanceRefreshEnabled` | 是否启用后台周期余额刷新 |
-| `balanceRefreshIntervalSecs` | 周期余额刷新间隔，低于 180 会被钳制 |
-| `balanceRefreshConcurrency` | 周期余额刷新并发，最大 10 |
-| `sessionAffinityEnabled` | 是否启用会话/API Key 亲和调度 |
-| `privacyMode` | Admin UI 隐私展示模式 |
-| `preciseTokenCounting` | 是否启用 tiktoken cl100k_base 精确计数 |
+核心与网络：
+
+| 字段 | 默认 | 说明 |
+|------|------|------|
+| `host` / `port` | `127.0.0.1` / `8080` | 后端监听地址和端口 |
+| `apiKey` | 空 | 下游客户端访问 `/v1/messages` 等接口的 Bearer Token |
+| `requireApiKey` | `true` | 是否强制校验下游客户端 API Key |
+| `adminApiKey` | 空 | 开启 Admin API 和 `/admin` UI；留空则不启用管理面板 |
+
+区域与机器标识：
+
+| 字段 | 默认 | 说明 |
+|------|------|------|
+| `region` / `authRegion` / `apiRegion` | `us-east-1` / 回退 `region` / 回退 `region` | 默认区域、认证区域和 API 区域 |
+| `machineId` | 空 | 本机 machineId，初始化时生成 |
+| `credentialMachineIdStrategy` | `random` | 新凭据缺少 machineId 时使用 `random` 或 `local` |
+| `kiroVersion` / `systemVersion` / `nodeVersion` | `0.11.107` / 随机 / `22.22.0` | 上游请求携带的 Kiro 客户端、OS、Node 版本标识 |
+
+TLS 与代理：
+
+| 字段 | 默认 | 说明 |
+|------|------|------|
+| `tlsBackend` | `rustls` | `rustls` 或 `native-tls`；代理或证书异常时可切换 |
+| `proxyUrl` / `proxyUsername` / `proxyPassword` | 空 | 全局 HTTP/HTTPS/SOCKS 代理 |
+
+端点：
+
+| 字段 | 默认 | 说明 |
+|------|------|------|
+| `defaultEndpoint` | `ide` | 凭据未指定 `endpoint` 时的默认端点 |
+| `preferredEndpoint` | `auto` | 首选端点策略 |
+| `endpointFallback` | `true` | 端点瞬态失败时是否尝试其它端点 |
+| `endpoints` | `{}` | 按端点名的自由参数覆盖 |
+
+并发与额度：
+
+| 字段 | 默认 | 说明 |
+|------|------|------|
+| `perCredentialConcurrency` | `1` | 单凭据默认并发上限 |
+| `globalConcurrency` | `0` | 全局并发上限，`0` 表示不限 |
+| `acquireWaitTimeoutSecs` | `60` | 等待并发 permit 的超时时间，超时返回 429 |
+| `allowOverUsage` | `false` | 主额度/配额耗尽时是否仍允许调度（不自动禁用） |
+
+余额刷新：
+
+| 字段 | 默认 | 说明 |
+|------|------|------|
+| `balanceRefreshEnabled` | `true` | 是否启用后台周期余额刷新 |
+| `balanceRefreshIntervalSecs` | `300` | 周期余额刷新间隔，低于 180 会被钳制到 180 |
+| `balanceRefreshConcurrency` | `10` | 周期余额刷新并发，钳制到 `1..=10` |
+
+调度与展示：
+
+| 字段 | 默认 | 说明 |
+|------|------|------|
+| `sessionAffinityEnabled` | `false` | 是否启用会话/API Key 亲和调度，关闭时走排名调度 |
+| `privacyMode` | `true` | Admin UI 隐私展示模式（仅前端脱敏） |
+
+Token 计数：
+
+| 字段 | 默认 | 说明 |
+|------|------|------|
+| `preciseTokenCounting` | `true` | 启用 tiktoken cl100k_base 精确计数，保证上报的 input_tokens 贴近真实值，使 Claude Code 自动压缩上下文能正常触发 |
+| `countTokensApiUrl` / `countTokensApiKey` | 空 | 外部 count_tokens API 地址与密钥 |
+| `countTokensAuthType` | `x-api-key` | 外部 count_tokens 鉴权类型：`x-api-key` 或 `bearer` |
+| `contextWindowOverride` | `0` | 上下文占比→tokens 换算的窗口覆盖值，`0` 用模型默认（大窗口 1M，其余 200K）。设更大值会让同一占比换算出更多 token，客户端更早触发 auto-compact |
+| `contextUsageMultiplier` | `1.0` | 上下文占比换算的窗口放大系数，范围 `0.1..=10.0`；`>1` 提前触发 auto-compact，`<1` 推迟。与 `contextWindowOverride` 叠加相乘 |
+
+Thinking 与响应格式：
+
+| 字段 | 默认 | 说明 |
+|------|------|------|
+| `extractThinking` | `true` | 非流式响应中把 `<thinking>` 标签解析为 thinking 块 |
+| `thinkingSuffix` | `-thinking` | 标记 thinking 变体的模型名后缀 |
+| `openaiThinkingFormat` | `reasoning_content` | OpenAI 侧 thinking 输出格式 |
+| `claudeThinkingFormat` | `thinking` | Claude 侧 thinking 输出格式 |
+
+Prompt Cache：
+
+| 字段 | 默认 | 说明 |
+|------|------|------|
+| `promptCacheTtlSeconds` | `300` | Prompt cache TTL（秒） |
+| `promptCacheAccountingEnabled` | `true` | 是否启用本地 prompt cache 记账 |
+| `promptCacheMaxRatio` | `0.85` | cache_read 占 input tokens 的上限比例 |
+
+系统提示注入：
+
+| 字段 | 默认 | 说明 |
+|------|------|------|
+| `systemPromptEnabled` | `false` | 系统提示注入总开关 |
+| `systemPrompt` | 空 | 自定义系统提示补充文本 |
+| `systemPromptPosition` | `append` | 注入位置：`prepend` 或 `append` |
+| `enabledPresets` | `[]` | 启用的预设 ID（内置 + 用户） |
+| `userPresets` | `[]` | 用户自定义预设 `{id, name, description, content}` |
+
+嵌套对象：
+
+| 字段 | 默认 | 说明 |
+|------|------|------|
+| `compression.maxRequestBodyBytes` | `921600` | 请求体大小上限（900 KiB），超过上游硬限会返回 400 |
+| `promptFilter.filterClaudeCode` | `false` | 将检测到的 Claude Code 系统提示替换为精简版 |
+| `promptFilter.filterStripBoundaries` | `false` | 去除 `--- SYSTEM PROMPT ---` 边界标记 |
+| `promptFilter.filterEnvNoise` | `false` | 丢弃 `# Environment` / auto memory 等环境噪声段 |
+| `promptFilter.rules` | `[]` | 自定义规则 `{id, name, enabled, ruleType, matchPattern, replace}`，ruleType = `regex` / `lines-containing` / `contains` |
+| `modelMappings` | `[]` | 模型映射规则 `{id, name, enabled, ruleType, sourceModel, targetModels[], weights[]}`；仅作用于 OpenAI / OpenAI Responses 路径，不影响 Anthropic Messages |
 
 ## 数据文件
 
@@ -289,15 +370,17 @@ FREE 订阅默认不显示 overage 余额；非 FREE 订阅才展示超额余额
 
 | 协议 | 端点 |
 |------|------|
-| Anthropic | `POST /v1/messages` |
-| Anthropic token count | `POST /v1/messages/count_tokens` |
+| Anthropic | `POST /v1/messages`、`POST /messages`、`POST /anthropic/v1/messages` |
+| Anthropic token count | `POST /v1/messages/count_tokens`、`POST /messages/count_tokens` |
 | Claude Code | `POST /cc/v1/messages` |
 | Claude Code token count | `POST /cc/v1/messages/count_tokens` |
-| OpenAI Chat Completions | `POST /v1/chat/completions` |
-| OpenAI Responses | `POST /v1/responses` |
+| OpenAI Chat Completions | `POST /v1/chat/completions`、`POST /chat/completions` |
+| OpenAI Responses | `POST /v1/responses`、`POST /responses` |
 | Models | `GET /v1/models`、`GET /models` |
 | Stats | `GET /v1/stats` |
 | Telemetry sink | `POST /api/event_logging/batch` |
+
+Claude Code 端点 `/cc/v1/messages` 在流式响应中会先等待上游的 contextUsageEvent，再发出 `message_start`，以便回填真实上下文用量。
 
 示例：
 
@@ -349,11 +432,11 @@ Admin API 支持 `Authorization: Bearer <adminApiKey>` 或 `x-api-key: <adminApi
 
 | 模块 | 能力 |
 |------|------|
-| Dashboard | 凭据卡片、余额、订阅、overage、运行时并发、请求统计 |
+| Dashboard | 凭据卡片、余额、订阅、overage、运行时并发、请求统计；封禁/额度耗尽/刷新失败等状态通过 1 秒运行时轮询实时反馈到卡片和 toast |
 | 添加凭据 | Builder ID、GitHub、Google、IAM Identity Center、Microsoft / Entra ID、SSO Token、本地缓存、Web Cookie、API Key |
 | 导入导出 | 统一导入入口、dry run 预览、三种合并模式、完整 xkiro.rs 备份导出 |
 | 代理池 | 添加、导入、测试、删除、按区域/负载自动分配代理 |
-| 设置 | 常用、访问控制、Thinking、端点、全局代理、Prompt Filter |
+| 设置 | 常用、访问控制、Thinking、端点、全局代理、Prompt Filter、模型映射、上下文/压缩触发 |
 | 模型 | 查询单凭据可用模型、刷新模型缓存 |
 | 日志 | 请求日志查看和清空 |
 | 系统提示 | 内置预设、用户预设、自定义提示、prepend/append 注入位置 |

@@ -3093,6 +3093,8 @@ impl AdminService {
             balance_refresh_concurrency: config.balance_refresh_concurrency,
             session_affinity_enabled: config.session_affinity_enabled,
             privacy_mode: config.privacy_mode,
+            context_window_override: config.context_window_override,
+            context_usage_multiplier: config.context_usage_multiplier,
             compression: CompressionConfigResponse {
                 max_request_body_bytes: c.max_request_body_bytes,
             },
@@ -3216,6 +3218,24 @@ impl AdminService {
                 cfg.privacy_mode = v;
             }
 
+            if let Some(v) = req.context_window_override {
+                if v < 0 {
+                    return Err(AdminServiceError::InvalidCredential(
+                        "上下文窗口覆盖值不能为负".to_string(),
+                    ));
+                }
+                cfg.context_window_override = v;
+            }
+
+            if let Some(v) = req.context_usage_multiplier {
+                if !(0.1..=10.0).contains(&v) {
+                    return Err(AdminServiceError::InvalidCredential(
+                        "上下文放大系数必须在 0.1 到 10.0 之间".to_string(),
+                    ));
+                }
+                cfg.context_usage_multiplier = v;
+            }
+
             cfg.save()
                 .map_err(|e| AdminServiceError::InternalError(e.to_string()))
         })?;
@@ -3231,6 +3251,16 @@ impl AdminService {
         // 热更新 region（注：xkiro 已剔除 credential_rpm，故不存在 update_credential_rpm 同步）
         if req.region.is_some() {
             self.token_manager.update_region(config.region.clone());
+        }
+
+        // 热更新 auto-compact 换算旋钮（converter 全局 atomic，即时生效）
+        if req.context_window_override.is_some() {
+            crate::anthropic::converter::set_context_window_override(config.context_window_override);
+        }
+        if req.context_usage_multiplier.is_some() {
+            crate::anthropic::converter::set_context_usage_multiplier(
+                config.context_usage_multiplier,
+            );
         }
 
         // 热更新 default_endpoint：先更新 token_manager，再同步 provider。

@@ -121,6 +121,10 @@ export interface GlobalConfigResponse {
   sessionAffinityEnabled: boolean
   /** admin UI 隐私模式（邮箱脱敏展示） */
   privacyMode: boolean
+  /** 上下文窗口覆盖值（0=用模型默认 1M/200K），影响 auto-compact 触发时机 */
+  contextWindowOverride: number
+  /** 上下文占比换算的窗口放大系数（默认 1.0，范围 0.1..=10.0） */
+  contextUsageMultiplier: number
   compression: CompressionConfigPayload
 }
 
@@ -146,6 +150,8 @@ export interface UpdateGlobalConfigRequest {
   balanceRefreshConcurrency?: number
   sessionAffinityEnabled?: boolean
   privacyMode?: boolean
+  contextWindowOverride?: number
+  contextUsageMultiplier?: number
   compression?: Partial<CompressionConfigPayload>
 }
 
@@ -200,6 +206,20 @@ export interface PromptFilterConfig {
   filterEnvNoise: boolean
   filterStripBoundaries: boolean
   rules: PromptFilterRule[]
+}
+
+export interface ModelMappingRule {
+  id: string
+  name: string
+  enabled: boolean
+  ruleType: 'replace' | 'alias' | 'loadbalance'
+  sourceModel: string
+  targetModels: string[]
+  weights: number[]
+}
+
+export interface ModelMappingsConfig {
+  rules: ModelMappingRule[]
 }
 
 export interface ProxyConfig {

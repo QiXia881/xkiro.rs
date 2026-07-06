@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use base64::{Engine, engine::general_purpose};
 use regex::Regex;
@@ -166,12 +167,45 @@ pub fn map_model_with_thinking_suffix(model: &str, thinking_suffix: &str) -> Str
     kiro_upstream_claude_model_id(&model)
 }
 
+/// 上下文窗口覆盖值（0 = 未设置，用模型默认 1M/200K）
+static CONTEXT_WINDOW_OVERRIDE: AtomicI32 = AtomicI32::new(0);
+/// 上下文占比→tokens 换算的窗口放大系数（千分比存储，1000 = 1.0x）
+static CONTEXT_USAGE_MULTIPLIER_MILLI: AtomicI32 = AtomicI32::new(1000);
+
+/// 设置上下文窗口覆盖值；`<= 0` 表示清除覆盖，回落模型默认
+pub fn set_context_window_override(value: i32) {
+    CONTEXT_WINDOW_OVERRIDE.store(value.max(0), Ordering::Relaxed);
+}
+
+/// 设置上下文占比换算的窗口放大系数；clamp 到 `0.1..=10.0`
+pub fn set_context_usage_multiplier(value: f64) {
+    let clamped = value.clamp(0.1, 10.0);
+    CONTEXT_USAGE_MULTIPLIER_MILLI.store((clamped * 1000.0).round() as i32, Ordering::Relaxed);
+}
+
+/// 返回用于「上下文占比→tokens」换算的有效窗口大小。
+///
+/// 默认与上游一致（大窗口模型 1M，其余 200K）。可经 admin 配置覆盖基准窗口
+/// 或叠加放大系数，用于提前/推迟 Claude Code 客户端的 auto-compact 触发：
+/// 窗口越大，同一占比换算出的 input_tokens 越大，客户端越早压缩。
+/// 默认值（override=0, multiplier=1.0）下返回与硬编码完全一致。
 pub fn get_context_window_size(model: &str) -> i32 {
-    if is_large_context_model(model) {
-        1_000_000
-    } else {
-        200_000
+    let base = {
+        let ov = CONTEXT_WINDOW_OVERRIDE.load(Ordering::Relaxed);
+        if ov > 0 {
+            ov
+        } else if is_large_context_model(model) {
+            1_000_000
+        } else {
+            200_000
+        }
+    };
+
+    let milli = CONTEXT_USAGE_MULTIPLIER_MILLI.load(Ordering::Relaxed);
+    if milli == 1000 {
+        return base;
     }
+    ((base as i64 * milli as i64) / 1000).clamp(1, i32::MAX as i64) as i32
 }
 
 fn is_large_context_model(model: &str) -> bool {

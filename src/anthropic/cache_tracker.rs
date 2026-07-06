@@ -463,7 +463,7 @@ fn flatten_cacheable_blocks(payload: &MessagesRequest) -> Vec<PendingBlock> {
 
 fn flatten_message_blocks(message_index: usize, message: &Message) -> Vec<PendingBlock> {
     match &message.content {
-        serde_json::Value::String(text) => vec![build_message_block(
+        serde_json::Value::String(text) => build_message_block(
             message_index,
             &message.role,
             0,
@@ -473,13 +473,15 @@ fn flatten_message_blocks(message_index: usize, message: &Message) -> Vec<Pendin
             }),
             Duration::ZERO,
             true,
-        )],
+        )
+        .into_iter()
+        .collect(),
         serde_json::Value::Array(blocks) => {
             let last_block_index = blocks.len().saturating_sub(1);
             blocks
                 .iter()
                 .enumerate()
-                .map(|(block_index, block)| {
+                .filter_map(|(block_index, block)| {
                     let ttl = extract_cache_ttl(block).unwrap_or(Duration::ZERO);
                     build_message_block(
                         message_index,
@@ -492,17 +494,21 @@ fn flatten_message_blocks(message_index: usize, message: &Message) -> Vec<Pendin
                 })
                 .collect()
         }
-        other => vec![build_message_block(
+        other => build_message_block(
             message_index,
             &message.role,
             0,
             other.clone(),
             Duration::ZERO,
             true,
-        )],
+        )
+        .into_iter()
+        .collect(),
     }
 }
 
+/// 返回 `None` 表示该块为 volatile billing-header，需从指纹中丢弃（含其
+/// is_message_end 标记，不转移给前一块）——精确对齐 Go appendPromptBlock 的早退。
 fn build_message_block(
     message_index: usize,
     role: &str,
@@ -510,7 +516,10 @@ fn build_message_block(
     block: serde_json::Value,
     ttl: Duration,
     is_message_end: bool,
-) -> PendingBlock {
+) -> Option<PendingBlock> {
+    if is_anthropic_billing_header_block(&block) {
+        return None;
+    }
     let value = strip_cache_position_keys(serde_json::json!({
             "kind": "message",
             "message_index": message_index,
@@ -518,7 +527,7 @@ fn build_message_block(
             "block_index": block_index,
             "block": block,
     }));
-    build_pending_block(value, ttl, is_message_end)
+    Some(build_pending_block(value, ttl, is_message_end))
 }
 
 fn append_cache_block(
@@ -848,6 +857,59 @@ mod tests {
             breakpoints
                 .iter()
                 .all(|bp| bp.ttl == Duration::from_secs(3600))
+        );
+    }
+
+    #[test]
+    fn billing_header_in_message_block_does_not_change_fingerprint() {
+        // 对齐 Go appendPromptBlock：message 块里的 x-anthropic-billing-header
+        // 文本块被整块丢弃（连同其 is_message_end 标记），不进指纹/累计 token。
+        //
+        // 关键设计：billing-header 必须落在某个更深断点的「前缀」里，才能验证修复。
+        // turn1 的 cache_control 触发隐式断点规则，之后每个 message-end 都是断点；
+        // turn3 的 billing-header 位于 turn3/turn4 断点的滚动哈希之内。未剥离时它会
+        // 污染这些深层断点指纹 → 变体只能匹配到 turn2 的浅前缀（cache_read 大幅缩水）。
+        let long = long_cacheable_text();
+
+        // turn3 user 内容：baseline 只有正文块；变体在正文前插 billing-header。
+        let turn3_baseline = serde_json::json!([{ "type": "text", "text": long }]);
+        let turn3_variant = serde_json::json!([
+            { "type": "text", "text": "x-anthropic-billing-header: drift-abc-123" },
+            { "type": "text", "text": long },
+        ]);
+
+        let make = |turn3: serde_json::Value| {
+            build_request(vec![
+                msg("user", cache_text(&long)), // 显式 cache_control → 武装隐式断点
+                msg("assistant", serde_json::json!("R1")),
+                msg("user", turn3),
+                msg("assistant", serde_json::json!("R2")),
+            ])
+        };
+        let baseline = make(turn3_baseline);
+        let variant = make(turn3_variant);
+
+        let tracker = CacheTracker::new(Duration::ZERO);
+
+        // 存 baseline 的完整前缀阶梯（不含 billing-header）。
+        let baseline_profile = tracker.build_profile(&baseline, estimate_input_tokens(&baseline));
+        assert!(
+            baseline_profile.cacheable_breakpoints().len() >= 3,
+            "baseline 应形成多层断点阶梯"
+        );
+        tracker.update(1, &baseline_profile);
+
+        // 用带 billing-header 的变体 compute：剥离正确时深层断点指纹与 baseline 一致，
+        // 命中的 cache_read 应逼近 max_ratio 上限；否则只匹配到浅前缀，远低于上限。
+        let variant_profile = tracker.build_profile(&variant, estimate_input_tokens(&variant));
+        let hit = tracker.compute(1, &variant_profile);
+        let cap = cache_read_cap_tokens(&variant_profile);
+        assert!(
+            hit.cache_read_input_tokens as f64 >= cap as f64 * 0.9,
+            "message 块内 billing-header 应被丢弃，变体仍命中深层前缀：\
+             cache_read={} 应逼近上限 cap={}",
+            hit.cache_read_input_tokens,
+            cap,
         );
     }
 

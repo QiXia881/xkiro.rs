@@ -364,6 +364,19 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub precise_token_counting: bool,
 
+    /// 上下文占比→tokens 换算的窗口覆盖值（0 = 用模型默认 1M/200K）
+    ///
+    /// 影响 Claude Code auto-compact 触发时机：窗口越大，同一上游占比换算出
+    /// 的 input_tokens 越大，客户端越早触发压缩。默认 0 与硬编码行为一致。
+    #[serde(default)]
+    pub context_window_override: i32,
+
+    /// 上下文占比换算的窗口放大系数（默认 1.0，clamp 到 0.1..=10.0）
+    ///
+    /// 与 override 叠加。>1 提前触发 auto-compact，<1 推迟。默认 1.0 无变化。
+    #[serde(default = "default_context_usage_multiplier")]
+    pub context_usage_multiplier: f64,
+
     /// 周期余额刷新间隔（秒，默认 300，最小 180）
     ///
     /// 反序列化与 setter 都会 clamp 到 >=180，避免对上游过频。
@@ -442,6 +455,10 @@ fn default_prompt_cache_ttl_seconds() -> u64 {
 
 fn default_prompt_cache_max_ratio() -> f64 {
     0.85
+}
+
+fn default_context_usage_multiplier() -> f64 {
+    1.0
 }
 
 fn default_per_credential_concurrency() -> usize {
@@ -541,6 +558,8 @@ impl Default for Config {
             session_affinity_enabled: false,
             privacy_mode: true,
             precise_token_counting: true,
+            context_window_override: 0,
+            context_usage_multiplier: 1.0,
             config_path: None,
         }
     }

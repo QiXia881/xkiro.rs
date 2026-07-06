@@ -259,6 +259,10 @@ async fn main() {
     // tiktoken cl100k_base 精确计数开关（admin API 不暴露热改，需重启）
     token::set_precise_counting(config.precise_token_counting);
 
+    // 上下文占比→tokens 换算的窗口覆盖与放大系数（影响 auto-compact 触发时机）
+    crate::anthropic::converter::set_context_window_override(config.context_window_override);
+    crate::anthropic::converter::set_context_usage_multiplier(config.context_usage_multiplier);
+
     let api_keys_cache_dir = token_manager.cache_dir();
     let api_keys_store_path = api_keys_cache_dir
         .as_ref()

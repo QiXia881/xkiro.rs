@@ -1318,6 +1318,10 @@ pub struct GlobalConfigResponse {
     pub session_affinity_enabled: bool,
     /// admin UI 隐私模式（邮箱脱敏展示）
     pub privacy_mode: bool,
+    /// 上下文窗口覆盖值（0 = 模型默认 1M/200K）
+    pub context_window_override: i32,
+    /// 上下文占比换算的窗口放大系数（1.0 = 无变化）
+    pub context_usage_multiplier: f64,
     /// 压缩配置
     pub compression: CompressionConfigResponse,
 }
@@ -1361,6 +1365,10 @@ pub struct UpdateGlobalConfigRequest {
     pub session_affinity_enabled: Option<bool>,
     /// admin UI 隐私模式（可选）
     pub privacy_mode: Option<bool>,
+    /// 上下文窗口覆盖值（可选；<=0 清除覆盖回落模型默认）
+    pub context_window_override: Option<i32>,
+    /// 上下文占比换算窗口放大系数（可选；clamp 到 0.1..=10.0）
+    pub context_usage_multiplier: Option<f64>,
     /// 压缩配置（可选）
     pub compression: Option<UpdateCompressionConfigRequest>,
 }
