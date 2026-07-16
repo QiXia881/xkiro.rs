@@ -15,6 +15,7 @@ use super::{
     apply_stream_token_type_headers, codewhisperer_rest_host_for_region, q_rest_host_for_region,
 };
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::region::is_known_bad_q_transport_region;
 
 /// Kiro IDE 端点名称
 pub const IDE_ENDPOINT_NAME: &str = "ide";
@@ -32,11 +33,14 @@ impl IdeEndpoint {
     }
 
     fn management_region(&self, ctx: &RequestContext<'_>) -> String {
-        ctx.credentials
+        let profile_region = ctx
+            .credentials
             .management_profile_arn()
-            .and_then(KiroCredentials::profile_arn_region_from_value)
-            .unwrap_or_else(|| self.api_region(ctx))
-            .to_string()
+            .and_then(KiroCredentials::profile_arn_region_from_value);
+        match profile_region {
+            Some(region) if !is_known_bad_q_transport_region(region) => region.to_string(),
+            _ => self.api_region(ctx).to_string(),
+        }
     }
 
     fn host(&self, ctx: &RequestContext<'_>) -> String {
@@ -133,14 +137,11 @@ impl KiroEndpoint for IdeEndpoint {
     }
 
     fn api_url(&self, ctx: &RequestContext<'_>) -> String {
-        format!(
-            "https://q.{}.amazonaws.com/generateAssistantResponse",
-            self.api_region(ctx)
-        )
+        format!("https://{}/generateAssistantResponse", self.host(ctx))
     }
 
     fn mcp_url(&self, ctx: &RequestContext<'_>) -> String {
-        format!("https://q.{}.amazonaws.com/mcp", self.api_region(ctx))
+        format!("https://{}/mcp", self.host(ctx))
     }
 
     fn decorate_api(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
@@ -596,6 +597,74 @@ mod tests {
         assert_eq!(
             header_value(&preference.headers, "host"),
             Some("q.eu-central-1.amazonaws.com")
+        );
+    }
+
+    #[test]
+    fn ide_endpoint_repairs_known_bad_profile_region_without_changing_arn() {
+        let endpoint = IdeEndpoint::new();
+        let config = Config::default();
+        let credentials = KiroCredentials {
+            api_region: Some("us-east-1".to_string()),
+            profile_arn: Some("arn:aws:codewhisperer:eu-north-1:123:profile/test".to_string()),
+            ..Default::default()
+        };
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: "token",
+            machine_id: "machine-region",
+            config: &config,
+        };
+
+        assert_eq!(
+            endpoint.api_url(&ctx),
+            "https://q.us-east-1.amazonaws.com/generateAssistantResponse"
+        );
+        assert_eq!(
+            endpoint.mcp_url(&ctx),
+            "https://q.us-east-1.amazonaws.com/mcp"
+        );
+
+        let request = endpoint
+            .decorate_api(reqwest::Client::new().post(endpoint.api_url(&ctx)), &ctx)
+            .build()
+            .unwrap();
+        assert_eq!(
+            request.headers().get("host").and_then(|v| v.to_str().ok()),
+            Some("q.us-east-1.amazonaws.com")
+        );
+
+        let usage = endpoint.usage_request_parts(&ctx, false).unwrap();
+        assert!(
+            usage
+                .url
+                .starts_with("https://codewhisperer.us-east-1.amazonaws.com/getUsageLimits?")
+        );
+        assert!(
+            usage.url.contains(
+                "profileArn=arn%3Aaws%3Acodewhisperer%3Aeu-north-1%3A123%3Aprofile%2Ftest"
+            )
+        );
+        assert_eq!(
+            header_value(&usage.headers, "host"),
+            Some("codewhisperer.us-east-1.amazonaws.com")
+        );
+
+        let preference = endpoint
+            .set_preference_request_parts(&ctx, "ENABLED")
+            .unwrap();
+        let body: Value = serde_json::from_str(&preference.body).unwrap();
+        assert_eq!(
+            preference.url,
+            "https://q.us-east-1.amazonaws.com/setUserPreference"
+        );
+        assert_eq!(
+            header_value(&preference.headers, "host"),
+            Some("q.us-east-1.amazonaws.com")
+        );
+        assert_eq!(
+            body["profileArn"],
+            "arn:aws:codewhisperer:eu-north-1:123:profile/test"
         );
     }
 

@@ -18,6 +18,9 @@ use crate::kiro::endpoint::{
 };
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::region::{
+    is_known_bad_q_transport_region, normalize_q_transport_region, trimmed_region,
+};
 use crate::model::config::Config;
 
 const DEFAULT_PROFILE_REGIONS: &[&str] = &["us-east-1", "eu-central-1"];
@@ -447,7 +450,7 @@ fn profile_region_candidates(credentials: &KiroCredentials, config: &Config) -> 
     let mut out = Vec::new();
 
     push_unique_region(&mut out, profile_lookup_region(credentials, config));
-    if !should_probe_fallback_regions(credentials) {
+    if !should_probe_fallback_regions(credentials, config) {
         return out;
     }
 
@@ -465,38 +468,49 @@ fn profile_region_candidates(credentials: &KiroCredentials, config: &Config) -> 
 }
 
 fn profile_lookup_region<'a>(credentials: &'a KiroCredentials, config: &'a Config) -> &'a str {
-    if let Some(region) = credentials.profile_arn_region() {
-        return region;
+    if credentials.profile_arn_region().is_some() {
+        return credentials.effective_kiro_api_region(config);
     }
-    if let Some(region) = credentials
-        .api_region
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return region;
+    if let Some(region) = credentials.configured_api_region(config) {
+        return normalize_q_transport_region(region);
     }
-    if let Some(region) = credentials
-        .region
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return region;
+    if let Some(region) = credentials.region.as_deref().and_then(trimmed_region) {
+        return normalize_q_transport_region(region);
     }
-    config.effective_api_region()
+    normalize_q_transport_region(config.effective_api_region())
 }
 
 fn push_unique_region(out: &mut Vec<String>, region: &str) {
-    let region = region.trim();
-    if region.is_empty() || out.iter().any(|existing| existing == region) {
+    let region = normalize_q_transport_region(region);
+    if out
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(region))
+    {
         return;
     }
     out.push(region.to_string());
 }
 
-fn should_probe_fallback_regions(credentials: &KiroCredentials) -> bool {
+fn should_probe_fallback_regions(credentials: &KiroCredentials, config: &Config) -> bool {
+    let has_known_bad_source = credentials
+        .profile_arn_region()
+        .is_some_and(is_known_bad_q_transport_region)
+        || credentials
+            .api_region
+            .as_deref()
+            .is_some_and(is_known_bad_q_transport_region)
+        || credentials
+            .region
+            .as_deref()
+            .is_some_and(is_known_bad_q_transport_region)
+        || config
+            .api_region
+            .as_deref()
+            .is_some_and(is_known_bad_q_transport_region)
+        || is_known_bad_q_transport_region(&config.region);
+
     credentials.is_external_idp_credential()
+        || has_known_bad_source
         || credentials
             .api_region
             .as_deref()
@@ -702,6 +716,40 @@ mod tests {
     }
 
     #[test]
+    fn list_profiles_request_repairs_known_bad_profile_region_and_preserves_arn() {
+        let config = Config::default();
+        let credentials = KiroCredentials {
+            api_region: Some("us-east-1".to_string()),
+            profile_arn: Some("arn:aws:codewhisperer:eu-north-1:123:profile/test".to_string()),
+            ..Default::default()
+        };
+        let endpoint = IdeEndpoint::new();
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: "token",
+            machine_id: "machine",
+            config: &config,
+        };
+
+        let parts = list_profiles_request_parts(&endpoint, &ctx).unwrap();
+
+        assert_eq!(
+            parts.url,
+            "https://codewhisperer.us-east-1.amazonaws.com/ListAvailableProfiles"
+        );
+        assert_eq!(
+            header_value(&parts.headers, "host"),
+            Some("codewhisperer.us-east-1.amazonaws.com")
+        );
+        let usage = endpoint.usage_request_parts(&ctx, false).unwrap();
+        assert!(
+            usage.url.contains(
+                "profileArn=arn%3Aaws%3Acodewhisperer%3Aeu-north-1%3A123%3Aprofile%2Ftest"
+            )
+        );
+    }
+
+    #[test]
     fn external_idp_requests_include_token_type() {
         let endpoint = IdeEndpoint::new();
         let config = Config::default();
@@ -781,6 +829,41 @@ mod tests {
         assert_eq!(
             profile_region_candidates(&credentials, &config),
             vec!["ap-southeast-1".to_string()]
+        );
+    }
+
+    #[test]
+    fn non_external_idp_with_known_bad_region_uses_repaired_and_fallback_regions() {
+        let config = Config::default();
+        let credentials = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            region: Some(" EU-NORTH-1 ".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            profile_region_candidates(&credentials, &config),
+            vec!["us-east-1".to_string(), "eu-central-1".to_string()]
+        );
+    }
+
+    #[test]
+    fn known_bad_profile_candidates_use_api_override_then_fallback_regions() {
+        let config = Config::default();
+        let credentials = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            api_region: Some("us-west-2".to_string()),
+            profile_arn: Some("arn:aws:codewhisperer:eu-north-1:123:profile/test".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            profile_region_candidates(&credentials, &config),
+            vec![
+                "us-west-2".to_string(),
+                "us-east-1".to_string(),
+                "eu-central-1".to_string()
+            ]
         );
     }
 }

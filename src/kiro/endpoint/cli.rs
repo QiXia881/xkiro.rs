@@ -112,17 +112,11 @@ impl KiroEndpoint for CliEndpoint {
     }
 
     fn api_url(&self, ctx: &RequestContext<'_>) -> String {
-        format!(
-            "https://q.{}.amazonaws.com/generateAssistantResponse",
-            ctx.credentials.effective_api_region(ctx.config)
-        )
+        format!("https://{}/generateAssistantResponse", self.host(ctx))
     }
 
     fn mcp_url(&self, ctx: &RequestContext<'_>) -> String {
-        format!(
-            "https://q.{}.amazonaws.com/mcp",
-            ctx.credentials.effective_api_region(ctx.config)
-        )
+        format!("https://{}/mcp", self.host(ctx))
     }
 
     fn decorate_api(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
@@ -251,5 +245,77 @@ impl KiroEndpoint for CliEndpoint {
             headers,
             body: serde_json::to_string(&body)?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CliEndpoint;
+    use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
+    use crate::kiro::model::credentials::KiroCredentials;
+    use crate::model::config::Config;
+
+    fn header_value<'a>(headers: &'a [(&'static str, String)], name: &str) -> Option<&'a str> {
+        headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
+    #[test]
+    fn cli_endpoint_repairs_known_bad_api_region_across_request_shapes() {
+        let endpoint = CliEndpoint::new();
+        let config = Config::default();
+        let credentials = KiroCredentials {
+            api_region: Some(" EU-NORTH-1 ".to_string()),
+            ..Default::default()
+        };
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: "token",
+            machine_id: "machine",
+            config: &config,
+        };
+
+        assert_eq!(
+            endpoint.api_url(&ctx),
+            "https://q.us-east-1.amazonaws.com/generateAssistantResponse"
+        );
+        assert_eq!(
+            endpoint.mcp_url(&ctx),
+            "https://q.us-east-1.amazonaws.com/mcp"
+        );
+
+        let request = endpoint
+            .decorate_api(reqwest::Client::new().post(endpoint.api_url(&ctx)), &ctx)
+            .build()
+            .unwrap();
+        assert_eq!(
+            request.headers().get("host").and_then(|v| v.to_str().ok()),
+            Some("q.us-east-1.amazonaws.com")
+        );
+
+        let usage = endpoint.usage_request_parts(&ctx, false).unwrap();
+        assert!(
+            usage
+                .url
+                .starts_with("https://q.us-east-1.amazonaws.com/getUsageLimits?")
+        );
+        assert_eq!(
+            header_value(&usage.headers, "host"),
+            Some("q.us-east-1.amazonaws.com")
+        );
+
+        let preference = endpoint
+            .set_preference_request_parts(&ctx, "ENABLED")
+            .unwrap();
+        assert_eq!(
+            preference.url,
+            "https://q.us-east-1.amazonaws.com/setUserPreference"
+        );
+        assert_eq!(
+            header_value(&preference.headers, "host"),
+            Some("q.us-east-1.amazonaws.com")
+        );
     }
 }

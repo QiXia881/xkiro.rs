@@ -8,6 +8,10 @@ use std::fs;
 use std::path::Path;
 
 use crate::http_client::ProxyConfig;
+use crate::kiro::region::{
+    DEFAULT_Q_TRANSPORT_REGION, is_known_bad_q_transport_region, normalize_q_transport_region,
+    trimmed_region,
+};
 use crate::model::config::Config;
 
 pub const KIRO_BUILDER_ID_START_URL: &str = "https://view.awsapps.com/start";
@@ -594,9 +598,18 @@ impl KiroCredentials {
     /// 获取有效的 API 区域（用于 API 请求）
     /// 优先级：凭据.api_region > config.api_region > config.region
     pub fn effective_api_region<'a>(&'a self, config: &'a Config) -> &'a str {
+        let region = self
+            .configured_api_region(config)
+            .or_else(|| trimmed_region(&config.region))
+            .unwrap_or(DEFAULT_Q_TRANSPORT_REGION);
+        normalize_q_transport_region(region)
+    }
+
+    pub fn configured_api_region<'a>(&'a self, config: &'a Config) -> Option<&'a str> {
         self.api_region
             .as_deref()
-            .unwrap_or(config.effective_api_region())
+            .and_then(trimmed_region)
+            .or_else(|| config.api_region.as_deref().and_then(trimmed_region))
     }
 
     pub fn profile_arn_region(&self) -> Option<&str> {
@@ -612,8 +625,14 @@ impl KiroCredentials {
     ///
     /// 优先使用 profileArn 内的 region，因为 auth/OIDC region 可能与真实 profile region 不同。
     pub fn effective_kiro_api_region<'a>(&'a self, config: &'a Config) -> &'a str {
-        self.profile_arn_region()
-            .unwrap_or_else(|| self.effective_api_region(config))
+        match self.profile_arn_region() {
+            Some(region) if is_known_bad_q_transport_region(region) => self
+                .configured_api_region(config)
+                .map(normalize_q_transport_region)
+                .unwrap_or(DEFAULT_Q_TRANSPORT_REGION),
+            Some(region) => region,
+            None => self.effective_api_region(config),
+        }
     }
 
     /// 获取有效的代理配置
@@ -751,6 +770,16 @@ impl KiroCredentials {
 mod tests {
     use super::*;
     use crate::model::config::Config;
+
+    #[allow(clippy::field_reassign_with_default)]
+    fn config_with_regions(region: Option<&str>, api_region: Option<&str>) -> Config {
+        let mut config = Config::default();
+        if let Some(region) = region {
+            config.region = region.to_string();
+        }
+        config.api_region = api_region.map(str::to_string);
+        config
+    }
 
     #[test]
     fn test_from_json() {
@@ -1314,6 +1343,49 @@ mod tests {
     }
 
     #[test]
+    fn test_effective_kiro_api_region_repairs_known_bad_profile_with_credential_override() {
+        let config = config_with_regions(None, Some("eu-central-1"));
+        let creds = KiroCredentials {
+            api_region: Some(" us-west-2 ".to_string()),
+            profile_arn: Some(
+                "arn:aws:codewhisperer:eu-north-1:123456789012:profile/test".to_string(),
+            ),
+            ..Default::default()
+        };
+
+        assert_eq!(creds.effective_kiro_api_region(&config), "us-west-2");
+    }
+
+    #[test]
+    fn test_effective_kiro_api_region_repairs_known_bad_profile_with_config_override() {
+        let config = config_with_regions(None, Some(" eu-central-1 "));
+        let creds = KiroCredentials {
+            profile_arn: Some(
+                "arn:aws:codewhisperer:EU-NORTH-1:123456789012:profile/test".to_string(),
+            ),
+            ..Default::default()
+        };
+
+        assert_eq!(creds.effective_kiro_api_region(&config), "eu-central-1");
+    }
+
+    #[test]
+    fn test_effective_kiro_api_region_defaults_known_bad_profile_to_us_east_1() {
+        let config = config_with_regions(Some("us-west-2"), None);
+        let creds = KiroCredentials {
+            profile_arn: Some(
+                "arn:aws:codewhisperer:eu-north-1:123456789012:profile/test".to_string(),
+            ),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            creds.effective_kiro_api_region(&config),
+            DEFAULT_Q_TRANSPORT_REGION
+        );
+    }
+
+    #[test]
     fn test_region_roundtrip() {
         // 测试序列化和反序列化的往返一致性
         let original = KiroCredentials {
@@ -1526,6 +1598,31 @@ mod tests {
         let creds = KiroCredentials::default();
 
         assert_eq!(creds.effective_api_region(&config), "config-region");
+    }
+
+    #[test]
+    fn test_effective_api_region_skips_blank_overrides() {
+        let config = config_with_regions(Some(" config-region "), Some("  "));
+        let creds = KiroCredentials {
+            api_region: Some("\t".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(creds.effective_api_region(&config), "config-region");
+    }
+
+    #[test]
+    fn test_effective_api_region_normalizes_known_bad_region() {
+        let config = config_with_regions(Some("config-region"), None);
+        let creds = KiroCredentials {
+            api_region: Some(" EU-NORTH-1 ".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            creds.effective_api_region(&config),
+            DEFAULT_Q_TRANSPORT_REGION
+        );
     }
 
     #[test]

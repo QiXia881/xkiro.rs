@@ -6,13 +6,53 @@ on:
       version:
         description: 'Version label for artifacts (e.g., 2026.5.26)'
         required: true
-        default: '2026.7.6'
+        default: '2026.7.10'
 
 permissions:
   contents: write
 
 jobs:
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Install admin-ui dependencies
+        working-directory: admin-ui
+        run: pnpm install --frozen-lockfile
+
+      - name: Build admin-ui
+        working-directory: admin-ui
+        run: pnpm build
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-cache-test
+          cache-on-failure: true
+
+      - name: Test app
+        run: cargo test --locked
+
+      - name: Check app without default features
+        run: cargo check --locked --no-default-features
+
   build:
+    needs: test
     strategy:
       fail-fast: false
       matrix:
@@ -62,7 +102,7 @@ jobs:
 
       - name: Install admin-ui dependencies
         working-directory: admin-ui
-        run: pnpm install
+        run: pnpm install --frozen-lockfile
 
       - name: Build admin-ui
         working-directory: admin-ui

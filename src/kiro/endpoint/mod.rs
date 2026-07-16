@@ -9,6 +9,7 @@
 use reqwest::RequestBuilder;
 
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::region::{DEFAULT_Q_TRANSPORT_REGION, normalize_q_transport_region};
 use crate::model::config::Config;
 
 pub mod amazonq;
@@ -118,8 +119,8 @@ pub struct RequestContext<'a> {
 }
 
 pub(crate) fn codewhisperer_rest_host_for_region(region: &str) -> String {
-    let region = region.trim();
-    if region.is_empty() || region.eq_ignore_ascii_case("us-east-1") {
+    let region = normalize_q_transport_region(region);
+    if region.eq_ignore_ascii_case(DEFAULT_Q_TRANSPORT_REGION) {
         "codewhisperer.us-east-1.amazonaws.com".to_string()
     } else {
         format!("q.{}.amazonaws.com", region)
@@ -127,12 +128,7 @@ pub(crate) fn codewhisperer_rest_host_for_region(region: &str) -> String {
 }
 
 pub(crate) fn q_rest_host_for_region(region: &str) -> String {
-    let region = region.trim();
-    let region = if region.is_empty() {
-        "us-east-1"
-    } else {
-        region
-    };
+    let region = normalize_q_transport_region(region);
     format!("q.{}.amazonaws.com", region)
 }
 
@@ -228,6 +224,10 @@ mod tests {
             codewhisperer_rest_host_for_region("eu-central-1"),
             "q.eu-central-1.amazonaws.com"
         );
+        assert_eq!(
+            codewhisperer_rest_host_for_region(" EU-NORTH-1 "),
+            "codewhisperer.us-east-1.amazonaws.com"
+        );
     }
 
     #[test]
@@ -236,6 +236,10 @@ mod tests {
         assert_eq!(
             q_rest_host_for_region("eu-central-1"),
             "q.eu-central-1.amazonaws.com"
+        );
+        assert_eq!(
+            q_rest_host_for_region(" eu-north-1 "),
+            "q.us-east-1.amazonaws.com"
         );
     }
 }

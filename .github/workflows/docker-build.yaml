@@ -6,7 +6,7 @@ on:
       version:
         description: 'Version tag for Docker images (e.g., 2026.5.26)'
         required: true
-        default: '2026.7.6'
+        default: '2026.7.10'
 
 permissions:
   contents: read

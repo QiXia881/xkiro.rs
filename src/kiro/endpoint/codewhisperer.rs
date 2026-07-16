@@ -324,6 +324,54 @@ mod tests {
             Some("q.eu-central-1.amazonaws.com")
         );
     }
+
+    #[test]
+    fn codewhisperer_endpoint_repairs_known_bad_profile_region() {
+        let endpoint = CodewhispererEndpoint::new();
+        let config = Config::default();
+        let credentials = KiroCredentials {
+            api_region: Some("us-east-1".to_string()),
+            profile_arn: Some("arn:aws:codewhisperer:eu-north-1:123:profile/test".to_string()),
+            ..Default::default()
+        };
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: "token",
+            machine_id: "machine",
+            config: &config,
+        };
+
+        assert_eq!(
+            endpoint.api_url(&ctx),
+            "https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse"
+        );
+        assert_eq!(
+            endpoint.mcp_url(&ctx),
+            "https://codewhisperer.us-east-1.amazonaws.com/mcp"
+        );
+
+        let request = endpoint
+            .decorate_api(reqwest::Client::new().post(endpoint.api_url(&ctx)), &ctx)
+            .build()
+            .unwrap();
+        assert_eq!(
+            request.headers().get("host").and_then(|v| v.to_str().ok()),
+            Some("codewhisperer.us-east-1.amazonaws.com")
+        );
+
+        let usage = endpoint.usage_request_parts(&ctx, false).unwrap();
+        assert_eq!(
+            header_value(&usage.headers, "host"),
+            Some("codewhisperer.us-east-1.amazonaws.com")
+        );
+        let preference = endpoint
+            .set_preference_request_parts(&ctx, "DISABLED")
+            .unwrap();
+        assert_eq!(
+            header_value(&preference.headers, "host"),
+            Some("q.us-east-1.amazonaws.com")
+        );
+    }
 }
 
 impl Default for CodewhispererEndpoint {

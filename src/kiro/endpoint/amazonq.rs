@@ -171,4 +171,35 @@ mod tests {
             Some(AMAZONQ_API_TARGET)
         );
     }
+
+    #[test]
+    fn amazonq_endpoint_repairs_known_bad_profile_region() {
+        let endpoint = AmazonQEndpoint::new();
+        let config = Config::default();
+        let credentials = KiroCredentials {
+            api_region: Some("us-east-1".to_string()),
+            profile_arn: Some("arn:aws:codewhisperer:eu-north-1:123:profile/test".to_string()),
+            ..Default::default()
+        };
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: "token",
+            machine_id: "machine-123",
+            config: &config,
+        };
+
+        let request = endpoint
+            .decorate_api(reqwest::Client::new().post(endpoint.api_url(&ctx)), &ctx)
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            request.url().as_str(),
+            "https://q.us-east-1.amazonaws.com/generateAssistantResponse"
+        );
+        assert_eq!(
+            request.headers().get("host").and_then(|v| v.to_str().ok()),
+            Some("q.us-east-1.amazonaws.com")
+        );
+    }
 }

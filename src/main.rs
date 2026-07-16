@@ -50,6 +50,43 @@ async fn main() {
         return;
     }
 
+    if let Some(Command::RepairApiRegion {
+        target_api_region,
+        known_bad_api_regions,
+        check_dns,
+        apply,
+        service_stopped,
+    }) = args.command
+    {
+        let config_path = args
+            .config
+            .unwrap_or_else(|| Config::default_config_path().to_string());
+        let credentials_path = args
+            .credentials
+            .unwrap_or_else(|| KiroCredentials::default_credentials_path().to_string());
+        let config = Config::load(&config_path).unwrap_or_else(|error| {
+            eprintln!("加载配置失败: {error:#}");
+            std::process::exit(1);
+        });
+        let options = kiro::api_region_repair::RepairApiRegionOptions {
+            credentials_path: credentials_path.into(),
+            config,
+            target_api_region,
+            known_bad_api_regions,
+            check_dns,
+            apply,
+            service_stopped,
+        };
+        match kiro::api_region_repair::run(&options) {
+            Ok(report) => kiro::api_region_repair::print_report(&report),
+            Err(error) => {
+                eprintln!("apiRegion 修复失败: {error:#}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     // social-helper 子命令：本机完成 OAuth 并回传远程 xkiro，独立于服务启动流程
     if let Some(Command::SocialHelper {
         server,

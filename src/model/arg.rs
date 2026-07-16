@@ -29,6 +29,33 @@ pub enum Command {
         force: bool,
     },
 
+    /// 检查或修复 credentials.json 中不可用的 Kiro/Q API 区域
+    RepairApiRegion {
+        /// 修复目标区域
+        #[arg(long, default_value = "us-east-1")]
+        target_api_region: String,
+
+        /// 已知不可用区域，可重复指定或使用逗号分隔
+        #[arg(
+            long = "known-bad-api-region",
+            value_delimiter = ',',
+            default_value = "eu-north-1"
+        )]
+        known_bad_api_regions: Vec<String>,
+
+        /// 对非目标区域额外检查 q.<region>.amazonaws.com DNS
+        #[arg(long)]
+        check_dns: bool,
+
+        /// 写入修复；默认仅预览
+        #[arg(long)]
+        apply: bool,
+
+        /// 确认目标 xkiro 服务已停止；--apply 时必需
+        #[arg(long)]
+        service_stopped: bool,
+    },
+
     /// 本机社交登录助手（远程部署场景）
     ///
     /// 在用户本机完成 GitHub/Google OAuth（本机回调 + token 交换），

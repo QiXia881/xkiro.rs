@@ -140,6 +140,14 @@ Docker 场景建议 `config.json` 使用：
 | `credentialMachineIdStrategy` | `random` | 新凭据缺少 machineId 时使用 `random` 或 `local` |
 | `kiroVersion` / `systemVersion` / `nodeVersion` | `0.11.107` / 随机 / `22.22.0` | 上游请求携带的 Kiro 客户端、OS、Node 版本标识 |
 
+区域字段分别承担不同职责：
+
+- `region`：全局默认区域；凭据级 `region` 主要作为认证区域和 Profile 查询候选，不直接加入普通 API host 的回退链。
+- `authRegion`：OIDC/token 刷新区域；凭据级优先级为 `authRegion > region >` 全局认证区域。
+- `apiRegion`：显式 API transport 覆盖；无有效 Profile region 时按 `凭据 apiRegion > 全局 apiRegion > 全局 region` 选择。
+- Profile region：来自 `profileArn`。有效区域继续用于 Kiro/Q 数据面；当前已知不可用的 `eu-north-1` transport 会回退到显式 `apiRegion` 或 `us-east-1`，ARN 内容本身不会被修改。
+- Transport region：最终用于生成 HTTP URL 和 `Host` 的运行时区域，不影响认证端点。
+
 TLS 与代理：
 
 | 字段 | 默认 | 说明 |
@@ -260,6 +268,27 @@ Prompt Cache：
 ```bash
 KIRO_API_KEY=ksk_xxxxx ./target/debug/xkiro-rs
 ```
+
+### 修复凭据 API 区域
+
+离线修复命令默认只预览，不会写文件：
+
+```bash
+./xkiro-rs --config config.json --credentials credentials.json repair-api-region
+```
+
+预览确认后，先停止正在使用该凭据文件的 xkiro 服务，再显式写入：
+
+```bash
+./xkiro-rs --config config.json --credentials credentials.json repair-api-region \
+  --apply --service-stopped
+```
+
+默认只处理 `eu-north-1 -> us-east-1`。工具支持单对象和数组凭据，只修改候选对象的 `apiRegion`，并在同目录创建 `credentials.json.bak.<timestamp>.<pid>.<nanos>`。写入失败时会从备份恢复原文件；再次运行应报告零变更。
+
+可使用 `--check-dns` 对非目标区域做一次显式 DNS 诊断。该检查只属于离线工具，不会进入服务启动或请求热路径。不要将所有非 `us-east-1` 区域批量改写，`eu-central-1` 等有效 Profile region 会保持原路由。
+
+发布前 smoke test 只需确认 dry-run 结果、最终目标 host 和一次最小请求的 HTTP 状态；不要记录 Authorization、完整邮箱、请求体或响应内容。需要回滚时，停止服务并用对应 `.bak.*` 文件替换 `credentials.json`。
 
 ## 凭据与登录
 
@@ -493,16 +522,21 @@ Prompt Filter 可清理：
 
 ```bash
 cd admin-ui
-pnpm install
+pnpm install --frozen-lockfile
 pnpm dev
 pnpm build
 ```
 
-后端：
+后端测试依赖已构建的 `admin-ui/dist`：
 
 ```bash
+cd admin-ui
+pnpm install --frozen-lockfile
+pnpm build
+cd ..
 cargo check
 cargo test
+cargo check --no-default-features
 cargo build --release
 ```
 
